@@ -90,6 +90,29 @@ disp: ct952emu tests/disp_test.bin
 	./ct952emu tests/disp_test.bin --fb-out disp_test.ppm \
 	    --instr 20000000 --quiet
 
+tests/uart_test.o: tests/uart_test.c tests/testapi.h
+	$(XCC) -m32 -mcpu=v8 -O2 -ffreestanding -fno-builtin \
+	    -mno-app-regs -I. -c -o $@ $<
+
+tests/uart_test.elf: tests/start.o tests/uart_test.o tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld \
+	    -o $@ tests/start.o tests/uart_test.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld \
+	    -o $@ tests/start.o tests/uart_test.o
+
+tests/uart_test.bin: tests/uart_test.elf
+	$(XOBJCOPY) -O binary $< $@
+
+# Feed bytes into UART1 RX and verify the firmware echoes them back.
+uart: ct952emu tests/uart_test.bin
+	printf 'PING 1234\n' > uart_in.txt
+	./ct952emu tests/uart_test.bin --uart-in uart_in.txt \
+	    --uart uart_out.txt --instr 5000000 --quiet
+	@printf 'sent: '; cat uart_in.txt
+	@printf 'echo: '; cat uart_out.txt
+	@cmp -s uart_in.txt uart_out.txt && echo "UART RX OK (echo matches)" \
+	    || echo "UART RX MISMATCH"
+
 check: test_sparc tests/testprog.bin
 	./test_sparc tests/testprog.bin
 

@@ -57,6 +57,7 @@
 #define TIMER_LOAD     4u
 
 #define UART_STAT_READY 0x6u   /* TX shift + holding empty, no RX data */
+#define UART_STAT_DATA_READY 0x1u   /* RX byte available (ctkav_platform.h) */
 
 static machine_t *M(sparc_bus_t *b) { return (machine_t *)b; }
 
@@ -106,13 +107,20 @@ static uint32_t io_read(machine_t *m, uint32_t off)
 {
     switch (off) {
     case R_UART1_STAT:
+        /* TX always ready; RX ready iff bytes are queued (host -> device) */
+        return UART_STAT_READY |
+               ((m->rx_pos < m->rx_len) ? UART_STAT_DATA_READY : 0u);
     case R_UART2_STAT:
     case R_DSU_UART_STAT:
         return UART_STAT_READY;
     case R_UART1_DATA:
+        /* pop one queued RX byte (or 0 if none) */
+        if (m->rx_pos < m->rx_len)
+            return m->rx_buf[m->rx_pos++];
+        return 0;
     case R_UART2_DATA:
     case R_DSU_UART_DATA:
-        return 0;                     /* no RX modeled yet */
+        return 0;                     /* RX not modeled on these ports */
     case R_TIMER3_VAL:
         return (uint32_t)m->t3_value;
     case R_PRESC_CNT:
@@ -351,12 +359,23 @@ void machine_seed_boot(machine_t *m, uint32_t entry, uint32_t sp)
     if (sp)    io_set(m, R_PROC2_SP, sp);
 }
 
+void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len)
+{
+    uint8_t *nb = (uint8_t *)realloc(m->rx_buf, m->rx_len + len);
+    if (!nb) return;
+    m->rx_buf = nb;
+    memcpy(m->rx_buf + m->rx_len, data, len);
+    m->rx_len += len;
+}
+
 void machine_free(machine_t *m)
 {
     free(m->flash);
     free(m->dram);
+    free(m->rx_buf);
     m->flash = NULL;
     m->dram = NULL;
+    m->rx_buf = NULL;
 }
 
 uint64_t machine_run(machine_t *m, uint64_t n)

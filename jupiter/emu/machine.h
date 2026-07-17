@@ -52,6 +52,10 @@ typedef struct machine {
     FILE *uart_file;         /* optional capture file (may be NULL) */
     int uart_echo;           /* echo UART bytes to stdout */
 
+    /* uart rx: host -> firmware, drained on UART1 DATA reads */
+    uint8_t *rx_buf;
+    uint32_t rx_len, rx_pos;
+
     /* io access inventory */
     mach_logent_t log[MACH_LOG_MAX];
     int log_n;
@@ -63,6 +67,11 @@ typedef struct machine {
 
 /* Create/reset the machine with a flash image (copied in). */
 int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size);
+
+/* Queue bytes for the firmware to read from UART1 RX (host -> device).
+ * Appends to any pending data; each byte is delivered once, in order,
+ * and the UART1 status DATA_READY bit reflects whether any remain. */
+void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len);
 
 /* Seed the boot-trampoline registers the earlier dsu_boot stage would
  * have written: GR22 (0x800007d8) = firmware entry, GR21 (0x800007d4)

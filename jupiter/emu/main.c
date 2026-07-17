@@ -17,6 +17,7 @@ int main(int argc, char **argv)
     const char *rom_path = NULL, *uart_path = NULL, *iolog_path = NULL;
     const char *dram_path = NULL;
     const char *fb_path = NULL;
+    const char *uartin_path = NULL;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
     uint32_t fb_addr = 0x4005F000u;   /* DS_OSDFRAME_ST */
@@ -38,6 +39,8 @@ int main(int argc, char **argv)
             iolog_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dram") && i + 1 < argc)
             dram_path = argv[++i];
+        else if (!strcmp(argv[i], "--uart-in") && i + 1 < argc)
+            uartin_path = argv[++i];
         else if (!strcmp(argv[i], "--fb-out") && i + 1 < argc)
             fb_path = argv[++i];
         else if (!strcmp(argv[i], "--fb-addr") && i + 1 < argc)
@@ -60,7 +63,8 @@ int main(int argc, char **argv)
     if (!rom_path) {
         fprintf(stderr, "usage: ct952emu <flash.rom> [--instr N] "
                         "[--uart FILE] [--iolog FILE] [--quiet]\n"
-                        "       [--fb-out PPM] [--fb-addr ADDR] [--fb-wh WxH]\n");
+                        "       [--fb-out PPM] [--fb-addr ADDR] [--fb-wh WxH]\n"
+                        "       [--uart-in FILE]\n");
         return 2;
     }
 
@@ -89,6 +93,19 @@ int main(int argc, char **argv)
     if (uart_path) {
         m->uart_file = fopen(uart_path, "wb");
         if (!m->uart_file) { perror(uart_path); return 1; }
+    }
+    if (uartin_path) {
+        FILE *rf = fopen(uartin_path, "rb");
+        if (!rf) { perror(uartin_path); return 1; }
+        {
+            uint8_t buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), rf)) > 0)
+                machine_uart_feed(m, buf, (uint32_t)n);
+        }
+        fclose(rf);
+        fprintf(stderr, "[ct952emu] queued %u UART RX bytes from %s\n",
+                m->rx_len, uartin_path);
     }
 
     if (rom_load) {

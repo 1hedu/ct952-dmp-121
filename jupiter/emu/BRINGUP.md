@@ -172,6 +172,61 @@ DISP scan-out (`--fb-out`) renders whatever it draws (boot logo from the
 Tooling used to pin this: `--dump-dram`, the jmpl trace ring, the 64-deep
 PC ring, and an ad-hoc windowed-register + DRAM-write watch.
 
+### The loop, fully decoded
+
+Disassembling `0x400204f0..0x4002063c` and walking the register windows
+resolves it completely. The register-config routine is a doubly-nested
+walk; the terminating outer loop is:
+
+```
+40020624  inc  %l4                 ; outer index++
+40020628  lduh [%i0], %o1          ; outer count = *(u16*)%i0
+4002062c  and  %l4, 0xff, %o0      ; index masked to 8 bits
+40020630  cmp  %o0, %o1
+40020634  bcs,a 0x4002050c         ; loop while (%l4 & 0xff) < count
+```
+
+Both inputs are garbage:
+- **`%i0 = 0x126`** — a flash address in the boot header, not a table.
+  `*(u16*)0x126 = 0x56b7` (25783). Masked to 8 bits, `%l4` tops out at
+  255 and can never reach it, so the outer loop cannot terminate.
+- **`%l5 = 0x40042000`** — the inner count `*(u16*)%l5 = 0`, so the inner
+  guard `cmp %g2, [%l5]` (`%g2=1`) always skips the body: no engine
+  registers are ever written.
+
+Call stack at the stall (window-chain unwind):
+`0x4001ea40 -> 0x4001ea60 -> flash 0xadbc -> 0x4176c -> 0x42218 ->
+0xea74 -> 0x1b3d0 -> 0x33cc0 -> [stall]`. `%i0`/`%l5` are handed in by
+this chain from config state that was never built.
+
+`0x40042000` is a shared bss arena (e.g. an IRQ/callback table lives at
+`+0x3a0`, managed by `0x4001d918`); the **display-config sub-table at
+offset 0 is the part never populated**.
+
+### Root cause, pinpointed
+
+The `%i0 = 0x126` isn't a stray pointer -- it's an **offset with a null
+base**. The call at flash `0x33cc0` targets a thunk `0x3d564`, which does
+`base = *(desc + 0x10); arg0 = 0x126 + base` before tail-calling the
+SFAT routine `0x400203e8` (the one holding the loop). The descriptor is
+`desc = 0x4002f75c` (formed as `sethi %hi(0x4002f400); or 0x35c`). So the
+stall's `%i0 = 0x126` means **`*(0x4002f76c) = 0`** -- the register-config
+**table-base pointer is null**.
+
+A write-watch on `0x4002f75c..0x4002f784` over the whole boot shows the
+descriptor is, again, **only ever zeroed** (bss-clear at `0x4001d1f0`) and
+never populated. So one specific config-init phase -- the one that fills
+`desc+0x10` (table base) and `desc+0x14` (count), plus `0x40042000[0]`
+and the `0x40046800` pointer table -- is skipped entirely.
+
+**Exact next step:** find the writer of `0x4002f76c` (`desc+0x10`) -- the
+routine that builds the display-register config table -- and determine
+what gates it (a mode flag, a panel-ID/`CUST` read, or an ordering
+dependency). Run it or stage its output (the table base + count), and the
+`0x400203e8` walk gets a valid pointer and a bounded count, terminates,
+and boot proceeds to display init -- at which point `--fb-out` renders
+the firmware's own screen (boot logo from `LOGO` first).
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

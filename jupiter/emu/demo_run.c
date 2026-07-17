@@ -53,23 +53,37 @@ int main(int argc, char **argv)
             (unsigned long long)ran, m->cpu.pc,
             m->cpu.halted ? m->cpu.halt_reason : "(spin/done)");
 
-    /* pull the framebuffer + palette out of emulated DRAM */
-    fb = machine_dram_ptr(m, FB_ADDR);
-    for (i = 0; i < 256; i++)
-        pal[i] = machine_dram_rd(m, PAL_ADDR + (uint32_t)i * 4, 4);
-
     f = fopen(out, "wb");
     if (!f) { perror(out); return 1; }
     fprintf(f, "P6\n%d %d\n255\n", FB_W, FB_H);
-    for (y = 0; y < FB_H; y++)
-        for (x = 0; x < FB_W; x++) {
-            uint32_t c = pal[fb[y * FB_W + x]];
-            fputc((int)((c >> 16) & 0xFF), f);
-            fputc((int)((c >> 8) & 0xFF), f);
-            fputc((int)(c & 0xFF), f);
+
+    /* Preferred path: let the emulated display engine scan out from the
+     * registers the demo programmed (VCR20 base + GAM_OSD YCbCr palette
+     * + OSD-enable) -- exactly what the firmware's OSD read-channel does.
+     * Fall back to the direct index+ARGB path if the DE wasn't set up. */
+    {
+        uint8_t *rgb = (uint8_t *)malloc((size_t)FB_W * FB_H * 3);
+        if (rgb && machine_scanout(m, FB_W, FB_H, FB_W, rgb)) {
+            fwrite(rgb, 1, (size_t)FB_W * FB_H * 3, f);
+            fprintf(stderr, "[demo_run] wrote %s (%dx%d) via display-engine "
+                            "scanout\n", out, FB_W, FB_H);
+        } else {
+            fb = machine_dram_ptr(m, FB_ADDR);
+            for (i = 0; i < 256; i++)
+                pal[i] = machine_dram_rd(m, PAL_ADDR + (uint32_t)i * 4, 4);
+            for (y = 0; y < FB_H; y++)
+                for (x = 0; x < FB_W; x++) {
+                    uint32_t c = pal[fb[y * FB_W + x]];
+                    fputc((int)((c >> 16) & 0xFF), f);
+                    fputc((int)((c >> 8) & 0xFF), f);
+                    fputc((int)(c & 0xFF), f);
+                }
+            fprintf(stderr, "[demo_run] wrote %s (%dx%d) via direct palette\n",
+                    out, FB_W, FB_H);
         }
+        free(rgb);
+    }
     fclose(f);
-    fprintf(stderr, "[demo_run] wrote %s (%dx%d)\n", out, FB_W, FB_H);
 
     machine_free(m);
     free(m);

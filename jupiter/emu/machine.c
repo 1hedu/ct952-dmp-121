@@ -434,6 +434,55 @@ uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr)
     return NULL;
 }
 
+/* ---- Display-engine scanout ----
+ * Reproduce what the CT952 OSD read-channel would put on screen, from
+ * the real registers any code (firmware or an SDK demo) programs:
+ *   REG_MCU_VCR20   0x80000D80  OSD read-channel base (DRAM byte addr)
+ *   REG_DISP_OSD_SIZE 0x80001A54  bit28 = OSD enable
+ *   GAM_OSD RAM     0x80001C00..  256 palette entries, [23:0] = YCbCr
+ *                                 (Y<<16|Cb<<8|Cr, BT.601 studio range),
+ *                                 bit24 = per-entry mix enable.
+ * The 8bpp OSD plane at the base is resolved through that palette and
+ * YCbCr->RGB converted (host-side float is fine). Returns 1 and fills
+ * rgb (w*h*3, top-down RGB) if the OSD is enabled with a DRAM base,
+ * else 0. pitch is the plane's row stride in bytes. */
+#define R_MCU_VCR20     0x0D80
+#define R_DISP_OSD_SIZE 0x1A54
+#define R_GAM_OSD       0x1C00
+#define DISP_OSD_ENABLE 0x10000000u
+
+int machine_scanout(machine_t *m, int w, int h, int pitch, uint8_t *rgb)
+{
+    uint32_t base = io_get(m, R_MCU_VCR20);
+    uint32_t size = io_get(m, R_DISP_OSD_SIZE);
+    const uint8_t *fb;
+    int x, y;
+
+    if (!(size & DISP_OSD_ENABLE)) return 0;
+    fb = machine_dram_ptr(m, base);
+    if (!fb) return 0;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint8_t idx = fb[(uint32_t)y * (uint32_t)pitch + (uint32_t)x];
+            uint32_t e = io_get(m, R_GAM_OSD + (uint32_t)idx * 4);
+            int Y = (int)((e >> 16) & 0xFF);
+            int Cb = (int)((e >> 8) & 0xFF) - 128;
+            int Cr = (int)(e & 0xFF) - 128;
+            /* BT.601 studio-swing YCbCr -> full-range RGB */
+            double yy = 1.164 * (double)(Y - 16);
+            int r = (int)(yy + 1.596 * Cr + 0.5);
+            int g = (int)(yy - 0.392 * Cb - 0.813 * Cr + 0.5);
+            int b = (int)(yy + 2.017 * Cb + 0.5);
+            uint8_t *o = rgb + ((uint32_t)y * (uint32_t)w + (uint32_t)x) * 3;
+            o[0] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+            o[1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+            o[2] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+        }
+    }
+    return 1;
+}
+
 /* ---- Stock-ROM section loader (mask-ROM equivalent) ---- */
 
 #define UZIP_DECODE  0x00002C50u   /* UZIP blob @ flash 0x2000, wrapper +0xc50 */

@@ -21,6 +21,7 @@
  *   192..255 NES master palette
  */
 #include "jup_types.h"
+#include "demo_de.h"
 #include "jdraw.h"
 #include "jnes.h"
 #include "jgb.h"
@@ -434,5 +435,7 @@ unsigned testmain(void)
     text(fb, 196, 416, "ON THE EMU CPU", 2, 4);
 
     for (i = 0; i < 256; i++) pal[i] = g_pal[i];
+    /* program the real display engine so the emulator scans it out */
+    de_program(FB_ADDR, FB_W, FB_H, g_pal);
     return FB_ADDR;
 }

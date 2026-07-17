@@ -61,6 +61,19 @@ pixel is produced by SPARC instructions the interpreter executed.
 This closes the arc: port the SDK -> build the emulator -> run the SDK on
 the emulator -> see a display window.
 
+## The display engine is modeled (real scanout)
+
+`machine_scanout()` reproduces the CT952 OSD read-channel from the actual
+registers any code programs -- `REG_MCU_VCR20` (0x80000D80, OSD base),
+`REG_DISP_OSD_SIZE` (0x80001A54, bit28 enable), and the `GAM_OSD` palette
+RAM (0x80001C00, 256 entries of `[23:0]=YCbCr`, BT.601 studio-swing) --
+resolving the 8bpp plane through the palette and converting YCbCr->RGB
+the way the hardware would. The demos now program those registers via
+`tests/demo_de.h` (`de_program`, RGB->YCbCr into GAM_OSD), and `demo_run`
+scans out through the DE instead of reading a side-channel palette. The
+same path will render the *firmware's* screen the moment it reaches its
+own OSD init -- no demo-specific assumptions.
+
 ## Stock-firmware boot frontier
 
 `./ct952emu dp700wd.bin --rom-load` now boots far past the old

@@ -15,6 +15,7 @@
  * SPARC exactly as it would on the metal.
  */
 #include "jup_types.h"
+#include "demo_de.h"
 #include "jdraw.h"
 #include "jnes.h"
 #include "jrgb2yuv.h"
@@ -244,6 +245,8 @@ unsigned testmain(void)
 
     /* publish the palette for the host snapshot */
     for (i = 0; i < 256; i++) pal[i] = g_pal[i];
+    /* program the real display engine so the emulator scans it out */
+    de_program(FB_ADDR, FB_W, FB_H, g_pal);
 
     return FB_ADDR;
 }

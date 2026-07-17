@@ -9,6 +9,7 @@
  * Same machine model that boots the stock ROM; no firmware, no libc.
  */
 #include "jup_types.h"
+#include "demo_de.h"
 #include "jdraw.h"
 #include "jsnes.h"
 
@@ -228,6 +229,8 @@ unsigned testmain(void)
     text(fb, ox, oy + SNES_NATIVE_H + 10, "MODE 1 BG1+BG2 OVER BG3", 2, 6);
 
     for (i = 0; i < 256; i++) pal[i] = g_pal[i];
+    /* program the real display engine so the emulator scans it out */
+    de_program(FB_ADDR, FB_W, FB_H, g_pal);
     (void)x;
     return FB_ADDR;
 }

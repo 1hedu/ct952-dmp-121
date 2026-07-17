@@ -97,6 +97,13 @@ int machine_call(machine_t *m, uint32_t entry,
 uint32_t machine_dram_rd(machine_t *m, uint32_t addr, int size);
 uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr);
 
+/* Display-engine scanout: render the OSD plane the way the hardware
+ * read-channel would, from the registers programmed in the I/O page
+ * (VCR20 base, OSD-enable, GAM_OSD YCbCr palette). Fills rgb (w*h*3,
+ * top-down) and returns 1 if the OSD is enabled with a valid DRAM
+ * base; returns 0 otherwise. pitch is the OSD plane row stride. */
+int machine_scanout(machine_t *m, int w, int h, int pitch, uint8_t *rgb);
+
 /* Parse the flash section table and stage every DRAM-resident section:
  * raw sections are copied, zip-flagged sections are decompressed by
  * invoking the firmware's own UZIP codec (flash 0x2000, wrapper +0xc50)

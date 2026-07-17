@@ -311,6 +311,29 @@ base -- rather than papering over it with `--skip-panelcfg`. This is the
 next concrete target; it is one more layer of the same boot-config
 subsystem, not a new mystery.
 
+### Deeper: it is a two-phase init and only phase 2 runs
+
+`0x420d4` (called at `0x4176c`) is the **display-config apply**: it stages
+real panel timing into `0x40033744` (`0x2d0`=720, `0x1e0`=480, `0xf0`=240)
+and then, at `0x42218`, calls `0xea18` -> ... -> the config thunk to push
+that config through the descriptor's register table -- which is empty, so
+it stalls. The table's source, the **`SETD`** settings sector, *does*
+contain real data in this image (`flash 0x1000`: `43 00 01 0d 03 01 05 7d
+...`, 204 non-trivial bytes), so the config is present on the device; the
+problem is purely that the descriptor pointing at it is never built.
+
+The descriptor's *correct uninitialised state is `-1`* (skip): `0x3cf60`
+sets `desc+0x14 = -1` based on a MODE byte at `0x40033723` (which has no
+explicit writer -- it stays 0). And `0x416f4` is two-phase: its entry
+`btst 4,%i0 ; be 0x4181c` splits an early default-init path (`0x4181c`,
+arg bit2 clear) from the apply path (bit2 set, the `0x4176c`/`0x41774`
+body). The emulator only ever runs the **apply** phase (via `0xadbc`,
+bit2 set); the early default-init call (via `0xa798`->`0xa8c0`, which
+would run with bit2 clear and set the descriptor to its `-1`/SETD-derived
+default) is never reached. So phase 2 runs before phase 1 -- the missing
+early pass is why the descriptor is raw zero instead of `-1`-or-valid.
+Next: find why `0xa798` (the phase-1 caller) is skipped in this boot.
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

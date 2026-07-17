@@ -122,6 +122,10 @@ DWORD   __dwW99AV_DestDRAM;
 extern EN_GAME_ID __enGameID;
 #endif
 
+#ifdef SUPPORT_JUPITER
+#include "japp.h"
+#endif
+
 #ifdef SUPPORT_TFT        
     #include "tft.h"
     BIT _btAVIN=0; //Jeff 20060705 Add for AV in
@@ -717,6 +721,10 @@ pFunction FuncArray[]=
     &GAMEMAIN_ProcessKey,
 #endif
 
+#ifdef SUPPORT_JUPITER
+    &JUPITER_ProcessKey,
+#endif
+
 #ifdef SUPPORT_POWERON_MENU //CoCo2.56
     &POWERONMENU_CheckModeKey,
 #endif //SUPPORT_POWERON_MENU
@@ -963,7 +971,15 @@ void CC_DVD_MainLoop(void)
         if(__enGameID!=GAME_NONE)
         {
         GAMEMAIN_Trigger();
-        goto MAIN_LOOP_END;  
+        goto MAIN_LOOP_END;
+        }
+#endif
+
+#ifdef SUPPORT_JUPITER
+        if(JUPITER_IsActive())
+        {
+        JUPITER_Trigger();
+        goto MAIN_LOOP_END;
         }
 #endif
 
@@ -3866,7 +3882,7 @@ WIN_PARAMETER ClipArea;
         __bRepeat= REPEAT_NONE;            
         OSD_OUTPUT_MACRO(MSG_REPEAT, __bRepeat, 0 );
 
-        //Aron1.11, Fixed ¹C¨«3, ¦b¼½©ñ¤k¤ýÀY®É,«ö¼Æ¦rÁä¸õ¨ì³¹¸`¤§«á, ¦¹®É¨Ï¥Înavagiator¥\¯à¸õ³¹¸`·|µLªk¸õ³¹¸`
+        //Aron1.11, Fixed ï¿½Cï¿½ï¿½3, ï¿½bï¿½ï¿½ï¿½ï¿½kï¿½ï¿½ï¿½Yï¿½ï¿½,ï¿½ï¿½ï¿½Æ¦rï¿½ï¿½ï¿½ï¿½ì³¹ï¿½`ï¿½ï¿½ï¿½ï¿½, ï¿½ï¿½ï¿½É¨Ï¥ï¿½navagiatorï¿½\ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½`ï¿½|ï¿½Lï¿½kï¿½ï¿½ï¿½ï¿½ï¿½`
         //change "search Chapters in the same Title" as LinkPTTN which will not execute PRE-CMD. 
         //And do "search Chapters between different Title" as Jump_VTS_PTT  
         if ( __bSearchTitle == __bTitle )
@@ -5691,6 +5707,13 @@ BYTE    _CC_CheckValidKey(void)
 //CoCo1.02, add OSD game from XuLi's code
 #ifdef SUPPORT_OSDGAME
     if((__bKey == KEY_OSDGAME) || (__enGameID!=GAME_NONE))
+    {
+        return KEY_ACCEPT;
+    }
+#endif
+
+#ifdef SUPPORT_JUPITER
+    if((__bKey == KEY_OSDGAME) || JUPITER_IsActive())
     {
         return KEY_ACCEPT;
     }

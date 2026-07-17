@@ -32,6 +32,10 @@ SUPPORT_STB		= 0
 # SUPPORT_950   : Mean remove servo and DVD part.
 SUPPORT_950		= 1
 
+# SUPPORT_JUPITER : JupiterSDK port (jupiter/) — retro renderers + audio
+#                   demo app on the GAME key. Set to 0 to build without it.
+SUPPORT_JUPITER	= 1
+
 DVD_INCLUDE		:=
 
 ifeq ($(SUPPORT_STB), 1)
@@ -84,7 +88,15 @@ OBJ             =  $(OBJ_PATH)cc.o  $(OBJ_PATH)cckey.o  \
         $(OBJ_PATH)romld.o $(OBJ_PATH)notransl.o $(OBJ_PATH)convchar.o \
         $(USB_PATH)jos_mem.o $(USB_PATH)usbdi.o 
 
-ifeq ($(SUPPORT_950), 1)	
+JUPITER_PATH = ./jupiter/
+ifeq ($(SUPPORT_JUPITER), 1)
+JUPOBJ = $(OBJ_PATH)jnes.o $(OBJ_PATH)jgb.o $(OBJ_PATH)jaudio.o \
+	$(OBJ_PATH)jrgb2yuv.o $(OBJ_PATH)jshim_ct952.o $(OBJ_PATH)japp.o
+OBJ += $(JUPOBJ)
+CFLAGS += -DSUPPORT_JUPITER -I $(JUPITER_PATH)
+endif
+
+ifeq ($(SUPPORT_950), 1)
 950OBJ = $(OBJ_PATH)menu.o  $(OBJ_PATH)toolbar.o $(OBJ_PATH)mainmenu.o $(OBJ_PATH)dvdsetup.o $(OBJ_PATH)dvdsetup_op.o $(OBJ_PATH)poweronmenu.o $(OBJ_PATH)clock.o $(OBJ_PATH)rtcdrv.o $(OBJ_PATH)settime.o $(OBJ_PATH)dialog.o $(OBJ_PATH)calenui.o $(OBJ_PATH)alarm.o $(OBJ_PATH)autopower.o $(OBJ_PATH)edit.o $(OBJ_PATH)backdoor.o $(OBJ_PATH)setdate.o $(OBJ_PATH)radiodrv.o $(OBJ_PATH)radio.o $(OBJ_PATH)notedlg.o
 endif	
 
@@ -269,6 +281,10 @@ endif
 	@$(XCC) -c -o  $(OBJ_PATH)$*.o $(CFLAGS) $(DIVXCFLAGS) $(SERVOCFLAGS) $(CFLAGS_PROC2) $(ECOS_GLOBAL_CFLAGS) $(CFLAGS_SYS) $<
 
 $(OBJ_PATH)%.o: %.c
+	@echo "     COMPILING    :  $<"
+	@$(XCC) -c -o  $(OBJ_PATH)$*.o $(CFLAGS) $(DIVXCFLAGS) $(SERVOCFLAGS) $(CFLAGS_PROC2) $(ECOS_GLOBAL_CFLAGS) $(CFLAGS_SYS) $<
+
+$(OBJ_PATH)%.o: $(JUPITER_PATH)%.c
 	@echo "     COMPILING    :  $<"
 	@$(XCC) -c -o  $(OBJ_PATH)$*.o $(CFLAGS) $(DIVXCFLAGS) $(SERVOCFLAGS) $(CFLAGS_PROC2) $(ECOS_GLOBAL_CFLAGS) $(CFLAGS_SYS) $<
 

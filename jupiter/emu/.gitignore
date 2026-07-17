@@ -4,7 +4,4 @@ tests/*.o
 tests/*.elf
 tests/*.bin
 *.log
-*_io.txt
-*_err.txt
-boot_iolog.txt
-seed_io.txt
+*.txt

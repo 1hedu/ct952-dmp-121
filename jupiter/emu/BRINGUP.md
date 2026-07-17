@@ -334,6 +334,36 @@ default) is never reached. So phase 2 runs before phase 1 -- the missing
 early pass is why the descriptor is raw zero instead of `-1`-or-valid.
 Next: find why `0xa798` (the phase-1 caller) is skipped in this boot.
 
+### Root: the display-init phase is event/callback-gated
+
+Both `0x416f4` call sites confirm the split -- `0xadbc` passes `0x14`
+(bit2 set = apply), `0xa8c0` passes `0x11` (bit2 clear = default-init).
+The default-init orchestrator is fn `0xa798`, and it is **event-gated**:
+a dispatcher at `0x4860` calls it only when
+`*(0x4002fb58) != 0` **or** `*(state+0x1f4) == 2` (an init/mode event).
+Those flags are 0 in the emulator, so `0xa798` -- and the phase-1
+descriptor default-init it drives -- never runs.
+
+The apply side is worse-coupled: fn `0xadb0` (which contains the stalling
+`0xadbc` apply) has **no direct flash callers** -- it is invoked through a
+registered function pointer (a callback / message handler). So the apply
+fires from the firmware's event system *before* the default-init event is
+posted, and stalls on the still-raw descriptor.
+
+**Conclusion.** This is no longer a single missing register or table --
+it is the firmware's **boot event/callback sequencing**. On real hardware
+a boot init step posts the display-init event (`*(0x4002fb58)` /
+`state+0x1f4`), `0xa798` runs, `0x416f4`'s default path + `0x3ce60` build
+the descriptor from the real `SETD` settings (which are present in this
+image), and only then does the apply callback fire. The emulator's
+`rom_load` stages code+data but does not reproduce this event posting, so
+the ordering inverts. A faithful fix means modelling that boot event
+sequence (or running the real `dsu_boot`, which posts it) -- a deeper
+undertaking than a device stub. The `--skip-panelcfg` aid short-circuits
+exactly this gap (forcing the apply's descriptor to the `-1` "no-override"
+skip the firmware itself uses), and demonstrably carries boot into display
+init; it stands in until the event layer is modelled.
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

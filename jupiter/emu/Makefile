@@ -122,6 +122,14 @@ boot: ct952emu
 	@echo "--- uart ---"; head -c 2000 boot_uart.log; echo
 	@echo "--- iolog (head) ---"; head -30 boot_iolog.txt
 
+# Boot the real DP700WD device image (in-tree) and snapshot the display.
+# --skip-panelcfg carries boot past the config-arena frontier into display
+# init (see BRINGUP.md); drop it to reproduce the raw stall.
+bootreal: ct952emu
+	./ct952emu dp700wd.bin --rom-load --skip-panelcfg \
+	    --instr 800000000 --quiet --fb-out dp700wd_screen.ppm \
+	    --iolog dp700wd_iolog.txt
+
 clean:
 	rm -f ct952emu test_sparc tests/*.o tests/*.elf tests/*.bin \
 	    boot_uart.log boot_iolog.txt

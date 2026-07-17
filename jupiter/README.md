@@ -23,6 +23,7 @@ line-for-line copy.
 | `draw_rect` / `sprite_blit` (NEON) | `jdraw.h` | Plain-C 8bpp fill/clear/color-keyed blit with clipping. |
 | platform layer (`video_/input_/timer_`) | `jshim.h` + `jshim_ct952.c` | See mapping below. |
 | — | `jrgb2yuv.c/h` | New: ARGB8888 → `0x00YYUUVV` BT.601 (the OSD palette is **YUV, not RGB**). |
+| `sprite_neon.S` blit engine (the "GPU" role) | `jgpu.c/h` + `jgpu_ct952.c` | A real driver for the CT952's 2D blitter (fill-rect + color-keyed/mirrored blits over pitched 8bpp surfaces): pure op-builders whose register math is verified byte-exact against a CPU reference through a software model of the block; async submit/sync (stock firmware only busy-waits); the never-enabled `_HP` opcodes, max DRAM burst thresholds, and hardware beam-race gating exposed as flags. Color-bars scene doubles as the hardware bring-up test (`JAPP_USE_GPU`). |
 | `cedar.c` / `libcedarjpeg` (codec layer) | `jfb.c/h` + `jcodec.h` + `jcodec_ct952.c` | The Cedar analogue. `jfb`: CPU access to the video plane's block-tiled YUV 4:2:0 framebuffers (the `argb↔nv12` conversion role) — swizzle verified bijective over the full 704×480 canvas in tests. `jcodec`: MPEG-still decode **from memory** through the hardware VLD (the boot-logo idiom), hardware JPEG decode from memory (JPEG-logo idiom), JPEG encode of any framebuffer region (photo-save idiom), and JPU hardware scale-copy (digest idiom). |
 | `template/game.c` demo pattern | `japp.c/h` | Demo app on the superloop: color bars, NES scene (scroll + sprites + APU jingle), GB scene, Genesis scene (two-plane parallax + window HUD + sprites), SNES Mode 7 flight, and a **YUV canvas scene** — the NES scene rendered full-color on the video plane via `jfb` (the `cedar_nes`-pipeline analogue). |
 
@@ -99,6 +100,10 @@ above). What has NOT been exercised on hardware:
 - The OSD bring-up sequence in `jvid_open()` (region config, mix ratio,
   activation) follows the firmware's own idiom (`osdnd.c`/`osdmm.c`)
   but has not run on a CT952.
+- `jgpu_ct952.c` (blitter submit/sync) mirrors gdi.c's GXA programming
+  exactly, and the op math is model-verified, but the hardware has not
+  executed it in this effort. `JAPP_USE_GPU 0` in japp.c falls back to
+  CPU drawing.
 - All of `jcodec_ct952.c` (canvas binding, MPEG/JPEG decode-from-memory,
   JPEG encode, JPU scale) mirrors the firmware's own call sequences
   (`utl.c` logo paths, `mm_play.c` photo save, `digest.c`) line for

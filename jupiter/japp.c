@@ -35,7 +35,13 @@
 #include "jaudio.h"
 #include "jfb.h"
 #include "jcodec.h"
+#include "jgpu.h"
 #include "japp.h"
+
+/* Use the 2D engine for OSD fills (color bars, scene clears). The
+ * blitter path mirrors gdi.c's own programming; set to 0 to fall back
+ * to CPU drawing if hardware bring-up misbehaves. */
+#define JAPP_USE_GPU 1
 
 extern BYTE __bKey;
 
@@ -379,7 +385,9 @@ static void play_jingle(void)
 static void scene_colorbars(void)
 {
     /* 8 SMPTE-order bars from NES master colors:
-     * white, yellow, cyan, green, magenta, red, blue, black */
+     * white, yellow, cyan, green, magenta, red, blue, black.
+     * Drawn by the 2D engine when JAPP_USE_GPU -- this scene doubles
+     * as the blitter's hardware bring-up test. */
     static const uint8_t bar_color[8] = {
         0x30, 0x28, 0x2C, 0x2A, 0x24, 0x16, 0x12, 0x0F
     };
@@ -387,10 +395,17 @@ static void scene_colorbars(void)
     int i;
     int barw = JVID_W / 8;
 
-    for (i = 0; i < 8; i++)
-        jdraw_rect(fb, JVID_PITCH, i * barw, 0,
-                   (i == 7) ? (JVID_W - 7 * barw) : barw, JVID_H,
-                   (uint8_t)(JPAL_NES_BASE + bar_color[i]));
+    for (i = 0; i < 8; i++) {
+        int w = (i == 7) ? (JVID_W - 7 * barw) : barw;
+        uint8_t c = (uint8_t)(JPAL_NES_BASE + bar_color[i]);
+#if JAPP_USE_GPU
+        if (jgpu_fill((uint32_t)fb, JVID_PITCH,
+                      (uint32_t)(i * barw), 0, (uint32_t)w, JVID_H,
+                      c, JGPU_F_HP | JGPU_F_BURST_MAX) == 0)
+            continue;
+#endif
+        jdraw_rect(fb, JVID_PITCH, i * barw, 0, w, JVID_H, c);
+    }
 }
 
 static void scene_nes_frame(void)
@@ -555,8 +570,13 @@ static void scene_enter(void)
     canvas_leave();
 
     /* Frame the scene area with the NES black; scenes draw inside */
-    jdraw_clear(jvid_fb(), JVID_PITCH, JVID_W, JVID_H,
-                (uint8_t)(JPAL_NES_BASE + 0x0F));
+#if JAPP_USE_GPU
+    if (jgpu_fill((uint32_t)jvid_fb(), JVID_PITCH, 0, 0, JVID_W, JVID_H,
+                  (uint8_t)(JPAL_NES_BASE + 0x0F),
+                  JGPU_F_HP | JGPU_F_BURST_MAX) != 0)
+#endif
+        jdraw_clear(jvid_fb(), JVID_PITCH, JVID_W, JVID_H,
+                    (uint8_t)(JPAL_NES_BASE + 0x0F));
     _bSceneDirty = 1;
     play_jingle();
 }

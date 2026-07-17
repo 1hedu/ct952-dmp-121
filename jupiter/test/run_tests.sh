@@ -30,10 +30,13 @@ gcc -O2 -Wall -DJUP_HOST_BUILD -I"$JUP" \
     test_fb.c "$JUP/jfb.c" "$JUP/jrgb2yuv.c" \
     -o build/native/test_fb || FAIL=1
 gcc -O2 -Wall -DJUP_HOST_BUILD -I"$JUP" \
+    test_gpu.c "$JUP/jgpu.c" \
+    -o build/native/test_gpu || FAIL=1
+gcc -O2 -Wall -DJUP_HOST_BUILD -I"$JUP" \
     test_audio.c "$JUP/jaudio.c" \
     -o build/native/test_audio || FAIL=1
 (cd build/native && ./test_render && ./test_render2 && ./test_fb \
-    && ./test_audio) | tee native.log || FAIL=1
+    && ./test_gpu && ./test_audio) | tee native.log || FAIL=1
 
 echo
 echo "=== 2. big-endian SPARC tests under qemu ==="
@@ -48,11 +51,14 @@ sparc64-linux-gnu-gcc -O2 -Wall -static -DJUP_HOST_BUILD -I"$JUP" \
     test_fb.c "$JUP/jfb.c" "$JUP/jrgb2yuv.c" \
     -o build/sparc/test_fb || FAIL=1
 sparc64-linux-gnu-gcc -O2 -Wall -static -DJUP_HOST_BUILD -I"$JUP" \
+    test_gpu.c "$JUP/jgpu.c" \
+    -o build/sparc/test_gpu || FAIL=1
+sparc64-linux-gnu-gcc -O2 -Wall -static -DJUP_HOST_BUILD -I"$JUP" \
     test_audio.c "$JUP/jaudio.c" \
     -o build/sparc/test_audio || FAIL=1
 (cd build/sparc && qemu-sparc64 ./test_render && qemu-sparc64 ./test_render2 \
-    && qemu-sparc64 ./test_fb && qemu-sparc64 ./test_audio) \
-    | tee sparc.log || FAIL=1
+    && qemu-sparc64 ./test_fb && qemu-sparc64 ./test_gpu \
+    && qemu-sparc64 ./test_audio) | tee sparc.log || FAIL=1
 
 echo
 echo "=== 3. endianness cross-check ==="
@@ -70,7 +76,7 @@ echo "=== 4. firmware compile-check (SPARC V8 ILP32, real headers) ==="
 FWCC="sparc64-linux-gnu-gcc -m32 -mcpu=v8 -msoft-float -Wall -Wno-comment \
       -Wno-endif-labels -fsigned-char -c -I$REPO -I$JUP -Iecos_stub"
 mkdir -p build/fw
-for f in jnes jgb jsnes jgen jaudio jrgb2yuv jfb jcodec_ct952 jshim_ct952 japp; do
+for f in jnes jgb jsnes jgen jaudio jrgb2yuv jfb jcodec_ct952 jgpu jgpu_ct952 jshim_ct952 japp; do
     if $FWCC "$JUP/$f.c" -o "build/fw/$f.o" 2> "build/fw/$f.err"; then
         echo "  OK   $f.c"
     else

@@ -93,6 +93,7 @@ ifeq ($(SUPPORT_JUPITER), 1)
 JUPOBJ = $(OBJ_PATH)jnes.o $(OBJ_PATH)jgb.o $(OBJ_PATH)jsnes.o \
 	$(OBJ_PATH)jgen.o $(OBJ_PATH)jaudio.o $(OBJ_PATH)jfb.o \
 	$(OBJ_PATH)jcodec_ct952.o $(OBJ_PATH)jgpu.o $(OBJ_PATH)jgpu_ct952.o \
+	$(OBJ_PATH)jspr.o \
 	$(OBJ_PATH)jrgb2yuv.o $(OBJ_PATH)jshim_ct952.o $(OBJ_PATH)japp.o
 OBJ += $(JUPOBJ)
 CFLAGS += -DSUPPORT_JUPITER -I $(JUPITER_PATH)

@@ -36,6 +36,7 @@
 #include "jfb.h"
 #include "jcodec.h"
 #include "jgpu.h"
+#include "jspr.h"
 #include "japp.h"
 
 /* Use the 2D engine for OSD fills (color bars, scene clears). The
@@ -57,9 +58,10 @@ extern BYTE __bKey;
 #define JPAL_GEN_BASE  128
 #define JPAL_GB_BASE   192
 
-#define JAPP_SCENES    6
+#define JAPP_SCENES    7
 #define JAPP_FRAME_MS  33   /* ~30 fps target; degrades gracefully */
 #define JAPP_SCENE_CANVAS 5 /* video-plane scene: OSD closed while active */
+#define JAPP_SCENE_SPRITES 6 /* 2D-engine sprite scene */
 
 static BYTE _bJupActive = 0;
 static BYTE _bScene = 0;
@@ -104,6 +106,16 @@ static snes_mode7_t m7_cfg;
 static jfb_t _canvas;
 static uint32_t canvas_pal_yuv[256];  /* OSD index -> 0x00YYUUVV */
 static BYTE _bCanvasActive = 0;
+
+/* ---- GPU sprite scene state ----
+ * The atlas is a static: it lives in DRAM, so the blitter can read it
+ * directly by address. 2 sprites of 24x24 side by side. */
+#define SPR_SZ    24
+#define SPR_COUNT 10
+static uint8_t spr_atlas[SPR_SZ * 2 * SPR_SZ]
+    __attribute__((aligned(4)));
+static int16_t spr_x[SPR_COUNT], spr_y[SPR_COUNT];
+static int16_t spr_dx_[SPR_COUNT], spr_dy_[SPR_COUNT];
 
 /* Set one pixel of a 2bpp tile (shared CHR helper) */
 static void chr_set(uint8_t *tile, int row, int col, uint8_t ci)
@@ -354,6 +366,77 @@ static void build_m7_assets(void)
     m7_cfg.map_w_bits = 6; m7_cfg.map_mask = 63;
 }
 
+static void build_spr_assets(void)
+{
+    int r, c, i;
+    uint32_t pitch = SPR_SZ * 2;
+
+    /* Sprite 0: shaded ball; sprite 1: diamond. Index 0 = key. */
+    for (i = 0; i < (int)sizeof(spr_atlas); i++) spr_atlas[i] = 0;
+    for (r = 0; r < SPR_SZ; r++)
+        for (c = 0; c < SPR_SZ; c++) {
+            int dx = 2 * c - (SPR_SZ - 1), dy = 2 * r - (SPR_SZ - 1);
+            int d2 = dx * dx + dy * dy;
+            if (d2 <= (SPR_SZ - 1) * (SPR_SZ - 1))
+                spr_atlas[r * pitch + c] = (uint8_t)(JPAL_NES_BASE +
+                    ((d2 < 200) ? 0x30 : (d2 < 380 ? 0x27 : 0x16)));
+            if ((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) <= SPR_SZ - 1)
+                spr_atlas[r * pitch + SPR_SZ + c] =
+                    (uint8_t)(JPAL_NES_BASE + ((r > c) ? 0x2A : 0x12));
+        }
+
+    for (i = 0; i < SPR_COUNT; i++) {
+        spr_x[i] = (int16_t)(20 + i * 55);
+        spr_y[i] = (int16_t)(30 + (i * 83) % 300);
+        spr_dx_[i] = (int16_t)((i & 1) ? 3 : -2);
+        spr_dy_[i] = (int16_t)((i & 2) ? 2 : -3);
+    }
+}
+
+/* GPU sprite scene: the 2D engine clears the playfield ASYNC while the
+ * CPU updates positions (the overlap the stock driver never does),
+ * then blits every sprite hardware-color-keyed; odd sprites use the
+ * hardware mirror. */
+static void scene_spr_frame(void)
+{
+    jgpu_op_t clear_op;
+    jspr_surface_t dst, atlas;
+    int i;
+
+    dst.base = (uint32_t)jvid_fb();
+    dst.pitch = JVID_PITCH;
+    dst.w = JVID_W;
+    dst.h = JVID_H;
+    atlas.base = (uint32_t)spr_atlas;
+    atlas.pitch = SPR_SZ * 2;
+    atlas.w = SPR_SZ * 2;
+    atlas.h = SPR_SZ;
+
+    /* Kick the background clear, overlap the game logic, then sync */
+    if (jgpu_build_fill(&clear_op, dst.base, dst.pitch, 0, 0,
+                        JVID_W, JVID_H,
+                        (uint8_t)(JPAL_NES_BASE + 0x0F),
+                        JGPU_F_HP | JGPU_F_BURST_MAX) == 0) {
+        jgpu_submit(&clear_op);
+        for (i = 0; i < SPR_COUNT; i++) {
+            spr_x[i] = (int16_t)(spr_x[i] + spr_dx_[i]);
+            spr_y[i] = (int16_t)(spr_y[i] + spr_dy_[i]);
+            /* bounce against the full region, sprites may clip edges */
+            if (spr_x[i] < -SPR_SZ / 2 || spr_x[i] > JVID_W - SPR_SZ / 2)
+                spr_dx_[i] = (int16_t)-spr_dx_[i];
+            if (spr_y[i] < -SPR_SZ / 2 || spr_y[i] > JVID_H - SPR_SZ / 2)
+                spr_dy_[i] = (int16_t)-spr_dy_[i];
+        }
+        jgpu_sync();
+    }
+
+    for (i = 0; i < SPR_COUNT; i++)
+        jspr_blit(&dst, spr_x[i], spr_y[i], &atlas,
+                  (uint32_t)((i & 2) ? SPR_SZ : 0), 0,
+                  SPR_SZ, SPR_SZ, 0,
+                  (i & 1) ? JSPR_HFLIP : 0);
+}
+
 /* Entry jingle: APU square arpeggio + noise hit, rendered offline into
  * DRAM scratch and submitted through the HAL raw-PCM path. */
 static void play_jingle(void)
@@ -591,6 +674,7 @@ static void jupiter_enter(void)
     build_gb_assets();
     build_gen_assets();
     build_m7_assets();
+    build_spr_assets();
     _bScene = 0;
     _bJupActive = 1;
     _dwLastFrameMs = 0;
@@ -681,6 +765,9 @@ void JUPITER_Trigger(void)
     case JAPP_SCENE_CANVAS:
         if (_bCanvasActive)
             scene_canvas_frame();
+        break;
+    case JAPP_SCENE_SPRITES:
+        scene_spr_frame();
         break;
     default:
         break;

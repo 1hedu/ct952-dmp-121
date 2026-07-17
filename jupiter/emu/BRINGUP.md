@@ -364,6 +364,29 @@ exactly this gap (forcing the apply's descriptor to the `-1` "no-override"
 skip the firmware itself uses), and demonstrably carries boot into display
 init; it stands in until the event layer is modelled.
 
+### Toward faithful: run the firmware's own builder on the real SETD
+
+Rather than skip, `--build-panelcfg` reproduces the missing default-init
+*faithfully*: at the first fetch of the config thunk (`0x3d564`) it saves
+the boot CPU context, invokes the firmware's own descriptor builder
+`0x3ce60` via `machine_call` (the same in-emulator-execution trick that
+cracked the decompressor), then restores context. `0x3ce60` runs cleanly
+(`rc=0`) and **builds the descriptor from the real `SETD` sector**:
+`desc+0x14 = 0x1000` (SETD flash address), `desc+0x10 = 0x1c00`. So the
+firmware's own code, on the device's own settings, produces a live
+descriptor -- the faithful path works.
+
+It is **not yet sufficient alone**, and the trace shows why: the config
+walk also reads an *inner* register table at DRAM `0x40042000`, which is
+still empty -- that table is populated by the apply pass itself (from the
+descriptor), and `desc+0x10 = 0x1c00` is a flash offset the walk consumes
+differently than a ready DRAM table. So one more layer remains: either
+run the descriptor build at the point where the apply expects it (so the
+apply fills `0x40042000`), or model the apply's table-population. The
+mechanism and the proof that the builder works on real SETD data are the
+groundwork; `--build-panelcfg` is committed as the in-progress faithful
+path, `--skip-panelcfg` remains the working bridge to display init.
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

@@ -399,6 +399,25 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
         uint64_t chunk = n - done;
         uint64_t ran, i;
+        /* Faithful panel-config build (opt-in): at the first fetch of the
+         * config thunk (flash 0x3d564), run the firmware's own descriptor
+         * builder (0x3ce60) on the live machine -- it reads the real SETD
+         * settings sector -- preserving the boot CPU context across the
+         * call. Reproduces the default-init pass the eCos init-callback
+         * list would run before the apply. NOTE: builds the descriptor
+         * (desc+0x10/0x14 from SETD) but is not yet sufficient on its own
+         * -- the inner register table at 0x40042000 is populated by the
+         * apply itself, which is the next layer. */
+        if (m->build_panelcfg && !m->panelcfg_built) {
+            if (m->cpu.pc == 0x3d564u) {
+                sparc_t save = m->cpu;
+                machine_call(m, 0x3ce60u, 0, 0, 0, 0x40700000u, 50000000ull);
+                m->cpu = save;
+                m->panelcfg_built = 1;
+            } else {
+                chunk = 1;   /* single-step until the thunk is reached */
+            }
+        }
         if (chunk > 4096) chunk = 4096;
         ran = sparc_run(&m->cpu, chunk);
         done += ran;

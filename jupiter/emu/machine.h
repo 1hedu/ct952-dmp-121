@@ -62,6 +62,13 @@ typedef struct machine {
      * instead of spinning on the never-initialised config arena. */
     int skip_panelcfg;
 
+    /* faithful aid: just before the config thunk (0x3d564) first runs,
+     * invoke the firmware's own descriptor builder (0x3ce60) via
+     * machine_call so the descriptor is built from the real SETD settings
+     * sector -- reproducing the default-init pass the eCos init-callback
+     * list would have run before the apply callback. */
+    int build_panelcfg, panelcfg_built;
+
     /* io access inventory */
     mach_logent_t log[MACH_LOG_MAX];
     int log_n;

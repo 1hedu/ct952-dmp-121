@@ -37,6 +37,8 @@
 #include "jcodec.h"
 #include "jgpu.h"
 #include "jspr.h"
+#include "jlayer.h"
+#include "jdraw2.h"
 #include "japp.h"
 
 /* Use the 2D engine for OSD fills (color bars, scene clears). The
@@ -58,10 +60,11 @@ extern BYTE __bKey;
 #define JPAL_GEN_BASE  128
 #define JPAL_GB_BASE   192
 
-#define JAPP_SCENES    7
+#define JAPP_SCENES    8
 #define JAPP_FRAME_MS  33   /* ~30 fps target; degrades gracefully */
 #define JAPP_SCENE_CANVAS 5 /* video-plane scene: OSD closed while active */
 #define JAPP_SCENE_SPRITES 6 /* 2D-engine sprite scene */
+#define JAPP_SCENE_TRILAYER 7 /* video + SP1 + SP2 hardware layer stack */
 
 static BYTE _bJupActive = 0;
 static BYTE _bScene = 0;
@@ -116,6 +119,18 @@ static uint8_t spr_atlas[SPR_SZ * 2 * SPR_SZ]
     __attribute__((aligned(4)));
 static int16_t spr_x[SPR_COUNT], spr_y[SPR_COUNT];
 static int16_t spr_dx_[SPR_COUNT], spr_dy_[SPR_COUNT];
+
+/* ---- Trilayer scene state ---- */
+static jlayer_sp_t sp_fog, sp_hud;
+static BYTE _bSPActive = 0;
+static uint16_t _wFogPhase = 0;
+static uint16_t _wHudBar = 0;
+
+#define FOG_W 624
+#define FOG_H 48
+#define HUD_W 624
+#define HUD_H 36
+#define SP_X_BASE 51   /* display-coordinate origin the firmware uses */
 
 /* Set one pixel of a 2bpp tile (shared CHR helper) */
 static void chr_set(uint8_t *tile, int row, int col, uint8_t ci)
@@ -597,10 +612,18 @@ static void canvas_enter(void)
     _bCanvasActive = 1;
 }
 
-/* Leave the canvas scene: hide the video plane and restore the OSD
- * (region + palettes), since jvid_close() dropped it. */
+static void scene_canvas_frame(void);   /* defined below */
+
+/* Leave the canvas/trilayer scenes: drop any SP overlays, hide the
+ * video plane and restore the OSD (region + palettes), since
+ * jvid_close() dropped it. */
 static void canvas_leave(void)
 {
+    if (_bSPActive) {
+        _bSPActive = 0;
+        jlayer_sp_close(JLAYER_SP1);
+        jlayer_sp_close(JLAYER_SP2);
+    }
     if (!_bCanvasActive)
         return;
     _bCanvasActive = 0;
@@ -609,6 +632,97 @@ static void canvas_leave(void)
     jvid_load_palette(JPAL_NES_BASE, jup_nes_master_palette, 64);
     build_gb_assets();    /* reloads the GB palette entries */
     build_gen_assets();   /* reloads the Genesis CRAM entries */
+}
+
+/* Enter the trilayer scene: the NES canvas on the video plane, a
+ * drifting translucent fog band on SP1 and a HUD panel on SP2 -- three
+ * hardware-composited layers, zero CPU blending. */
+static void trilayer_enter(void)
+{
+    uint32_t cap;
+    uint8_t *buf;
+    uint16_t x;
+
+    canvas_enter();
+    if (!_bCanvasActive)
+        return;
+
+    /* SP1: fog. Dithered bands of the 3 visible indices. */
+    buf = jlayer_sp_buffer(JLAYER_SP1, &cap);
+    if (buf && cap >= (FOG_W / 4) * FOG_H &&
+        jlayer_sp_open(&sp_fog, JLAYER_SP1, SP_X_BASE, 200,
+                       FOG_W, FOG_H, buf) == 0) {
+        uint32_t r, c;
+        jdraw2_clear(sp_fog.bmp, sp_fog.pitch, sp_fog.h, 0);
+        for (r = 0; r < FOG_H; r++)
+            for (c = 0; c < FOG_W; c++) {
+                uint32_t band = (r * 4) / FOG_H;   /* denser center */
+                uint32_t d = ((c + r * 3) ^ (r << 1)) & 7;
+                uint8_t ci = 0;
+                if (band == 1 || band == 2)
+                    ci = (uint8_t)((d < 5) ? 2 : 1);
+                else
+                    ci = (uint8_t)((d < 3) ? 1 : 0);
+                if (ci)
+                    jdraw2_set(sp_fog.bmp, sp_fog.pitch, c, r, ci);
+            }
+        jlayer_sp_color(JLAYER_SP1, 0, 0xFF000000, 0);   /* clear */
+        jlayer_sp_color(JLAYER_SP1, 1, 0xFFFFFFFF, 4);   /* thin mist */
+        jlayer_sp_color(JLAYER_SP1, 2, 0xFFE0F0FF, 8);   /* dense mist */
+        jlayer_sp_color(JLAYER_SP1, 3, 0xFFFFFFFF, 12);
+        jlayer_sp_show(JLAYER_SP1, 1);
+        _bSPActive = 1;
+    }
+
+    /* SP2: HUD panel with border and a progress bar. */
+    buf = jlayer_sp_buffer(JLAYER_SP2, &cap);
+    if (buf && cap >= (HUD_W / 4) * HUD_H &&
+        jlayer_sp_open(&sp_hud, JLAYER_SP2, SP_X_BASE, 40,
+                       HUD_W, HUD_H, buf) == 0) {
+        jdraw2_clear(sp_hud.bmp, sp_hud.pitch, sp_hud.h, 1);
+        jdraw2_frame(sp_hud.bmp, sp_hud.pitch, 0, 0, HUD_W, HUD_H, 2, 2);
+        for (x = 16; x < HUD_W - 16; x = (uint16_t)(x + 60))
+            jdraw2_fill(sp_hud.bmp, sp_hud.pitch, x, 6, 2, 6, 3);
+        jlayer_sp_color(JLAYER_SP2, 0, 0xFF000000, 0);
+        jlayer_sp_color(JLAYER_SP2, 1, 0xFF102040, 9);   /* glassy panel */
+        jlayer_sp_color(JLAYER_SP2, 2, 0xFFFFFFFF, 15);  /* border */
+        jlayer_sp_color(JLAYER_SP2, 3, 0xFFFFD040, 15);  /* accents */
+        jlayer_sp_show(JLAYER_SP2, 1);
+        _bSPActive = 1;
+    }
+
+    _wFogPhase = 0;
+    _wHudBar = 0;
+}
+
+static void scene_trilayer_frame(void)
+{
+    /* The NES world keeps running on the video plane */
+    scene_canvas_frame();
+
+    /* Fog drifts by MOVING THE PLANE -- hardware scroll, no redraw */
+    _wFogPhase++;
+    {
+        static const int8_t drift[16] = {
+            0, 2, 4, 6, 7, 8, 7, 6, 4, 2, 0, -2, -4, -6, -4, -2
+        };
+        jlayer_sp_move(JLAYER_SP1,
+                       (uint16_t)(SP_X_BASE + 8 +
+                                  drift[(_wFogPhase >> 3) & 15]),
+                       200);
+    }
+
+    /* HUD bar creeps along -- tiny redraw in the 2bpp buffer */
+    if ((_wFogPhase & 7) == 0 && _wHudBar < HUD_W - 40) {
+        jdraw2_fill(sp_hud.bmp, sp_hud.pitch, 16, HUD_H - 14,
+                    (uint32_t)(24 + _wHudBar), 6, 3);
+        _wHudBar = (uint16_t)(_wHudBar + 4);
+        if (_wHudBar >= HUD_W - 40) {
+            jdraw2_fill(sp_hud.bmp, sp_hud.pitch, 16, HUD_H - 14,
+                        HUD_W - 32, 6, 1);
+            _wHudBar = 0;
+        }
+    }
 }
 
 static void scene_canvas_frame(void)
@@ -644,8 +758,12 @@ static void scene_canvas_frame(void)
 
 static void scene_enter(void)
 {
-    if (_bScene == JAPP_SCENE_CANVAS) {
-        canvas_enter();
+    if (_bScene == JAPP_SCENE_CANVAS || _bScene == JAPP_SCENE_TRILAYER) {
+        canvas_leave();   /* reset any previous SP/canvas state */
+        if (_bScene == JAPP_SCENE_TRILAYER)
+            trilayer_enter();
+        else
+            canvas_enter();
         _bSceneDirty = 1;
         play_jingle();
         return;
@@ -768,6 +886,10 @@ void JUPITER_Trigger(void)
         break;
     case JAPP_SCENE_SPRITES:
         scene_spr_frame();
+        break;
+    case JAPP_SCENE_TRILAYER:
+        if (_bCanvasActive)
+            scene_trilayer_frame();
         break;
     default:
         break;

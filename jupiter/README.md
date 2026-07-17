@@ -23,6 +23,7 @@ line-for-line copy.
 | `draw_rect` / `sprite_blit` (NEON) | `jdraw.h` | Plain-C 8bpp fill/clear/color-keyed blit with clipping. |
 | platform layer (`video_/input_/timer_`) | `jshim.h` + `jshim_ct952.c` | See mapping below. |
 | — | `jrgb2yuv.c/h` | New: ARGB8888 → `0x00YYUUVV` BT.601 (the OSD palette is **YUV, not RGB**). |
+| DE2 mixer layer model (VI0+VI1+UI0) | `jlayer.c/h` + `jdraw2.h` | The layer manager: brings the two idle DVD-subpicture planes online as **hardware overlay layers** in raw-bitmap mode (the firmware's own DivX-subtitle recipe, parameterized) — each 2bpp with 4 colors carrying individual YUV + **16-level per-color alpha**, hardware position/move (whole-layer scroll without redraw), over the OSD and video planes. Full stack: video canvas + OSD + SP1 + SP2 = four hardware-composited layers, zero CPU blending. `jdraw2.h` provides the 2bpp drawing helpers (packing convention test-pinned). Demo scene 7 "trilayer": NES world full-color on the video plane + drifting translucent fog on SP1 (moved by hardware, never redrawn) + glassy HUD panel on SP2. |
 | `sprite.c` sprite API | `jspr.c/h` | Color-keyed atlas sprites executed by the 2D engine, with hardware mirror as hflip and full destination clipping (including the mirror-aware source adjustment). Pluggable executor: real blitter on firmware, software model in tests — output verified byte-exact against a CPU reference across all clip edges. Demo scene 6 bounces 10 hardware sprites while the blitter clears the playfield asynchronously under the CPU's position update. |
 | `sprite_neon.S` blit engine (the "GPU" role) | `jgpu.c/h` + `jgpu_ct952.c` | A real driver for the CT952's 2D blitter (fill-rect + color-keyed/mirrored blits over pitched 8bpp surfaces): pure op-builders whose register math is verified byte-exact against a CPU reference through a software model of the block; async submit/sync (stock firmware only busy-waits); the never-enabled `_HP` opcodes, max DRAM burst thresholds, and hardware beam-race gating exposed as flags. Color-bars scene doubles as the hardware bring-up test (`JAPP_USE_GPU`). |
 | `cedar.c` / `libcedarjpeg` (codec layer) | `jfb.c/h` + `jcodec.h` + `jcodec_ct952.c` | The Cedar analogue. `jfb`: CPU access to the video plane's block-tiled YUV 4:2:0 framebuffers (the `argb↔nv12` conversion role) — swizzle verified bijective over the full 704×480 canvas in tests. `jcodec`: MPEG-still decode **from memory** through the hardware VLD (the boot-logo idiom), hardware JPEG decode from memory (JPEG-logo idiom), JPEG encode of any framebuffer region (photo-save idiom), and JPU hardware scale-copy (digest idiom). |
@@ -101,6 +102,10 @@ above). What has NOT been exercised on hardware:
 - The OSD bring-up sequence in `jvid_open()` (region config, mix ratio,
   activation) follows the firmware's own idiom (`osdnd.c`/`osdmm.c`)
   but has not run on a CT952.
+- `jlayer_ct952.c` follows char_subpict.c's SPU-bitmap recipe exactly
+  but is hardware-unverified; the 2bpp in-byte pixel order
+  (leftmost = high bits) is inferred from the GDI conventions and
+  test-pinned so a hardware session can correct it in one place.
 - `jgpu_ct952.c` (blitter submit/sync) mirrors gdi.c's GXA programming
   exactly, and the op math is model-verified, but the hardware has not
   executed it in this effort. `JAPP_USE_GPU 0` in japp.c falls back to

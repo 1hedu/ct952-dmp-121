@@ -16,6 +16,7 @@ int main(int argc, char **argv)
 {
     const char *rom_path = NULL, *uart_path = NULL, *iolog_path = NULL;
     const char *dram_path = NULL;
+    uint32_t watch_lo = 0;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
     int rom_load = 0;
@@ -35,6 +36,8 @@ int main(int argc, char **argv)
             iolog_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dram") && i + 1 < argc)
             dram_path = argv[++i];
+        else if (!strcmp(argv[i], "--watch") && i + 1 < argc)
+            watch_lo = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
@@ -99,6 +102,14 @@ int main(int argc, char **argv)
                 seed_entry, seed_sp);
     }
 
+    if (watch_lo) {
+        m->watch_lo = watch_lo;
+        m->watch_hi = watch_lo + 0x40;   /* watch a 64-byte window */
+        m->watch_left = 40;
+        fprintf(stderr, "[ct952emu] watching DRAM writes to [0x%08x,0x%08x)\n",
+                m->watch_lo, m->watch_hi);
+    }
+
     fprintf(stderr, "[ct952emu] flash %ld bytes, running %llu instrs\n",
             sz, (unsigned long long)max_instr);
     ran = machine_run(m, max_instr);
@@ -124,6 +135,20 @@ int main(int argc, char **argv)
             fprintf(stderr, "    0x%08x -> 0x%08x\n",
                     m->cpu.tr_from[idx], m->cpu.tr_to[idx]);
         }
+    }
+
+    /* window + global registers at the stop -- names table pointers,
+     * loop counters, and the caller (%i7/%o7) at the frontier */
+    {
+        static const char *gname[8] = {"g0","g1","g2","g3","g4","g5","g6","g7"};
+        int r;
+        fprintf(stderr, "[ct952emu] registers at stop:\n");
+        for (r = 0; r < 8; r++)
+            fprintf(stderr, "    %s=%08x  o%d=%08x  l%d=%08x  i%d=%08x\n",
+                    gname[r], m->cpu.g[r],
+                    r, sparc_get_reg(&m->cpu, 8 + r),
+                    r, sparc_get_reg(&m->cpu, 16 + r),
+                    r, sparc_get_reg(&m->cpu, 24 + r));
     }
 
     /* last 64 PCs executed -- pinpoints the exact hot loop body */

@@ -89,11 +89,24 @@ count exceeds 255, so it can't terminate -- one of the config tables it
 walks still holds a value that depends on state we haven't staged (a real
 EEPROM image / earlier device init). The display engine (`0x80001A00`) is
 not touched yet, so the firmware hasn't reached its own display init.
-Next step: trace who calls the `0x40020480` routine and with which
-tables, and stage the missing table/device. The tooling for this landed
-this pass: `--dump-dram`, the jmpl trace ring, and a 64-deep
-per-instruction PC ring (which is exactly how the spin loop above was
-pinpointed).
+
+Pulling that thread further (this pass): the spin is the leaf function at
+`0x400203e8` (called from flash `0x3d5ac`). It is a *leaf* -- no `save`,
+so it runs in its caller's register window -- that walks a device table
+and programs SPI-flash-controller shadow registers (`0x40046800[...]` and
+`0x80002a28`/`0x80002a34` in the `0x80002a00` PROM/SPI block) per entry.
+The inner walk indexes a runtime table at `0x40042000`; a DRAM write-watch
+(`--watch`) shows that table is **only ever memset to zero** (by
+`0x4001d1f0`) and never populated. With it empty, the per-entry "apply"
+work is always skipped and the outer counter spins against a bogus bound.
+The table lives in the DATA->ENGL BSS gap, so it is meant to be filled at
+runtime -- by storage/EEPROM probing over the `0xA0000000` FCR/SDC/NFC
+controller, which the model currently stubs to 0 (no media). So the next
+real fix is to model that controller's media-detect (or reverse the three
+caller frames that build the descriptor list) so the device table gets
+populated. Tooling that landed to get here: `--dump-dram`, `--watch ADDR`
+(DRAM write-watch with the issuing PC), the jmpl trace ring, a 64-deep
+per-instruction PC ring, and a full window+global register dump at halt.
 
 ### The older status (pre-dump), kept for context
 

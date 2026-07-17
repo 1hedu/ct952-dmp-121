@@ -232,6 +232,11 @@ static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
     if (addr < MACH_FLASH_MAX)
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
+        if (m->watch_left > 0 && addr >= m->watch_lo && addr < m->watch_hi) {
+            fprintf(stderr, "[watch] pc=0x%08x wrote [0x%08x] = 0x%08x (%dB)\n",
+                    m->cpu.pc, addr, val, size);
+            m->watch_left--;
+        }
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
         return;
     }

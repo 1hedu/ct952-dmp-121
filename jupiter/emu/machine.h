@@ -59,6 +59,11 @@ typedef struct machine {
 
     uint64_t cycles;
     int watchdog_fired;
+
+    /* DRAM write-watch: log the first N writes into [watch_lo, watch_hi)
+     * with the PC that issued them (find who fills a table). */
+    uint32_t watch_lo, watch_hi;
+    int watch_left;
 } machine_t;
 
 /* Create/reset the machine with a flash image (copied in). */

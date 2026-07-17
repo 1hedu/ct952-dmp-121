@@ -1,0 +1,4 @@
+[ct952emu] flash 1301352 bytes, running 30000000 instrs
+
+[ct952emu] stopped after 30000000 instrs: instruction budget
+[ct952emu] pc=0x000004a0 npc=0x000004a4 psr=0xf30000e0 tbr=0x00000000 cwp=0 wim=0x02

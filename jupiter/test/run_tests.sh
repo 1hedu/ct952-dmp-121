@@ -101,6 +101,17 @@ for f in jnes jgb jsnes jgen jaudio jrgb2yuv jfb jcodec_ct952 jgpu jgpu_ct952 js
 done
 
 echo
+echo "=== 5. ct952emu CPU core (bit-exact vs native) ==="
+if make -C ../emu check >emu.log 2>&1; then
+    grep -E 'CRC cpu|sparc core tests OK' emu.log || true
+    echo "  emulator CPU core: OK"
+else
+    echo "  emulator CPU core: FAIL"
+    tail -20 emu.log
+    FAIL=1
+fi
+
+echo
 if [ "$FAIL" -eq 0 ]; then
     echo "ALL CHECKS PASSED"
 else

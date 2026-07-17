@@ -227,6 +227,49 @@ dependency). Run it or stage its output (the table base + count), and the
 and boot proceeds to display init -- at which point `--fb-out` renders
 the firmware's own screen (boot logo from `LOGO` first).
 
+### Modelling the real DP700WD target (not a generic CT952)
+
+The stall is a *boot-config* subsystem (the strings around it -- "AP code
+area", "Err: Unknown DRAM type", "APPacker Version too old" -- and
+`0x40260` reading `SYSTEM_CONFIGURATION1` at `0x8000031c` -- show it is
+the AP/auto-upgrade + per-panel config path). `0x40260` decodes the
+DRAM/flash **hardware strapping** from `SYSTEM_CONFIGURATION1` (bits[4:0],
+forced `0b11xxx`) via a jump table at flash `0x40300`; with that register
+unmodelled (reading 0) it returns the `0x50000000` "unknown DRAM"
+sentinel and config-init aborts.
+
+The real strapping is embedded in the device image's own boot-config
+block (`dp700wd.bin` `0xf8c..0xfb0`), which decodes to the actual board:
+
+```
+unzip_buff 0x40002000   sp1 0x40012000   code_protect 3
+mclk_config 0x00000085  -> 133 MHz
+dram_config 0x0108011b  -> 16 Mbit = 2 MB DRAM, 909P   (low byte 0x1b)
+prom_config 0x20541010  -> serial flash, fast-read
+```
+
+So the DP700WD is a **2 MB-DRAM / 133 MHz / 16 Mbit-flash** board, strap
+`0x1b`. The emulator now models `SYSTEM_CONFIGURATION1 = 0x1b` by default
+(taken from this image; overridable via `CT952_SYSCFG1`), so `0x40260`
+returns a valid type (`0x40200000`, top of 2 MB) instead of the error
+sentinel. (The DRAM *allocation* stays 8 MB -- a harmless superset; the
+firmware's notion of size comes from the strap. Shrinking the alloc to a
+true 2 MB would need `rom_load`'s decompression scratch re-placed, a
+separate change, and it does not affect this stall.)
+
+Modelling the strap alone does not fill the config arena -- that init
+phase is still skipped -- so a labelled, opt-in bring-up aid,
+`--skip-panelcfg`, forces the config thunk's own "no override" path
+(`desc+0x14 = -1`, flash `0x3d564`). With it, the real firmware advances
+**past the config stall into display init**: it programs the DISP timing
+generator (`REG_DISP_TGEN_TOTAL 0x80001a38 = 0x120d035a`), screen size
+(`0x80001a44 = 0x00f002d0`, 720x240) and the TVE, then hits the **next
+frontier** -- a compute loop at flash `0x32e34` (a bounded sum over a
+halfword table left unpopulated by the skipped config). The aid is a
+stand-in until the config-arena init is modelled faithfully; it confirms
+the display path is reachable and that the DISP model will render the
+firmware's own output once boot completes.
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

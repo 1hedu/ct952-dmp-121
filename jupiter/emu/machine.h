@@ -56,6 +56,12 @@ typedef struct machine {
     uint8_t *rx_buf;
     uint32_t rx_len, rx_pos;
 
+    /* bring-up aid: force the panel-config descriptor's validity word
+     * (0x4002f770, desc+0x14) to read as -1, so the boot config-register
+     * thunk (flash 0x3d564) takes its built-in "no override" skip path
+     * instead of spinning on the never-initialised config arena. */
+    int skip_panelcfg;
+
     /* io access inventory */
     mach_logent_t log[MACH_LOG_MAX];
     int log_n;

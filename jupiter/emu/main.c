@@ -23,6 +23,7 @@ int main(int argc, char **argv)
     uint32_t fb_addr = 0x4005F000u;   /* DS_OSDFRAME_ST */
     uint32_t fb_w = 616, fb_h = 440;  /* firmware OSD region geometry */
     int rom_load = 0;
+    int m_skip_panelcfg = 0;
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -55,6 +56,8 @@ int main(int argc, char **argv)
             seed_sp = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--rom-load"))
             rom_load = 1;
+        else if (!strcmp(argv[i], "--skip-panelcfg"))
+            m_skip_panelcfg = 1;
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -86,6 +89,7 @@ int main(int argc, char **argv)
         return 1;
     }
     free(img);
+    m->skip_panelcfg = m_skip_panelcfg;
 
     for (i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--quiet"))

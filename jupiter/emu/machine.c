@@ -208,8 +208,11 @@ static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
             return mem_read_raw(m->flash + addr, size);
         return 0xFFFFFFFFu;   /* erased flash */
     }
-    if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE)
+    if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
+        if (m->skip_panelcfg && addr == 0x4002f770u)
+            return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
         return mem_read_raw(m->dram + (addr - 0x40000000u), size);
+    }
     if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)
         return mem_read_raw(m->dram + (addr - 0xC0000000u), size);
     if (addr >= 0x80000000u && addr < 0x80000000u + MACH_IO_SIZE) {
@@ -344,6 +347,18 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     memset(m->dram, 0, MACH_DRAM_SIZE);
     m->flash_size = flash_size;
     m->uart_echo = 1;
+
+    /* SYSTEM_CONFIGURATION1 (0x8000031c): hardware strapping the boot code
+     * decodes for DRAM/flash type. Bits[4:0] must be 0b11xxx or the AP
+     * code-area calc (flash 0x40260) returns the 0x50000000 "unknown DRAM"
+     * sentinel and boot-config aborts. Overridable via CT952_SYSCFG1 for
+     * bring-up sweeps. */
+    {
+        const char *e = getenv("CT952_SYSCFG1");
+        /* 0x1e -> AP-calc returns 0x40800000 (8 MB / 64 Mbit DRAM top),
+         * matching this model's DRAM size. */
+        m->io[0x31c / 4] = e ? (uint32_t)strtoul(e, NULL, 0) : 0x1eu;
+    }
 
     m->bus.read = bus_read;
     m->bus.write = bus_write;

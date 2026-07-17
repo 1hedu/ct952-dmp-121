@@ -1,5 +1,13 @@
 # Coby DP722 / Cheertek CT952 — SDK Teardown & Hacking Field Guide
 
+> **Device correction:** the frame in hand is a **Coby DP700WD** (7", 480×234,
+> JPEG-only), not a DP722. Same Cheertek CT9xx platform and `DMP_121` firmware —
+> only the panel resolution and the (absent) video path differ. Everything below
+> still applies. For the **source-verified deep reference** — exact register
+> addresses, the full UART monitor command/opcode tables, the serial-reflash
+> protocol, and the `.AP` image format — see **`DP700WD_HW_REFERENCE.md`**, which
+> supersedes and adds hard `file:line` evidence to this orientation.
+
 A reverse-engineering orientation to the firmware source in this repo, written
 toward one goal: **running your own code (ideally Python/MicroPython) on the
 frame, and using the USB port for something other than photo storage.**

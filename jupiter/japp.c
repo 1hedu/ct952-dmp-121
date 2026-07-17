@@ -1,16 +1,20 @@
 /*
  * JupiterSDK on CT952 -- demo application.
  *
- * Three scenes, switched with LEFT/RIGHT:
- *   0  color bars   -- palette / region bring-up check (static image)
- *   1  NES demo     -- jnes renderer: scrolling attributed background +
- *                     bouncing OAM sprites, APU jingle on entry
+ * Five scenes, switched with LEFT/RIGHT:
+ *   0  color bars    -- palette / region bring-up check (static image)
+ *   1  NES demo      -- jnes renderer: scrolling attributed background +
+ *                      bouncing OAM sprites, APU jingle on entry
  *   2  Game Boy demo -- jgb renderer: DMG-green scrolling background +
- *                     sprites
+ *                      sprites
+ *   3  Genesis demo  -- jgen renderer: two-plane parallax + window HUD +
+ *                      sprites
+ *   4  SNES Mode 7   -- jsnes renderer: affine ground flight over a
+ *                      rings texture
  *
  * All assets are generated procedurally at entry -- no bitmap resources,
- * no ROMs. The scenes exercise every ported subsystem: jnes, jgb,
- * jdraw, jaudio, jrgb2yuv and the jshim platform layer.
+ * no ROMs. The scenes exercise every ported subsystem: jnes, jgb, jgen,
+ * jsnes, jdraw, jaudio, jrgb2yuv and the jshim platform layer.
  */
 #include "Winav.h"
 #include "gdi.h"
@@ -20,21 +24,26 @@
 #include "jdraw.h"
 #include "jnes.h"
 #include "jgb.h"
+#include "jgen.h"
+#include "jsnes.h"
 #include "jaudio.h"
 #include "japp.h"
 
 extern BYTE __bKey;
 
 /* ---- OSD palette layout while the Jupiter app owns the screen ----
- * [JPAL_NES_BASE .. +63]  NES master palette (also used by color bars)
+ * [JPAL_NES_BASE .. +63]  NES master palette (color bars + NES scene;
+ *                         the Mode 7 scene reuses this range too)
+ * [JPAL_GEN_BASE .. +63]  Genesis CRAM (4 palettes x 16)
  * [JPAL_GB_BASE  .. +7]   GB demo colors (4 BG + 4 sprite)
  * Chosen above the firmware's reserved UI entries (0..154 are the GDI
  * UI ranges; the app owns the screen, but staying high keeps the UI
  * palette intact for instant restore on exit). */
 #define JPAL_NES_BASE  64
+#define JPAL_GEN_BASE  128
 #define JPAL_GB_BASE   192
 
-#define JAPP_SCENES    3
+#define JAPP_SCENES    5
 #define JAPP_FRAME_MS  33   /* ~30 fps target; degrades gracefully */
 
 static BYTE _bJupActive = 0;
@@ -60,6 +69,21 @@ static uint8_t gb_pal_idx[32];         /* BG palette indices */
 static uint8_t gb_spr_pal_idx[32];     /* sprite palette indices */
 static gb_bg_t gb_bg;
 static gb_oam_entry_t gb_oam[2];
+
+/* ---- Genesis demo state ---- */
+static uint8_t gen_tiles[32 * 5];      /* 4bpp tiles */
+static uint16_t gen_map_a[32 * 32];
+static uint16_t gen_map_b[32 * 32];
+static uint16_t gen_win_map[16 * 4];
+static uint8_t gen_cram_idx[64];
+static genesis_plane_t gen_pa, gen_pb;
+static genesis_window_t gen_win;
+static genesis_sprite_t gen_spr[2];
+
+/* ---- SNES Mode 7 demo state ---- */
+static uint8_t m7_map[64 * 64];
+static uint8_t m7_pal_idx[256];
+static snes_mode7_t m7_cfg;
 
 /* Set one pixel of a 2bpp tile (shared CHR helper) */
 static void chr_set(uint8_t *tile, int row, int col, uint8_t ci)
@@ -204,6 +228,112 @@ static void build_gb_assets(void)
     gb_oam[1].tile = 0; gb_oam[1].attr = GB_SPR_HFLIP;
 }
 
+/* 4bpp tile builder (Genesis packed format: 2 px/byte, high nibble
+ * first) */
+static void gen_tile_set(uint8_t *tile, int row, int col, uint8_t ci)
+{
+    uint8_t *b = &tile[row * 4 + (col >> 1)];
+    if (col & 1) *b = (uint8_t)((*b & 0xF0) | (ci & 0x0F));
+    else         *b = (uint8_t)((*b & 0x0F) | (uint8_t)(ci << 4));
+}
+
+static void build_gen_assets(void)
+{
+    int r, c, i;
+    uint32_t cram_argb[64];
+
+    /* Tiles: 1 solid block w/ border, 2 checker, 3 hill, 4 ring */
+    for (i = 0; i < (int)sizeof(gen_tiles); i++) gen_tiles[i] = 0;
+    for (r = 0; r < 8; r++)
+        for (c = 0; c < 8; c++) {
+            gen_tile_set(&gen_tiles[32 * 1], r, c,
+                         (uint8_t)((r == 0 || c == 0) ? 12
+                                   : ((r == 7 || c == 7) ? 2 : 7)));
+            gen_tile_set(&gen_tiles[32 * 2], r, c,
+                         (uint8_t)((((r >> 2) ^ (c >> 2)) & 1) ? 5 : 3));
+            gen_tile_set(&gen_tiles[32 * 3], r, c,
+                         (uint8_t)((r >= (7 - c)) ? 9 : 0));
+            gen_tile_set(&gen_tiles[32 * 4], r, c,
+                         (uint8_t)((r == 0 || r == 7 || c == 0 || c == 7)
+                                   ? 14 : 0));
+        }
+
+    /* Plane B: checker field with hill strips. Plane A: sparse rings. */
+    for (r = 0; r < 32; r++)
+        for (c = 0; c < 32; c++) {
+            gen_map_b[r * 32 + c] = (uint16_t)GEN_ENTRY(
+                (r > 24) ? 3 : 2, (r > 24) ? 1 : 0, 0, 0);
+            gen_map_a[r * 32 + c] = (uint16_t)(((r * 7 + c * 3) % 13 == 0)
+                ? GEN_ENTRY(4, 2, c & 1, r & 1) : 0);
+        }
+
+    /* Window: HUD strip of bordered blocks */
+    for (i = 0; i < 16 * 4; i++)
+        gen_win_map[i] = (uint16_t)GEN_ENTRY(1, 3, 0, 0);
+
+    /* CRAM: 4 palettes of 16 shades (blue, green, orange, gray) */
+    for (i = 0; i < 16; i++) {
+        uint32_t v = (uint32_t)(i * 16 + 15);
+        cram_argb[i]      = 0xFF000000u | (v >> 2 << 16) | (v >> 1 << 8) | v;
+        cram_argb[16 + i] = 0xFF000000u | (v >> 2 << 16) | (v << 8) | (v >> 2);
+        cram_argb[32 + i] = 0xFF000000u | (v << 16) | (v >> 1 << 8) | (v >> 3);
+        cram_argb[48 + i] = 0xFF000000u | (v << 16) | (v << 8) | v;
+    }
+    jvid_load_palette(JPAL_GEN_BASE, cram_argb, 64);
+    for (i = 0; i < 64; i++)
+        gen_cram_idx[i] = (uint8_t)(JPAL_GEN_BASE + i);
+
+    gen_pa.tiles = gen_tiles; gen_pa.map = gen_map_a;
+    gen_pa.cram = gen_cram_idx;
+    gen_pa.scroll_x = 0; gen_pa.scroll_y = 0; gen_pa.line_hscroll = NULL;
+    gen_pa.map_w = 32; gen_pa.map_h = 32; gen_pa.enabled = 1;
+
+    gen_pb.tiles = gen_tiles; gen_pb.map = gen_map_b;
+    gen_pb.cram = gen_cram_idx;
+    gen_pb.scroll_x = 0; gen_pb.scroll_y = 0; gen_pb.line_hscroll = NULL;
+    gen_pb.map_w = 32; gen_pb.map_h = 32; gen_pb.enabled = 1;
+
+    gen_win.map = gen_win_map; gen_win.x = 8; gen_win.y = 8;
+    gen_win.w = 128; gen_win.h = 16; gen_win.map_w = 16; gen_win.map_h = 4;
+
+    for (i = 0; i < 2; i++) {
+        gen_spr[i].tile = 1; gen_spr[i].w = 2; gen_spr[i].h = 2;
+        gen_spr[i].pal = (uint8_t)(i + 1);
+        gen_spr[i].fliph = 0; gen_spr[i].flipv = 0;
+        gen_spr[i].enabled = 1;
+    }
+}
+
+static void build_m7_assets(void)
+{
+    int r, c, i;
+
+    /* Rings texture over a checker floor */
+    for (r = 0; r < 64; r++)
+        for (c = 0; c < 64; c++) {
+            int dx = c - 32, dy = r - 32;
+            int ring = ((dx * dx + dy * dy) >> 5) & 15;
+            int check = (((r >> 3) ^ (c >> 3)) & 1) ? 2 : 0;
+            m7_map[r * 64 + c] = (uint8_t)((ring + check) & 15);
+        }
+
+    /* Texture values 0..15 -> a warm ramp inside the NES master range */
+    {
+        static const uint8_t ramp[16] = {
+            0x0F, 0x07, 0x17, 0x27, 0x37, 0x28, 0x38, 0x18,
+            0x08, 0x09, 0x19, 0x29, 0x39, 0x2A, 0x1A, 0x0A
+        };
+        for (i = 0; i < 256; i++)
+            m7_pal_idx[i] = (uint8_t)(JPAL_NES_BASE + ramp[i & 15]);
+    }
+
+    m7_cfg.cam_x = 0; m7_cfg.cam_y = 0;
+    m7_cfg.angle = 0; m7_cfg.twist = 1;
+    m7_cfg.horizon = 60; m7_cfg.space_z = 8000;
+    m7_cfg.map = m7_map; m7_cfg.palette = m7_pal_idx;
+    m7_cfg.map_w_bits = 6; m7_cfg.map_mask = 63;
+}
+
 /* Entry jingle: APU square arpeggio + noise hit, rendered offline into
  * DRAM scratch and submitted through the HAL raw-PCM path. */
 static void play_jingle(void)
@@ -290,6 +420,48 @@ static void scene_gb_frame(void)
                &gb_bg, gb_spr_chr, gb_spr_pal_idx, gb_oam, 2);
 }
 
+static void scene_gen_frame(void)
+{
+    uint8_t *fb = jvid_fb();
+    uint32_t t = jtime_ms() / 33;
+
+    /* Parallax: Plane A scrolls 2x faster than Plane B */
+    gen_pb.scroll_x = (int32_t)(t & 0x7FFFFFFF);
+    gen_pa.scroll_x = (int32_t)((t * 2) & 0x7FFFFFFF);
+
+    gen_spr[0].x = (int16_t)(40 + ((t * 2) % (GEN_NATIVE_W - 56)));
+    gen_spr[0].y = 100;
+    gen_spr[1].x = (int16_t)(GEN_NATIVE_W - 56 -
+                             ((t * 3) % (GEN_NATIVE_W - 56)));
+    gen_spr[1].y = 150;
+
+    genesis_render8(fb, JVID_PITCH,
+                    (JVID_W - GEN_NATIVE_W) / 2, (JVID_H - GEN_NATIVE_H) / 2,
+                    (uint8_t)(JPAL_NES_BASE + 0x0F),
+                    &gen_pa, &gen_pb, &gen_win, gen_spr, 2);
+}
+
+static void scene_m7_frame(void)
+{
+    uint8_t *fb = jvid_fb();
+    uint32_t x0 = (JVID_W - SNES_NATIVE_W) / 2;
+    uint32_t y0 = (JVID_H - SNES_NATIVE_H) / 2;
+    const int32_t *cos_lut = snes_cos_lut();
+    const int32_t *sin_lut = snes_sin_lut();
+
+    /* Fly forward along the current heading, slowly turning */
+    m7_cfg.angle = (uint8_t)(m7_cfg.angle + 1);
+    m7_cfg.cam_x += cos_lut[m7_cfg.angle] >> 9;
+    m7_cfg.cam_y += sin_lut[m7_cfg.angle] >> 9;
+
+    /* Sky above the horizon (NES light blue) */
+    jdraw_rect(fb, JVID_PITCH, (int)x0, (int)y0,
+               SNES_NATIVE_W, m7_cfg.horizon,
+               (uint8_t)(JPAL_NES_BASE + 0x21));
+
+    snes_mode7_render8(fb, JVID_PITCH, x0, y0, &m7_cfg);
+}
+
 static void scene_enter(void)
 {
     /* Frame the scene area with the NES black; scenes draw inside */
@@ -307,6 +479,8 @@ static void jupiter_enter(void)
     jvid_load_palette(JPAL_NES_BASE, jup_nes_master_palette, 64);
     build_nes_assets();
     build_gb_assets();
+    build_gen_assets();
+    build_m7_assets();
     _bScene = 0;
     _bJupActive = 1;
     _dwLastFrameMs = 0;
@@ -383,6 +557,12 @@ void JUPITER_Trigger(void)
         break;
     case 2:
         scene_gb_frame();
+        break;
+    case 3:
+        scene_gen_frame();
+        break;
+    case 4:
+        scene_m7_frame();
         break;
     default:
         break;

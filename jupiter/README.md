@@ -17,11 +17,13 @@ line-for-line copy.
 |---|---|---|
 | `lib/nes.c` NES PPU renderer | `jnes.c/h` | Re-targeted from ARGB8888 dual-plane to **8bpp palette-indexed** single-plane output (the CT952 OSD region format). Sprite behind-BG priority via a 1bpp opacity bitmap. Tile/nametable/attribute/OAM formats unchanged. |
 | `lib/gb.c` GB/GBC PPU renderer | `jgb.c/h` | Same treatment; GBC per-tile attribute map supported. Palettes become OSD palette indices. |
+| `lib/snes.c` SNES renderer | `jsnes.c/h` | All BG modes 0–7 (2/4/8bpp tiles, per-tile-column offset in modes 2/4/6), 128 sprites (32/line). **Mode 7** affine ground (with twist/vortex) reimplemented in plain C, replacing the NEON scanline + NEON line-double. Single-buffer layering: bottom BG opaque, upper BGs front-to-back first-opaque-wins. |
+| `lib/genesis.c` Genesis VDP renderer | `jgen.c/h` | Planes A/B, per-scanline hscroll, window plane (truly *replaces* Plane A in its rect, matching the DE2-overlay semantics), multi-tile column-major sprites. CRAM becomes 64 OSD palette indices. |
 | `lib/audio.c` (portable half) | `jaudio.c/h` | PCM mixer w/ fractional resampling, NES/GB-style APU (2 pulse + wave + noise, envelopes), Genesis-style 6ch×4op FM + PSG. Restructured from a DMA ring-buffer to a **pull model** (`jaudio_render()` fills a mono int16 buffer). Integer-only (`-msoft-float` target). |
 | `draw_rect` / `sprite_blit` (NEON) | `jdraw.h` | Plain-C 8bpp fill/clear/color-keyed blit with clipping. |
 | platform layer (`video_/input_/timer_`) | `jshim.h` + `jshim_ct952.c` | See mapping below. |
 | — | `jrgb2yuv.c/h` | New: ARGB8888 → `0x00YYUUVV` BT.601 (the OSD palette is **YUV, not RGB**). |
-| `template/game.c` demo pattern | `japp.c/h` | Demo app on the superloop: color bars, NES scene (scroll + sprites + APU jingle), GB scene. |
+| `template/game.c` demo pattern | `japp.c/h` | Demo app on the superloop: color bars, NES scene (scroll + sprites + APU jingle), GB scene, Genesis scene (two-plane parallax + window HUD + sprites), SNES Mode 7 flight. |
 
 ## Platform mapping
 
@@ -73,9 +75,6 @@ inspection.
 
 ## What was NOT ported, and why
 
-- **SNES + Genesis VDP renderers** — portable in principle (SNES Mode 7
-  and one memcpy need C replacements for their NEON paths); natural next
-  step, skipped to keep the first drop reviewable.
 - **CedarVE H.264, `cedar_*` examples** — V3s hardware codec; no
   equivalent here.
 - **NEON asm (`sprite_neon.S`, `mode7_neon.S`, `tiles_neon.S`,

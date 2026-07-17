@@ -126,9 +126,10 @@ boot: ct952emu
 # --skip-panelcfg carries boot past the config-arena frontier into display
 # init (see BRINGUP.md); drop it to reproduce the raw stall.
 bootreal: ct952emu
-	./ct952emu dp700wd.bin --rom-load --skip-panelcfg \
-	    --instr 800000000 --quiet --fb-out dp700wd_screen.ppm \
+	./ct952emu dp700wd.bin --instr 1500000000 --quiet \
+	    --uart dp700wd_boot.log --fb-out dp700wd_screen.ppm \
 	    --iolog dp700wd_iolog.txt
+	@echo '--- boot log ---'; tr -c '[:print:]\n\t' ' ' < dp700wd_boot.log | tr -s ' '
 
 clean:
 	rm -f ct952emu test_sparc tests/*.o tests/*.elf tests/*.bin \

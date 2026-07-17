@@ -8,6 +8,34 @@ This is honest, iterative hardware bring-up. Each entry records what
 works, what's blocked, and exactly what the next step is — the
 emulator's own I/O-access inventory is the worklist generator.
 
+## BREAKTHROUGH: the real first-stage boot runs (correct chip ID)
+
+The whole "config-arena / rom_load" saga had one root cause: **the emulated
+CPU reported the wrong PSR chip ID.** The stock boot at flash `0x310` reads
+`PSR[31:24]` and only takes its full clock/DRAM/section-load path when it
+reads **`0xa0`** (the real CT952); anything else falls to a debugger-style
+trampoline that expects pre-staged entry/SP -- which is exactly why the
+emulator needed `--rom-load` and never ran the true boot. Setting
+`sparc_reset` PSR to `0xA0000000` (impl=0xA, ver=0) makes the firmware's
+**own** first-stage boot run from reset, and it prints its real UART log:
+
+```
+<P1 Booting>
+SP1=40012000  DRAM_Config=0108011b [Size=16MBit]  MCLK=133MHz  PROM_Config=20541010
+Set PROM Controller...Ok   Code_Protect=3
+Load Sec[ROMV]:40000000...Ok   Load Sec[TEXT]:4001d000...Ok
+Load Sec[DATA]:40020878...Ok   Load Sec[ENGL]:40049900...Ok
+Jump Sec[ROMV]:40000000
+```
+
+Run it faithfully with **`ct952emu dp700wd.bin`** (no `--rom-load`, no
+aids): the firmware sets up the PROM controller, decompresses every
+section with its own codec, jumps to the main app, and reaches the eCos
+scheduler/idle loop. It programs the DISP timing generator (720x240) on
+its own. CPU verification stays bit-exact. The `--rom-load` path and the
+panel-config aids remain for diagnostics but are no longer needed for a
+real boot.
+
 ## Status
 
 | Layer | State |

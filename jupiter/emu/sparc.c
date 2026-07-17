@@ -46,8 +46,12 @@ void sparc_reset(sparc_t *c, sparc_bus_t *bus)
     c->bus = bus;
     c->pc = 0;
     c->npc = 4;
-    /* impl=0xF ver=3 (LEON-ish), S=1, ET=0, CWP=0 */
-    c->psr = 0xF3000000u | PSR_S;
+    /* PSR impl=0xA ver=0: the real CT952 SPARC chip ID. The stock boot
+     * code reads PSR[31:24] and only takes its full clock/DRAM/section
+     * init path when it reads 0xa0 (else it falls to a debugger-style
+     * trampoline that expects pre-staged entry/SP registers). S=1, ET=0,
+     * CWP=0. */
+    c->psr = 0xA0000000u | PSR_S;
     c->wim = 0;
     c->tbr = 0;
 }

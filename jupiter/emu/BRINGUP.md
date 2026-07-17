@@ -270,6 +270,47 @@ stand-in until the config-arena init is modelled faithfully; it confirms
 the display path is reachable and that the DISP model will render the
 firmware's own output once boot completes.
 
+### Faithful trace: the descriptor is consumed before it is produced
+
+Chasing this faithfully (no skip): a fetch trace shows the config
+*consumer* (thunk `0x3d564`) is reached but the *producer* is not. The
+descriptor at `0x4002f75c` is written only by the bss-clear -- confirmed
+by a full-boot write-watch on `0x4002f75c..0x4002f784`.
+
+The real producer is **`0x3ce60`**: it initialises the descriptor by
+looking up the **`SETD`** (settings/NVRAM sector) and **`SAV1`** (save
+area) flash sections via `0x621f0`/`0x3cf24`, storing their addresses
+into `desc+0x8/+0x14` and sizes into `desc+0xc/+0x28/+0x30`. `0x3ce60` is
+called only from `0x41774`, inside function `0x416f4`.
+
+The ordering is the problem. Disassembling `0x416f4`:
+
+```
+416f8  btst 4,%i0 ; be 0x4181c     ; full path only if arg bit2 set
+...
+4176c  call 0x420d4                ; -> ... -> 0x33cc0 -> thunk 0x3d564  (STALLS)
+41774  call 0x3ce60                ; <- descriptor init, never reached
+4178c  call 0x33ca4                ; second thunk caller, after init
+```
+
+`0x416f4` calls `0x420d4` (which chains through `0x42218 -> 0xea74 ->
+0x1b3d0 -> 0x33cc0` to the config thunk) **before** it calls the
+descriptor initialiser `0x3ce60` one instruction later. A single-step
+trace confirms it: `0xadbc -> 0x416f4` (instr 150789) reaches the thunk
+`0x3d564` (instr 153067) and spins; `0x3ce60`/`0x621f0`/`0x3cf24` are
+never fetched.
+
+So on real hardware the descriptor must already be valid at `0x4176c` --
+initialised by an *earlier* pass that the emulator's `rom_load` does not
+reproduce (the section-name lookup table `0x621f0` searches, and/or a
+prior call to `0x416f4`/`0xa798` that stages `SETD`/`SAV1`, must be set
+up by the real `dsu_boot`/section loader). The faithful fix is to model
+that earlier staging -- specifically, make the `SETD`/`SAV1` section
+lookup resolve so `0x3ce60` (when it does run) yields a valid `desc+0x10`
+base -- rather than papering over it with `--skip-panelcfg`. This is the
+next concrete target; it is one more layer of the same boot-config
+subsystem, not a new mystery.
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

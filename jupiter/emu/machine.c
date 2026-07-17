@@ -529,3 +529,69 @@ void machine_dump_iolog(machine_t *m, FILE *f)
     fprintf(f, "# unmapped: %u reads, %u writes\n",
             m->unmapped_reads, m->unmapped_writes);
 }
+
+/* ---- DISP display engine: OSD plane scanout ------------------------ *
+ * The stock display path is a blob (display.a), but the OSD plane it
+ * scans is fully described by header-visible state: the 8bpp palette-
+ * indexed pixels live linearly in DRAM (the firmware's OSD region,
+ * DS_OSDFRAME_ST = 0x4005F000), and the colour palette is the DISP
+ * GAM_OSD RAM at 0x80001C00 -- 256 words of 0x00YYUUVV, BT.601 studio
+ * range (jrgb2yuv.c). This composites that plane to an RGB PPM, exactly
+ * what the DISP scan-out does before the panel TCON. Register offsets
+ * from ctkav_disp.h. */
+#define R_DISP_OSD_SIZE  0x1A54          /* bit28 = DISP_OSD_EN */
+#define R_DISP_GAM_OSD   0x1C00          /* GAM_OSD[n] = +n*4, 256 entries */
+#define DISP_OSD_EN      0x10000000u
+
+static int clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+/* BT.601 studio-range YCbCr (0x00YYUUVV) -> packed 0x00RRGGBB: the exact
+ * inverse of the SDK's jup_argb_to_yuv, so a colour loaded into the OSD
+ * palette scans back out to its original ARGB. */
+static uint32_t disp_yuv_to_rgb(uint32_t yuv)
+{
+    int y = (int)((yuv >> 16) & 0xFF);
+    int u = (int)((yuv >> 8) & 0xFF);
+    int v = (int)(yuv & 0xFF);
+    int c = y - 16, d = u - 128, e = v - 128;
+    int r = clamp8((298 * c + 409 * e + 128) >> 8);
+    int g = clamp8((298 * c - 100 * d - 208 * e + 128) >> 8);
+    int b = clamp8((298 * c + 516 * d + 128) >> 8);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+int machine_disp_scanout(machine_t *m, uint32_t osd_base,
+                         uint32_t w, uint32_t h, uint32_t stride,
+                         const char *ppm_path)
+{
+    uint32_t pal[256];
+    const uint8_t *fb;
+    uint64_t span;
+    FILE *f;
+    uint32_t x, y;
+    int osd_en, i;
+
+    for (i = 0; i < 256; i++)
+        pal[i] = disp_yuv_to_rgb(io_get(m, R_DISP_GAM_OSD + (uint32_t)i * 4));
+
+    osd_en = (io_get(m, R_DISP_OSD_SIZE) & DISP_OSD_EN) != 0;
+
+    if (osd_base < 0x40000000u) return -1;
+    span = (uint64_t)(h ? h - 1 : 0) * stride + w;
+    if ((uint64_t)(osd_base - 0x40000000u) + span > MACH_DRAM_SIZE) return -1;
+    fb = machine_dram_ptr(m, osd_base);
+    if (!fb) return -1;
+
+    f = fopen(ppm_path, "wb");
+    if (!f) return -1;
+    fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            uint32_t c = osd_en ? pal[fb[(uint64_t)y * stride + x]] : 0u;
+            fputc((int)((c >> 16) & 0xFF), f);
+            fputc((int)((c >> 8) & 0xFF), f);
+            fputc((int)(c & 0xFF), f);
+        }
+    fclose(f);
+    return osd_en ? 0 : 1;
+}

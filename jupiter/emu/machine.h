@@ -99,4 +99,14 @@ uint32_t machine_rom_load(machine_t *m, FILE *log);
 /* Dump the I/O access inventory (sorted by address) to f. */
 void machine_dump_iolog(machine_t *m, FILE *f);
 
+/* Model the DISP display engine's OSD scan-out: composite the 8bpp
+ * palette-indexed OSD plane at `osd_base` (w x h, `stride` bytes/row)
+ * through the modelled DISP OSD palette RAM (GAM_OSD @ 0x80001C00,
+ * BT.601 0x00YYUUVV) into an RGB PPM. Honours DISP_OSD_EN in
+ * REG_DISP_OSD_SIZE. Returns 0 if OSD is enabled, 1 if disabled (still
+ * writes the file), -1 on error. */
+int machine_disp_scanout(machine_t *m, uint32_t osd_base,
+                         uint32_t w, uint32_t h, uint32_t stride,
+                         const char *ppm_path);
+
 #endif /* CT952EMU_MACHINE_H */

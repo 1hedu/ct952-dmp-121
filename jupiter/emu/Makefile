@@ -71,6 +71,25 @@ tests/testprog.elf: tests/start.o tests/testprog.o tests/link.ld
 tests/testprog.bin: tests/testprog.elf
 	$(XOBJCOPY) -O binary $< $@
 
+tests/disp_test.o: tests/disp_test.c tests/testapi.h
+	$(XCC) -m32 -mcpu=v8 -O2 -ffreestanding -fno-builtin \
+	    -mno-app-regs -I. -c -o $@ $<
+
+tests/disp_test.elf: tests/start.o tests/disp_test.o tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld \
+	    -o $@ tests/start.o tests/disp_test.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld \
+	    -o $@ tests/start.o tests/disp_test.o
+
+tests/disp_test.bin: tests/disp_test.elf
+	$(XOBJCOPY) -O binary $< $@
+
+# Drive the DISP OSD plane via hardware registers and snapshot the
+# emulator's modelled scan-out to a PPM.
+disp: ct952emu tests/disp_test.bin
+	./ct952emu tests/disp_test.bin --fb-out disp_test.ppm \
+	    --instr 20000000 --quiet
+
 check: test_sparc tests/testprog.bin
 	./test_sparc tests/testprog.bin
 

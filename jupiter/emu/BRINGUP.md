@@ -19,6 +19,7 @@ emulator's own I/O-access inventory is the worklist generator.
 | **ROM section loader** | **Working** (`--rom-load`) — parses the section table, copies raw sections, and **decompresses zipped sections by running the firmware's own codec in-emulator** (`machine_call`). The "closed `gz909`/`UNZIP2006` codec" is no longer a blocker. |
 | **Stock firmware boot** | **Boots into the main superloop** — a real device dump (`dp700wd.bin`) unpacks all 5 zipped sections, runs eCos HAL init, starts the PROC2 audio DSP, and reaches its watchdog-petting main loop. Parks in a table-driven register-config routine awaiting un-staged config data (see frontier below). |
 | **SDK-on-emulator demo** | **Renders** (`make demo`) — real Jupiter code (`jnes` + draw + palette) cross-compiled to SPARC V8 and run on the emulated CPU draws a splash + live NES scene into the CT952 8bpp OSD plane; snapshotted from DRAM to `demo_splash.png`. |
+| **DISP display engine** | **Modelled** (`make disp`) — the DISP OSD scan-out is now a real device: writes to the GAM_OSD palette RAM (`0x80001C00`) and `REG_DISP_OSD_SIZE` are honoured, and `machine_disp_scanout` composites the 8bpp OSD plane through the BT.601 palette to an RGB PPM (`--fb-out`). A bare-metal SPARC test drives it *through the hardware registers* and renders a colour-bar test card (`disp_test.png`). This is the interface a booted firmware / MicroPython HAL uses to put pixels on the panel. |
 
 ## Breakthrough: the compression codec, cracked by execution
 
@@ -60,6 +61,41 @@ pixel is produced by SPARC instructions the interpreter executed.
 
 This closes the arc: port the SDK -> build the emulator -> run the SDK on
 the emulator -> see a display window.
+
+## The DISP engine is now a modelled device (not a DRAM peek)
+
+The demo above snapshots a framebuffer the SDK wrote to a *known* DRAM
+address. The next step makes the **display hardware itself** real: the
+emulator now honours the DISP OSD registers, so any code that programs
+them the way the firmware (or a future MicroPython HAL) does gets
+scanned out.
+
+`machine_disp_scanout()` (`machine.c`) reads the modelled DISP state and
+composites the OSD plane:
+
+- **Palette** from the DISP `GAM_OSD` RAM at `0x80001C00` — 256 words of
+  `0x00YYUUVV`, BT.601 studio range, the exact format the firmware's
+  `GDI_ChangePALEntry` writes (`jrgb2yuv.c`). The scan-out inverts
+  BT.601 back to RGB, so a colour loaded into the palette comes back out
+  as itself.
+- **Enable** from `DISP_OSD_EN` (bit 28 of `REG_DISP_OSD_SIZE`,
+  `0x80001A54`) — a disabled OSD scans out black.
+- **Pixels** from the 8bpp plane at `DS_OSDFRAME_ST` (`0x4005F000`, the
+  firmware OSD region), linear, palette-indexed.
+
+`make disp` proves it end-to-end: `tests/disp_test.c` (bare-metal SPARC,
+no host help) loads a palette into `GAM_OSD`, sets `DISP_OSD_EN`, and
+paints an 8bpp test card into the OSD plane — **only** through hardware
+register / DRAM writes. The emulator's scan-out renders a clean
+SMPTE-style colour-bar + grey-ramp card (`disp_test.png`), each bar's
+RGB round-tripping through the YUV palette to its true colour. `--fb-out`
+also snapshots a booted firmware's OSD plane once the firmware reaches
+its own display init.
+
+Register facts (bases, the `TFT_Init` panel-on order, the active-low
+backlight, the OSD framebuffer address) are cited in the repo's
+`DP700WD_HW_REFERENCE.md`; this device model is the executable half of
+that reference.
 
 ## Stock-firmware boot frontier
 

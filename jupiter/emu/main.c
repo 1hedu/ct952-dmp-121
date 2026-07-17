@@ -16,8 +16,11 @@ int main(int argc, char **argv)
 {
     const char *rom_path = NULL, *uart_path = NULL, *iolog_path = NULL;
     const char *dram_path = NULL;
+    const char *fb_path = NULL;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
+    uint32_t fb_addr = 0x4005F000u;   /* DS_OSDFRAME_ST */
+    uint32_t fb_w = 616, fb_h = 440;  /* firmware OSD region geometry */
     int rom_load = 0;
     machine_t *m;
     FILE *f;
@@ -35,6 +38,14 @@ int main(int argc, char **argv)
             iolog_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dram") && i + 1 < argc)
             dram_path = argv[++i];
+        else if (!strcmp(argv[i], "--fb-out") && i + 1 < argc)
+            fb_path = argv[++i];
+        else if (!strcmp(argv[i], "--fb-addr") && i + 1 < argc)
+            fb_addr = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--fb-wh") && i + 1 < argc) {
+            char *xp; fb_w = (uint32_t)strtoul(argv[++i], &xp, 0);
+            if (xp && (*xp == 'x' || *xp == 'X')) fb_h = (uint32_t)strtoul(xp + 1, NULL, 0);
+        }
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
@@ -48,7 +59,8 @@ int main(int argc, char **argv)
     }
     if (!rom_path) {
         fprintf(stderr, "usage: ct952emu <flash.rom> [--instr N] "
-                        "[--uart FILE] [--iolog FILE] [--quiet]\n");
+                        "[--uart FILE] [--iolog FILE] [--quiet]\n"
+                        "       [--fb-out PPM] [--fb-addr ADDR] [--fb-wh WxH]\n");
         return 2;
     }
 
@@ -153,6 +165,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "[ct952emu] dumped DRAM (%u bytes) to %s\n",
                     MACH_DRAM_SIZE, dram_path);
         }
+    }
+
+    if (fb_path) {
+        int r = machine_disp_scanout(m, fb_addr, fb_w, fb_h, fb_w, fb_path);
+        if (r < 0)
+            fprintf(stderr, "[ct952emu] fb scanout FAILED\n");
+        else
+            fprintf(stderr, "[ct952emu] wrote %s (%ux%u, OSD %s @ 0x%08x)\n",
+                    fb_path, fb_w, fb_h, r == 0 ? "enabled" : "DISABLED",
+                    fb_addr);
     }
 
     if (m->uart_file) fclose(m->uart_file);

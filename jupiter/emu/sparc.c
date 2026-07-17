@@ -162,6 +162,11 @@ static int step(sparc_t *c)
         return c->halted;
     }
     c->pc_ring[c->pc_ri++ & 63] = pc;
+    if (c->cap_pc && pc == c->cap_pc && !c->cap_done) {
+        int k;
+        for (k = 0; k < 32; k++) c->cap[k] = sparc_get_reg(c, k);
+        c->cap_done = 1;
+    }
     c->icount++;
 
     {

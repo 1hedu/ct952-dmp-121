@@ -52,6 +52,23 @@
 #define R_IIC_DATA     0x4214
 #define IIC_BUSY       0x4u
 
+/* Serial (SPI) flash controller (ctkav_platform.h PROM block, CT909P
+ * offsets; spflash.c drives it). Bulk data reads go through the
+ * memory-mapped ASI-0x7 window (handled as flash in bus_read); only the
+ * JEDEC/device-ID + status handshake goes through these registers. */
+#define R_SPI_CMD      0x2A24   /* command byte written here */
+#define R_SPI_OP       0x2A28   /* format write / status read */
+#define R_SPI_RD       0x2A34   /* read-data result */
+#define SPI_IDLE       0x0200u
+#define SPI_IOR        0x0400u
+#define SPI_IOW        0x0800u
+#define SPI_WAITCMD    0x1000u
+#define SPI_DONE       (SPI_IDLE | SPI_IOR | SPI_IOW | SPI_WAITCMD)
+/* MX25L1605 -- a 2 MB serial flash; the device dump is 2 MB, and the
+ * firmware matches (RD_REG & 0xffff) == 0xC214 via the 0x90 read-ID cmd
+ * (spflash.c _SPF_ReadID, MX25L1605). Manufacturer 0xC2, device 0x14. */
+#define SPI_ID_MXIC    0xC214u
+
 #define TIMER_ENABLE   1u
 #define TIMER_RELOAD   2u
 #define TIMER_LOAD     4u
@@ -122,6 +139,11 @@ static uint32_t io_read(machine_t *m, uint32_t off)
     case R_IIC_CMD:
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
+    case R_SPI_OP:
+        /* every command completes instantly: all state bits ready */
+        return io_get(m, R_SPI_OP) | SPI_DONE;
+    case R_SPI_RD:
+        return m->spi_rd;
     default:
         log_access(m, 0x80000000u + off, 0, 0);
         return io_get(m, off);
@@ -156,6 +178,23 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
             io_set(m, R_PARAM2, 0);
         io_set(m, R_PARAM1, v & 0x3FFFFFFFu);
         return;
+    case R_SPI_CMD: {
+        /* Latch the read-data result the firmware will pull from RD_REG.
+         * cmd byte is the low 8 bits (ID/status reads); bulk data reads
+         * don't come through here. spflash.c _SPF_ReadID tries 0x9F/0x90/
+         * 0xAB; the 0x90 "read manuf/device ID" is the one that matches
+         * (RD_REG & 0xffff == 0xC214 -> MX25L1605). Read-status (0x05)
+         * returns 0 = not busy (WIP clear). */
+        uint8_t cmd = (uint8_t)(v & 0xFF);
+        switch (cmd) {
+        case 0x90: m->spi_rd = SPI_ID_MXIC;       break; /* manuf+device */
+        case 0x9F: m->spi_rd = SPI_ID_MXIC >> 8;  break; /* JEDEC 1st byte */
+        case 0x05: m->spi_rd = 0x00;              break; /* status: ready */
+        default:   m->spi_rd = 0x00;              break;
+        }
+        io_set(m, R_SPI_CMD, v);
+        return;
+    }
     case R_AUDIO_CMD:
         /* PROC1 writes 0x10003, then spins reading this word and shifting
          * right 16; it breaks when [31:16] == 0 (hdecoder.c:724-737).

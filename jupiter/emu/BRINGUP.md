@@ -121,6 +121,30 @@ populated. Tooling that landed to get here: `--dump-dram`, `--watch ADDR`
 (DRAM write-watch with the issuing PC), the jmpl trace ring, a 64-deep
 per-instruction PC ring, and a full window+global register dump at halt.
 
+### Deeper trace (SPI flash modeled; spin root-caused to bad window inputs)
+
+The serial-flash controller is now modeled (device-ID + status handshake:
+0x90 read-ID returns 0xC214 = MX25L1605, matching the 2 MB dump; status
+reads 0 = ready), so the firmware can detect its flash. That did **not**
+move the spin -- flash detection runs elsewhere.
+
+Capturing the spin leaf's registers on first entry (`--regs-at
+0x400203e8`) pinned the real problem: the leaf reads `%i0 = 0x126` and
+dereferences it (`lduh [%i0]`), but `*(u16*)0x126` is the *CLCK section's
+size field* inside the flash section table (0x56b7) -- a stray pointer,
+not a count. `%i4 = 0` (also dereferenced), and `%l4..%l7` are all
+0x40042000. The call chain is 0x33ca4 -> 0x3d564 -> leaf(0x400203e8); the
+leaf takes no `save`, so it runs in 0x3d564's window and consumes
+registers (%i4, %l4-7) that 0x3d564 never initialises. The machine's
+globals are otherwise sane (%g1/%g3/%g4 point at real DRAM structs), so
+this is narrowly stale/uninitialised *window* state feeding the leaf --
+either an upstream init that never ran, or a register-window-preservation
+bug in the interpreter that the canonical-handler CPU test doesn't
+exercise. Next: a targeted window-preservation stress test (does a callee
+correctly see an outer frame's %i/%l across a window-trap-triggering
+chain?) to rule the interpreter in or out before more RE.
+Tool added: `--regs-at ADDR` (one-shot register capture on first PC hit).
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

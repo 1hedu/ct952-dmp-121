@@ -68,6 +68,10 @@ typedef struct machine {
     /* stubbed storage/USB regions (0xA000xxxx / 0xB000xxxx) read as
      * 0xFFFFFFFF ("no media, floating bus") instead of 0 */
     int absent_ff;
+
+    /* serial-flash controller: pending RD_REG result latched at the last
+     * command write (device-ID / status handshake) */
+    uint32_t spi_rd;
 } machine_t;
 
 /* Create/reset the machine with a flash image (copied in). */

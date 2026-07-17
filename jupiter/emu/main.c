@@ -18,6 +18,7 @@ int main(int argc, char **argv)
     const char *dram_path = NULL;
     uint32_t watch_lo = 0;
     int absent_ff = 0;
+    uint32_t cap_pc = 0;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
     int rom_load = 0;
@@ -39,6 +40,8 @@ int main(int argc, char **argv)
             dram_path = argv[++i];
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc)
             watch_lo = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--regs-at") && i + 1 < argc)
+            cap_pc = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--absent-ff"))
             absent_ff = 1;
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
@@ -106,6 +109,7 @@ int main(int argc, char **argv)
     }
 
     m->absent_ff = absent_ff;
+    m->cpu.cap_pc = cap_pc;
     if (watch_lo) {
         m->watch_lo = watch_lo;
         m->watch_hi = watch_lo + 0x40;   /* watch a 64-byte window */
@@ -153,6 +157,16 @@ int main(int argc, char **argv)
                     r, sparc_get_reg(&m->cpu, 8 + r),
                     r, sparc_get_reg(&m->cpu, 16 + r),
                     r, sparc_get_reg(&m->cpu, 24 + r));
+    }
+
+    if (m->cpu.cap_done) {
+        int r;
+        fprintf(stderr, "[ct952emu] regs first time PC hit 0x%08x:\n",
+                m->cpu.cap_pc);
+        for (r = 0; r < 8; r++)
+            fprintf(stderr, "    g%d=%08x  o%d=%08x  l%d=%08x  i%d=%08x\n",
+                r, m->cpu.cap[r], r, m->cpu.cap[8+r],
+                r, m->cpu.cap[16+r], r, m->cpu.cap[24+r]);
     }
 
     /* last 64 PCs executed -- pinpoints the exact hot loop body */

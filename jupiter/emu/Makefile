@@ -99,6 +99,26 @@ tests/demo_snes.bin: tests/demo_snes.elf
 snes: demo_run tests/demo_snes.bin
 	./demo_run tests/demo_snes.bin demo_snes.ppm
 
+anim_run: anim_run.c sparc.c machine.c sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ anim_run.c sparc.c machine.c
+
+tests/demo_anim.o: tests/demo_anim.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/demo_anim.elf: tests/start.o tests/demo_anim.o tests/jsnes_s.o \
+                     tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_anim.o tests/jsnes_s.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_anim.o tests/jsnes_s.o
+
+tests/demo_anim.bin: tests/demo_anim.elf
+	$(XOBJCOPY) -O binary $< $@
+
+anim: anim_run tests/demo_anim.bin
+	./anim_run tests/demo_anim.bin anim.bin
+	python3 tools/mkgif.py anim.bin demo_mode7.gif
+
 tests/start.o: tests/start.S
 	$(XCC) -m32 -mcpu=v8 -c -o $@ $<
 

@@ -10,3 +10,5 @@ demo_run
 romv_out.bin
 *.ppm
 dram.bin
+anim_run
+anim.bin

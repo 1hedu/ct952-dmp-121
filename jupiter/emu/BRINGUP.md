@@ -16,7 +16,46 @@ emulator's own I/O-access inventory is the worklist generator.
 | Memory map | flash XIP @ 0, DRAM @ 0x40000000 (+0xC0000000 alias), I/O @ 0x80000000, DSU/FCR stubs |
 | Core devices | timers 1/2/3 + prescaler + watchdog, UART1/2/DSU (tx→host), LEON interrupt controller, PROC2 mailbox + boot-handshake auto-ACK |
 | Unmodeled I/O | store/readback register file with an access log (the worklist) |
-| Stock ROM boot | **Root-caused stall** — see below; boots and runs millions of instructions with zero illegal-instruction traps |
+| **ROM section loader** | **Working** (`--rom-load`) — parses the section table, copies raw sections, and **decompresses zipped sections by running the firmware's own codec in-emulator** (`machine_call`). The "closed `gz909`/`UNZIP2006` codec" is no longer a blocker. |
+| **Stock firmware boot** | **Decompresses and boots** — a real device dump (`dp700wd.bin`) unpacks all 5 zipped sections and runs **61k instructions of eCos HAL init** (cache, system timer @ `0x7CF`, interrupt controller) before the next device blocker. |
+
+## Breakthrough: the compression codec, cracked by execution
+
+The one hard gate — the custom `UNZIP2006`/`gz909` codec that packs the
+boot vectors, DRAM overlay, and data — is **present as plaintext SPARC
+in the device flash** (the `UZIP` section, flash `0x2000`). Rather than
+reverse-engineer the format, `ct952emu` **runs the firmware's own
+decompressor inside the emulated CPU** via `machine_call()` (set
+`%o0..%o2` = src/dst/workmem, run until it returns). The public entry is
+the wrapper at `UZIP+0xc50`; it XOR-deobfuscates a 16-byte header with
+`0x5a5a5a5a` (hence the `0x5A`-heavy compressed blobs), builds a
+descriptor, and calls the core at `UZIP+0xb4`.
+
+Verification: decompressing `ROMV` yields a textbook SPARC trap table
+(`b reset; nop`; per-slot `rd %tbr; rd %psr; b handler`), and — the
+stronger proof — the firmware then **executes** the decompressed vectors
+and `.text_dram` overlay for tens of thousands of instructions,
+correctly programming the eCos system-tick timer. Corrupt output could
+not do that. The codec is effectively solved for all sections (same
+algorithm).
+
+`--rom-load` does the on-chip mask ROM's job: decompress `ROMV`→
+`0x40000000`, `TEXT`→`0x4001d000`, `DATA`, `SFAT`, `ENGL`, seed the boot
+trampoline registers (GR21/22) with the reset vector + a stack, and run.
+
+## Current boot frontier
+
+`./ct952emu dp700wd.bin --rom-load` reaches eCos HAL init and stops at a
+jump to `0x9210a308` (a bad function pointer → instruction fetch from
+unmapped space). The I/O inventory shows it got through cache-control,
+the Timer1 reload (`0x7CF`), and the interrupt mask (`INT_TIMER1`) first.
+Next step: trace the source of that pointer — most likely one more
+unmodeled device read during HAL/PLL bring-up returning 0 where the
+firmware expects a real value (add a control-transfer trace, or model
+the device the inventory implicates). This is ordinary iterative
+device bring-up now — the compression wall is gone.
+
+### The older status (pre-dump), kept for context
 
 ## The CPU is proven
 

@@ -22,6 +22,9 @@ test_sparc: test_sparc.c sparc.c machine.c tests/testprog.c \
 	$(CC) $(CFLAGS) -I. -o $@ test_sparc.c sparc.c machine.c \
 	    tests/testprog.c
 
+probe_unzip: probe_unzip.c sparc.c machine.c sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ probe_unzip.c sparc.c machine.c
+
 tests/start.o: tests/start.S
 	$(XCC) -m32 -mcpu=v8 -c -o $@ $<
 

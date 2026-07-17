@@ -17,6 +17,7 @@ int main(int argc, char **argv)
     const char *rom_path = NULL, *uart_path = NULL, *iolog_path = NULL;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
+    int rom_load = 0;
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -35,6 +36,8 @@ int main(int argc, char **argv)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
             seed_sp = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--rom-load"))
+            rom_load = 1;
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -71,6 +74,20 @@ int main(int argc, char **argv)
     if (uart_path) {
         m->uart_file = fopen(uart_path, "wb");
         if (!m->uart_file) { perror(uart_path); return 1; }
+    }
+
+    if (rom_load) {
+        uint32_t entry = machine_rom_load(m, stderr);
+        if (!entry) {
+            fprintf(stderr, "[ct952emu] rom-load FAILED\n");
+            return 1;
+        }
+        /* Stage the boot trampoline the way the mask ROM does: entry =
+         * decompressed ROMV reset vector, sp = top of DRAM. */
+        if (!seed_entry) seed_entry = entry;
+        if (!seed_sp)    seed_sp = 0x40780000u;
+        fprintf(stderr, "[ct952emu] rom-load OK, reset vector @ 0x%08x\n",
+                entry);
     }
 
     if (seed_entry || seed_sp) {

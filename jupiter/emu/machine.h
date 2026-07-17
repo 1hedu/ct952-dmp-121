@@ -74,6 +74,28 @@ void machine_free(machine_t *m);
 /* Run n instructions (also advances timers 1 cycle per instruction). */
 uint64_t machine_run(machine_t *m, uint64_t n);
 
+/* Call firmware code inside the emulated machine: set %o0..%o2 = a0..a2,
+ * %sp = sp, %o7 so the routine's `retl`/`ret` lands on an unmapped
+ * sentinel, then run from `entry` until it returns (or budget/halt).
+ * Runs with traps off and WIM=0 (window rotation only, no over/underflow
+ * traps) -- fine for shallow leaf-ish routines like the decompressor.
+ * Returns 0 on clean return, -1 if halted, -2 on budget. */
+int machine_call(machine_t *m, uint32_t entry,
+                 uint32_t a0, uint32_t a1, uint32_t a2,
+                 uint32_t sp, uint64_t budget);
+
+/* Direct DRAM helpers (addr in 0x40000000 space). */
+uint32_t machine_dram_rd(machine_t *m, uint32_t addr, int size);
+uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr);
+
+/* Parse the flash section table and stage every DRAM-resident section:
+ * raw sections are copied, zip-flagged sections are decompressed by
+ * invoking the firmware's own UZIP codec (flash 0x2000, wrapper +0xc50)
+ * via machine_call -- exactly what the on-chip mask ROM does. Logs each
+ * section to `log` (may be NULL). Returns the ROMV run address (the
+ * reset entry) or 0 on failure. Leaves the CPU reset (pc=0) afterward. */
+uint32_t machine_rom_load(machine_t *m, FILE *log);
+
 /* Dump the I/O access inventory (sorted by address) to f. */
 void machine_dump_iolog(machine_t *m, FILE *f);
 

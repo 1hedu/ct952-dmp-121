@@ -5,3 +5,5 @@ tests/*.elf
 tests/*.bin
 *.log
 *.txt
+probe_unzip
+romv_out.bin

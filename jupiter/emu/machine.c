@@ -198,6 +198,7 @@ static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
         return 0;                        /* FCR/SDC/NFC stub */
     }
     m->unmapped_reads++;
+    log_access(m, addr & ~3u, 0, 0);   /* record so it names the blocker */
     return 0;
 }
 
@@ -352,6 +353,112 @@ uint64_t machine_run(machine_t *m, uint64_t n)
             break;
     }
     return done;
+}
+
+#define CALL_SENTINEL 0xE0000000u
+
+int machine_call(machine_t *m, uint32_t entry,
+                 uint32_t a0, uint32_t a1, uint32_t a2,
+                 uint32_t sp, uint64_t budget)
+{
+    sparc_t *c = &m->cpu;
+    uint64_t i;
+
+    /* Trap-free environment: S=1, ET=0, PIL=15, CWP=0; WIM=0 so save/
+     * restore just rotate windows (no overflow/underflow traps). */
+    c->halted = 0;
+    c->psr = 0xF3000F00u | PSR_S;    /* impl/ver | PIL=15 | S, ET=0 */
+    c->wim = 0;
+    c->pc = entry;
+    c->npc = entry + 4;
+    sparc_set_reg(c, 8, a0);          /* %o0 */
+    sparc_set_reg(c, 9, a1);          /* %o1 */
+    sparc_set_reg(c, 10, a2);         /* %o2 */
+    sparc_set_reg(c, 11, 0);          /* %o3 (extra args -> 0/NULL) */
+    sparc_set_reg(c, 12, 0);          /* %o4 */
+    sparc_set_reg(c, 13, 0);          /* %o5 */
+    sparc_set_reg(c, 14, sp);         /* %o6 / %sp */
+    sparc_set_reg(c, 15, CALL_SENTINEL - 8); /* %o7: retl -> sentinel */
+
+    for (i = 0; i < budget; i++) {
+        if (c->pc == CALL_SENTINEL) return 0;
+        if (c->halted) return -1;
+        sparc_run(c, 1);
+    }
+    return -2;
+}
+
+uint32_t machine_dram_rd(machine_t *m, uint32_t addr, int size)
+{
+    int f = 0;
+    return bus_read(&m->bus, addr, size, &f);
+}
+
+uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr)
+{
+    if (addr >= 0x40000000u && addr < 0x40000000u + MACH_DRAM_SIZE)
+        return m->dram + (addr - 0x40000000u);
+    return NULL;
+}
+
+/* ---- Stock-ROM section loader (mask-ROM equivalent) ---- */
+
+#define UZIP_DECODE  0x00002C50u   /* UZIP blob @ flash 0x2000, wrapper +0xc50 */
+#define UZIP_WORKMEM 0x40400000u   /* decompress scratch (clear of sections) */
+#define UZIP_SP      0x40700000u
+
+static uint32_t flash_be32(machine_t *m, uint32_t off)
+{
+    if (off + 4 > m->flash_size) return 0;
+    return ((uint32_t)m->flash[off] << 24) | ((uint32_t)m->flash[off+1] << 16) |
+           ((uint32_t)m->flash[off+2] << 8) | m->flash[off+3];
+}
+
+uint32_t machine_rom_load(machine_t *m, FILE *log)
+{
+    uint32_t off = 0x10, romv_entry = 0;
+    if (log) fprintf(log, "# section  run       flash     unpacked  packed   action\n");
+
+    while (off + 24 <= m->flash_size) {
+        char nm[5];
+        uint32_t lma, rma, lsz, rsz;
+        int i, printable = 1;
+        for (i = 0; i < 4; i++) {
+            nm[i] = (char)m->flash[off + i];
+            if (nm[i] < 32 || nm[i] > 126) printable = 0;
+        }
+        nm[4] = 0;
+        if (!printable) break;
+        lma = flash_be32(m, off + 4);  rma = flash_be32(m, off + 8);
+        lsz = flash_be32(m, off + 12); rsz = flash_be32(m, off + 16);
+        off += 24;
+
+        if (lma < 0x40000000u || lma + lsz > 0x40000000u + MACH_DRAM_SIZE) {
+            if (log) fprintf(log, "  %-4s %10x %9x %9x %8x  (flash/skip)\n",
+                             nm, lma, rma, lsz, rsz);
+            continue;   /* flash-XIP or non-DRAM: nothing to stage */
+        }
+        if (!memcmp(nm, "ROMV", 4)) romv_entry = lma;
+
+        if (rsz < lsz) {
+            /* zipped: run the firmware's decompressor */
+            int rc = machine_call(m, UZIP_DECODE, rma, lma, UZIP_WORKMEM,
+                                  UZIP_SP, 200000000ull);
+            if (log) fprintf(log, "  %-4s %10x %9x %9x %8x  UNZIP rc=%d\n",
+                             nm, lma, rma, lsz, rsz, rc);
+            if (rc != 0) return 0;
+        } else {
+            /* raw: copy flash -> DRAM */
+            uint8_t *dst = machine_dram_ptr(m, lma);
+            if (dst && rma + lsz <= m->flash_size)
+                memcpy(dst, m->flash + rma, lsz);
+            if (log) fprintf(log, "  %-4s %10x %9x %9x %8x  copy\n",
+                             nm, lma, rma, lsz, rsz);
+        }
+    }
+
+    sparc_reset(&m->cpu, &m->bus);   /* clean boot state; DRAM preserved */
+    return romv_entry;
 }
 
 static int cmp_log(const void *a, const void *b)

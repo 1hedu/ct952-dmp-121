@@ -158,12 +158,16 @@ then consumes the empty table and spins.
 
 **Next step:** find what fills `0x40042000` / `0x40046800`. It is
 referenced by many `.text_dram` routines (`sethi %hi(0x40042000)` at
-`0x4001d1cc, 0x4001d864, 0x4001d938, ...`); the caller of the stalling
-loop is a `jmpl` from `0x4001d560`. Trace back from there to the config-
-decode routine and either run it (stage its `CUST`/EEPROM input) or seed
-the two tables directly, then the firmware should proceed to its own
-display init -- at which point the modelled DISP scan-out (`--fb-out`)
-renders whatever it draws (boot logo from the `LOGO` section first).
+`0x4001d1cc, 0x4001d864, 0x4001d938, ...`). (Note the `0x4001d560 ->
+0x4002050c` entry in the jmpl ring is a red herring: `0x4001d560` is a
+`jmp %l1; rett %l2` trap-return -- the window-underflow / tick-timer
+handler returning *into* the spin, not the loop's caller. The real caller
+entered via a pc-relative `call` that has scrolled out of the ring.)
+Trace back to the config-decode routine and either run it (stage its
+`CUST`/EEPROM input) or seed the two tables directly, then the firmware
+should proceed to its own display init -- at which point the modelled
+DISP scan-out (`--fb-out`) renders whatever it draws (boot logo from the
+`LOGO` section first).
 
 Tooling used to pin this: `--dump-dram`, the jmpl trace ring, the 64-deep
 PC ring, and an ad-hoc windowed-register + DRAM-write watch.

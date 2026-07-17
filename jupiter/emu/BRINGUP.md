@@ -145,6 +145,40 @@ correctly see an outer frame's %i/%l across a window-trap-triggering
 chain?) to rule the interpreter in or out before more RE.
 Tool added: `--regs-at ADDR` (one-shot register capture on first PC hit).
 
+### Definitive root cause: register-window thread context (needs a HW trace)
+
+Walking the spin's saved-frame chain gives the full stack:
+`0x4001ea40/60` (RTOS overlay) -> `0xadbc` -> `0x4176c` -> `0x42218` ->
+`0xea74` -> `0x1b3d0` -> `0x33ca4` -> `0x3d564` -> leaf `0x400203e8`.
+
+At `0x1b3cc` the argument is a **literal**: `mov 0x126, %o0` -- so `%i0 =
+0x126` is a deliberate ID/index, not a stray pointer. And `0x400203e8` is
+not a function entry: it is the **branch-delay slot** of a `be` inside
+one large `.text_dram` routine (0x40020340..0x40020658). The call at
+`0x3d5ac` jumps into the *middle* of that routine, which immediately
+overwrites its passed argument (`lduh [%i4], %o0`) and runs on inherited
+window registers -- `%i4/%i5/%l5..%l7` are the **current thread's
+register-window context**, expected to be pre-established by whatever last
+owned that physical window.
+
+So the `.text_dram` overlay is a register-window-based RTOS, and the stall
+is a *symptom*: the inherited context is wrong (`%i4 = 0` where a table
+pointer belongs), which means an earlier execution-history divergence --
+one device read, interrupt, or scheduling decision that branched
+differently than real silicon -- left the thread's window state wrong.
+The machine's globals are all sane and the CPU is bit-exact (windows
+included), so this is not a local missing-fill or a decode bug; it is the
+accumulated product of the whole boot.
+
+Pinning the *first* divergence is not something static analysis can do
+from here -- the state is a function of the entire run. The definitive
+next step needs a **hardware reference**: a GRMON/DSU register+PC trace
+from the real board at a known checkpoint, diffed against the emulator to
+find the first instruction where they part. Everything up to that point
+is proven (bit-exact CPU, eCos HAL, PROC2 audio DSP boot, SPI-flash ID,
+200M instructions with no fault), and the display engine is already wired
+to render the firmware's OSD the moment it is programmed.
+
 ### The older status (pre-dump), kept for context
 
 ## The CPU is proven

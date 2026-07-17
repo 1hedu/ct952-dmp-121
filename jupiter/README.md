@@ -23,7 +23,8 @@ line-for-line copy.
 | `draw_rect` / `sprite_blit` (NEON) | `jdraw.h` | Plain-C 8bpp fill/clear/color-keyed blit with clipping. |
 | platform layer (`video_/input_/timer_`) | `jshim.h` + `jshim_ct952.c` | See mapping below. |
 | — | `jrgb2yuv.c/h` | New: ARGB8888 → `0x00YYUUVV` BT.601 (the OSD palette is **YUV, not RGB**). |
-| `template/game.c` demo pattern | `japp.c/h` | Demo app on the superloop: color bars, NES scene (scroll + sprites + APU jingle), GB scene, Genesis scene (two-plane parallax + window HUD + sprites), SNES Mode 7 flight. |
+| `cedar.c` / `libcedarjpeg` (codec layer) | `jfb.c/h` + `jcodec.h` + `jcodec_ct952.c` | The Cedar analogue. `jfb`: CPU access to the video plane's block-tiled YUV 4:2:0 framebuffers (the `argb↔nv12` conversion role) — swizzle verified bijective over the full 704×480 canvas in tests. `jcodec`: MPEG-still decode **from memory** through the hardware VLD (the boot-logo idiom), hardware JPEG decode from memory (JPEG-logo idiom), JPEG encode of any framebuffer region (photo-save idiom), and JPU hardware scale-copy (digest idiom). |
+| `template/game.c` demo pattern | `japp.c/h` | Demo app on the superloop: color bars, NES scene (scroll + sprites + APU jingle), GB scene, Genesis scene (two-plane parallax + window HUD + sprites), SNES Mode 7 flight, and a **YUV canvas scene** — the NES scene rendered full-color on the video plane via `jfb` (the `cedar_nes`-pipeline analogue). |
 
 ## Platform mapping
 
@@ -75,8 +76,9 @@ inspection.
 
 ## What was NOT ported, and why
 
-- **CedarVE H.264, `cedar_*` examples** — V3s hardware codec; no
-  equivalent here.
+- **H.264 specifically** — the CT952 has no H.264 silicon; the Cedar
+  *role* (hardware codec + pixel-format bridge) is covered by
+  `jcodec`/`jfb` over the MPEG-1/2 + JPEG + JPU hardware instead.
 - **NEON asm (`sprite_neon.S`, `mode7_neon.S`, `tiles_neon.S`,
   `genesis_asm.S`), `mmu.c`, `irq.c`, `mem.c`** — ARM-specific;
   functionality replaced by `jdraw.h`/plain C where it mattered.
@@ -97,6 +99,15 @@ above). What has NOT been exercised on hardware:
 - The OSD bring-up sequence in `jvid_open()` (region config, mix ratio,
   activation) follows the firmware's own idiom (`osdnd.c`/`osdmm.c`)
   but has not run on a CT952.
+- All of `jcodec_ct952.c` (canvas binding, MPEG/JPEG decode-from-memory,
+  JPEG encode, JPU scale) mirrors the firmware's own call sequences
+  (`utl.c` logo paths, `mm_play.c` photo save, `digest.c`) line for
+  line, but is hardware-unverified. The `jfb` swizzle math itself is
+  fully verified in tests against `GDI_FBDrawDot`'s addressing.
+- The canvas demo scene assumes hardware frame 1's memory is free for
+  scratch while only frame 0 is displayed; in the 2 MB DRAM map the OSD
+  buffer overlaps the frame-buffer region, so the OSD is closed while
+  the canvas scene is active.
 - `HAL_AM_ABUF0_ADR/LEN` opcode values (0x1F/0x20) are **inferred** from
   the unassigned gap in `hdecoder.h` — the authoritative values live in
   the eCos install headers that aren't in this tree. The defines are

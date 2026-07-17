@@ -11,22 +11,30 @@
  *                      sprites
  *   4  SNES Mode 7   -- jsnes renderer: affine ground flight over a
  *                      rings texture
+ *   5  YUV canvas    -- the NES scene rendered FULL-COLOR on the video
+ *                      plane via the jfb tiled-YUV canvas (the
+ *                      cedar_nes-analogue pipeline; OSD is closed while
+ *                      this scene owns the video layer)
  *
  * All assets are generated procedurally at entry -- no bitmap resources,
  * no ROMs. The scenes exercise every ported subsystem: jnes, jgb, jgen,
- * jsnes, jdraw, jaudio, jrgb2yuv and the jshim platform layer.
+ * jsnes, jdraw, jaudio, jrgb2yuv, jfb/jcodec and the jshim layer.
  */
 #include "Winav.h"
 #include "gdi.h"
+#include "disp.h"
 #include "input.h"
 
 #include "jshim.h"
+#include "jrgb2yuv.h"
 #include "jdraw.h"
 #include "jnes.h"
 #include "jgb.h"
 #include "jgen.h"
 #include "jsnes.h"
 #include "jaudio.h"
+#include "jfb.h"
+#include "jcodec.h"
 #include "japp.h"
 
 extern BYTE __bKey;
@@ -43,8 +51,9 @@ extern BYTE __bKey;
 #define JPAL_GEN_BASE  128
 #define JPAL_GB_BASE   192
 
-#define JAPP_SCENES    5
+#define JAPP_SCENES    6
 #define JAPP_FRAME_MS  33   /* ~30 fps target; degrades gracefully */
+#define JAPP_SCENE_CANVAS 5 /* video-plane scene: OSD closed while active */
 
 static BYTE _bJupActive = 0;
 static BYTE _bScene = 0;
@@ -84,6 +93,11 @@ static genesis_sprite_t gen_spr[2];
 static uint8_t m7_map[64 * 64];
 static uint8_t m7_pal_idx[256];
 static snes_mode7_t m7_cfg;
+
+/* ---- YUV canvas scene state ---- */
+static jfb_t _canvas;
+static uint32_t canvas_pal_yuv[256];  /* OSD index -> 0x00YYUUVV */
+static BYTE _bCanvasActive = 0;
 
 /* Set one pixel of a 2bpp tile (shared CHR helper) */
 static void chr_set(uint8_t *tile, int row, int col, uint8_t ci)
@@ -462,8 +476,84 @@ static void scene_m7_frame(void)
     snes_mode7_render8(fb, JVID_PITCH, x0, y0, &m7_cfg);
 }
 
+/* Enter the video-plane canvas scene: the OSD is closed (it would
+ * otherwise cover the video, and in the 2 MB DRAM map the OSD buffer
+ * overlaps the frame-buffer region), the canvas bound to hardware
+ * frame 0, and the NES master palette converted once to YUV. */
+static void canvas_enter(void)
+{
+    int i;
+
+    jvid_close();
+    if (jcodec_canvas_open(&_canvas, 0) != 0)
+        return;
+
+    for (i = 0; i < 256; i++)
+        canvas_pal_yuv[i] = 0x00108080;   /* black */
+    for (i = 0; i < 64; i++)
+        canvas_pal_yuv[JPAL_NES_BASE + i] =
+            jup_argb_to_yuv(jup_nes_master_palette[i]);
+
+    jfb_fill(&_canvas, 0, 0, _canvas.w, _canvas.h, 0x00108080);
+    jcodec_canvas_show(0);
+    _bCanvasActive = 1;
+}
+
+/* Leave the canvas scene: hide the video plane and restore the OSD
+ * (region + palettes), since jvid_close() dropped it. */
+static void canvas_leave(void)
+{
+    if (!_bCanvasActive)
+        return;
+    _bCanvasActive = 0;
+    jcodec_canvas_hide();
+    jvid_open(0);
+    jvid_load_palette(JPAL_NES_BASE, jup_nes_master_palette, 64);
+    build_gb_assets();    /* reloads the GB palette entries */
+    build_gen_assets();   /* reloads the Genesis CRAM entries */
+}
+
+static void scene_canvas_frame(void)
+{
+    /* Reuse the NES scene's world state, but rasterize into a linear
+     * indexed scratch and blit it full-color onto the video plane.
+     * Scratch: hardware frame 1's memory -- unused while the canvas
+     * displays frame 0 only. */
+    uint8_t *scratch = (uint8_t *)__DISPFrameInfo[1].dwFY_Addr;
+    int i;
+
+    nes_bg.scroll_x = (int16_t)(nes_bg.scroll_x + 1);
+    for (i = 0; i < 4; i++) {
+        nes_ball_x[i] = (int16_t)(nes_ball_x[i] + nes_ball_dx[i]);
+        nes_ball_y[i] = (int16_t)(nes_ball_y[i] + nes_ball_dy[i]);
+        if (nes_ball_x[i] <= 0 || nes_ball_x[i] >= NES_NATIVE_W - 8)
+            nes_ball_dx[i] = (int16_t)-nes_ball_dx[i];
+        if (nes_ball_y[i] <= 0 || nes_ball_y[i] >= NES_NATIVE_H - 9)
+            nes_ball_dy[i] = (int16_t)-nes_ball_dy[i];
+        nes_oam[i].x = (uint8_t)nes_ball_x[i];
+        nes_oam[i].y = (uint8_t)(nes_ball_y[i] - 1);
+    }
+
+    nes_render8(scratch, NES_NATIVE_W, 0, 0, JPAL_NES_BASE,
+                &nes_bg, nes_spr_chr, nes_oam, 4);
+
+    jfb_blit_indexed(&_canvas,
+                     (_canvas.w - NES_NATIVE_W) / 2 & ~1u,
+                     (_canvas.h - NES_NATIVE_H) / 2 & ~1u,
+                     scratch, NES_NATIVE_W, NES_NATIVE_H,
+                     NES_NATIVE_W, canvas_pal_yuv);
+}
+
 static void scene_enter(void)
 {
+    if (_bScene == JAPP_SCENE_CANVAS) {
+        canvas_enter();
+        _bSceneDirty = 1;
+        play_jingle();
+        return;
+    }
+    canvas_leave();
+
     /* Frame the scene area with the NES black; scenes draw inside */
     jdraw_clear(jvid_fb(), JVID_PITCH, JVID_W, JVID_H,
                 (uint8_t)(JPAL_NES_BASE + 0x0F));
@@ -491,6 +581,10 @@ static void jupiter_exit(void)
 {
     jaudio_apu_all_off();
     jaudio_genesis_all_off();
+    if (_bCanvasActive) {
+        _bCanvasActive = 0;
+        jcodec_canvas_hide();
+    }
     jvid_close();
     _bJupActive = 0;
 }
@@ -563,6 +657,10 @@ void JUPITER_Trigger(void)
         break;
     case 4:
         scene_m7_frame();
+        break;
+    case JAPP_SCENE_CANVAS:
+        if (_bCanvasActive)
+            scene_canvas_frame();
         break;
     default:
         break;

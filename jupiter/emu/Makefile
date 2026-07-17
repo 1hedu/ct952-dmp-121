@@ -80,6 +80,25 @@ tests/demo_gallery.bin: tests/demo_gallery.elf
 gallery: demo_run tests/demo_gallery.bin
 	./demo_run tests/demo_gallery.bin demo_gallery.ppm
 
+tests/demo_snes.o: tests/demo_snes.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/jsnes_s.o: ../jsnes.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/demo_snes.elf: tests/start.o tests/demo_snes.o tests/jsnes_s.o \
+                     tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_snes.o tests/jsnes_s.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_snes.o tests/jsnes_s.o
+
+tests/demo_snes.bin: tests/demo_snes.elf
+	$(XOBJCOPY) -O binary $< $@
+
+snes: demo_run tests/demo_snes.bin
+	./demo_run tests/demo_snes.bin demo_snes.ppm
+
 tests/start.o: tests/start.S
 	$(XCC) -m32 -mcpu=v8 -c -o $@ $<
 

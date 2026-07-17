@@ -216,7 +216,14 @@ static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
         return 0;                        /* DSU stub */
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 0, 0);
-        return 0;                        /* FCR/SDC/NFC stub */
+        /* FCR/SDC/NFC stub. absent_ff: float the bus like real silicon
+         * with no card/media attached (many present-detect bits are
+         * active-low), instead of reading as all-zeros. */
+        return m->absent_ff ? 0xFFFFFFFFu : 0;
+    }
+    if (addr >= 0xB0000000u && addr < 0xB0010000u) {
+        log_access(m, addr & ~3u, 0, 0);
+        return m->absent_ff ? 0xFFFFFFFFu : 0;   /* USB core stub */
     }
     m->unmapped_reads++;
     log_access(m, addr & ~3u, 0, 0);   /* record so it names the blocker */

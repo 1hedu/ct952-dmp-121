@@ -64,6 +64,10 @@ typedef struct machine {
      * with the PC that issued them (find who fills a table). */
     uint32_t watch_lo, watch_hi;
     int watch_left;
+
+    /* stubbed storage/USB regions (0xA000xxxx / 0xB000xxxx) read as
+     * 0xFFFFFFFF ("no media, floating bus") instead of 0 */
+    int absent_ff;
 } machine_t;
 
 /* Create/reset the machine with a flash image (copied in). */

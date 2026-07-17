@@ -17,6 +17,7 @@ int main(int argc, char **argv)
     const char *rom_path = NULL, *uart_path = NULL, *iolog_path = NULL;
     const char *dram_path = NULL;
     uint32_t watch_lo = 0;
+    int absent_ff = 0;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
     int rom_load = 0;
@@ -38,6 +39,8 @@ int main(int argc, char **argv)
             dram_path = argv[++i];
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc)
             watch_lo = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--absent-ff"))
+            absent_ff = 1;
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
@@ -102,6 +105,7 @@ int main(int argc, char **argv)
                 seed_entry, seed_sp);
     }
 
+    m->absent_ff = absent_ff;
     if (watch_lo) {
         m->watch_lo = watch_lo;
         m->watch_hi = watch_lo + 0x40;   /* watch a 64-byte window */

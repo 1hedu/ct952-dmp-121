@@ -125,11 +125,48 @@ count exceeds 255, so it can't terminate -- one of the config tables it
 walks still holds a value that depends on state we haven't staged (a real
 EEPROM image / earlier device init). The display engine (`0x80001A00`) is
 not touched yet, so the firmware hasn't reached its own display init.
-Next step: trace who calls the `0x40020480` routine and with which
-tables, and stage the missing table/device. The tooling for this landed
-this pass: `--dump-dram`, the jmpl trace ring, and a 64-deep
-per-instruction PC ring (which is exactly how the spin loop above was
-pinpointed).
+
+### Frontier, sharpened with register + memory evidence
+
+Booting the real device image (`dp700wd.bin`, 2 MB / 16 Mbit: sections
+`SETD UZIP TEX2 RODA ROMV TEXT DATA ENGL SFAT LOGO CUST CLCK`, all five
+zip sections unpack) and reading the CPU state at the stall pins the
+cause down exactly. At the spin (`pc=0x40020624`, `cwp=7`):
+
+```
+g2=00000001  l5=40042000  i0=00000126  i4=00000000  i1=40032616
+[l5=0x40042000] : 00 00 00 00 00 00 00 00 ...   (all zero)
+ptbl 0x40046b20 / 0x40046b28 : 00000000 / 00000000
+```
+
+The loop's guard is `lduh [%l5]; cmp %g2, [%l5]; bcc` -- it exits only
+when the counter `%g2` reaches the halfword count at `%l5`. That count
+table at **`0x40042000` is all zeros**, so `1 >= 0` is always true, the
+branch is always taken, and it loops forever. The companion register-
+pointer table at **`0x40046800`** (used as `ld [0x40046b20]`) is zero
+too. Both live in the **bss gap** (between `SFAT`/`DATA` end ~`0x40024e68`
+and `ENGL` at `0x40049900`).
+
+A DRAM write-watch over the whole boot shows `0x40042000..40` is written
+**only once, with zeros**, by a bss-clear at `pc=0x4001d1f0` -- the
+routine that should *populate* these config tables never runs. So this is
+not a stuck device bit: an earlier init step that decodes the panel /
+customer config into `0x40042000` + `0x40046800` (likely from the
+un-loaded `CUST` resource at flash `0x10ff80`, or gated behind a device
+read we stub to 0) is being skipped, and the register-programming loop
+then consumes the empty table and spins.
+
+**Next step:** find what fills `0x40042000` / `0x40046800`. It is
+referenced by many `.text_dram` routines (`sethi %hi(0x40042000)` at
+`0x4001d1cc, 0x4001d864, 0x4001d938, ...`); the caller of the stalling
+loop is a `jmpl` from `0x4001d560`. Trace back from there to the config-
+decode routine and either run it (stage its `CUST`/EEPROM input) or seed
+the two tables directly, then the firmware should proceed to its own
+display init -- at which point the modelled DISP scan-out (`--fb-out`)
+renders whatever it draws (boot logo from the `LOGO` section first).
+
+Tooling used to pin this: `--dump-dram`, the jmpl trace ring, the 64-deep
+PC ring, and an ad-hoc windowed-register + DRAM-write watch.
 
 ### The older status (pre-dump), kept for context
 

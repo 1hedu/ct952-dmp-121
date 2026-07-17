@@ -55,6 +55,31 @@ tests/demo_splash.bin: tests/demo_splash.elf
 demo: demo_run tests/demo_splash.bin
 	./demo_run tests/demo_splash.bin demo_splash.ppm
 
+tests/demo_gallery.o: tests/demo_gallery.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/jgb_s.o: ../jgb.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/jgen_s.o: ../jgen.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/demo_gallery.elf: tests/start.o tests/demo_gallery.o tests/jnes_s.o \
+                        tests/jgb_s.o tests/jgen_s.o tests/jrgb2yuv_s.o \
+                        tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_gallery.o tests/jnes_s.o tests/jgb_s.o \
+	    tests/jgen_s.o tests/jrgb2yuv_s.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_gallery.o tests/jnes_s.o tests/jgb_s.o \
+	    tests/jgen_s.o tests/jrgb2yuv_s.o
+
+tests/demo_gallery.bin: tests/demo_gallery.elf
+	$(XOBJCOPY) -O binary $< $@
+
+gallery: demo_run tests/demo_gallery.bin
+	./demo_run tests/demo_gallery.bin demo_gallery.ppm
+
 tests/start.o: tests/start.S
 	$(XCC) -m32 -mcpu=v8 -c -o $@ $<
 

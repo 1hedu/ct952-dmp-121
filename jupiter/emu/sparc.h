@@ -72,6 +72,12 @@ typedef struct sparc {
     int halted;                          /* error mode / external stop */
     char halt_reason[128];
     uint32_t halt_pc;
+    /* control-flow trace ring: register-indirect jumps (jmpl) */
+    uint32_t tr_from[32], tr_to[32];
+    int tr_i;
+    /* per-instruction PC ring: pinpoints the exact hot loop at halt */
+    uint32_t pc_ring[64];
+    int pc_ri;
 } sparc_t;
 
 /* Reset: PC=0, nPC=4, S=1, ET=0, CWP=0, impl/ver = LEON2-ish */

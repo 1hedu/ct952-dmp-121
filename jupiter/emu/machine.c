@@ -37,6 +37,21 @@
 #define R_PROC2_START  0x7D8
 #define R_AUDIO_CMD    0x7E4
 
+/* Hardware IIC/EEPROM master (undocumented in the headers; the firmware
+ * pokes it directly at 0x80004200). The boot config/EEPROM read routine
+ * (flash 0x62538) writes a command to 0x4210 -- clears bit0, then sets
+ * 0x24 (bit2 = start/trigger, bit5 = mode) -- and spins on bit2 until the
+ * hardware clears it, with a ~1000-tick timeout. On real silicon bit2 is
+ * a self-clearing "transaction in progress" flag; the store/readback
+ * register file would leave it stuck set forever, so we clear it on read
+ * (the transaction completes instantly in the model). 0x4204 is the
+ * status/result word; a companion routine (flash 0x625b0) reads it and
+ * defaults to the 0xAA55 EEPROM signature. */
+#define R_IIC_STAT     0x4204
+#define R_IIC_CMD      0x4210
+#define R_IIC_DATA     0x4214
+#define IIC_BUSY       0x4u
+
 #define TIMER_ENABLE   1u
 #define TIMER_RELOAD   2u
 #define TIMER_LOAD     4u
@@ -104,6 +119,9 @@ static uint32_t io_read(machine_t *m, uint32_t off)
         return m->presc_cnt;
     case R_INT_PENDING:
         return io_get(m, R_INT_PENDING);
+    case R_IIC_CMD:
+        /* trigger/busy bit self-clears: transaction done immediately */
+        return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
     default:
         log_access(m, 0x80000000u + off, 0, 0);
         return io_get(m, off);
@@ -139,9 +157,12 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
         io_set(m, R_PARAM1, v & 0x3FFFFFFFu);
         return;
     case R_AUDIO_CMD:
-        /* PROC1 writes 0x10003 then polls [31:16] for the DSP boot
-         * ack (hdecoder.c:714-737). Stand-in: ack instantly. */
-        io_set(m, R_AUDIO_CMD, (v & 0xFFFFu) | 0x00010000u);
+        /* PROC1 writes 0x10003, then spins reading this word and shifting
+         * right 16; it breaks when [31:16] == 0 (hdecoder.c:724-737).
+         * PROC2 signals "audio boot OK" by clearing the high half. Our
+         * stand-in DSP acks instantly: keep the low 16 (audio type),
+         * clear [31:16]. */
+        io_set(m, R_AUDIO_CMD, v & 0xFFFFu);
         return;
     default:
         log_access(m, 0x80000000u + off, 1, v);
@@ -414,15 +435,17 @@ static uint32_t flash_be32(machine_t *m, uint32_t off)
            ((uint32_t)m->flash[off+2] << 8) | m->flash[off+3];
 }
 
-uint32_t machine_rom_load(machine_t *m, FILE *log)
+/* One load pass. only_data: 0 = load everything except DATA, 1 = only
+ * DATA. DATA is applied last so it wins its overlap with SFAT (the VSR
+ * table at DATA's base must be authoritative). */
+static uint32_t rom_load_pass(machine_t *m, FILE *log, int only_data)
 {
     uint32_t off = 0x10, romv_entry = 0;
-    if (log) fprintf(log, "# section  run       flash     unpacked  packed   action\n");
 
     while (off + 24 <= m->flash_size) {
         char nm[5];
         uint32_t lma, rma, lsz, rsz;
-        int i, printable = 1;
+        int i, printable = 1, is_data;
         for (i = 0; i < 4; i++) {
             nm[i] = (char)m->flash[off + i];
             if (nm[i] < 32 || nm[i] > 126) printable = 0;
@@ -432,6 +455,10 @@ uint32_t machine_rom_load(machine_t *m, FILE *log)
         lma = flash_be32(m, off + 4);  rma = flash_be32(m, off + 8);
         lsz = flash_be32(m, off + 12); rsz = flash_be32(m, off + 16);
         off += 24;
+
+        is_data = !memcmp(nm, "DATA", 4);
+        if (is_data != only_data)
+            continue;
 
         if (lma < 0x40000000u || lma + lsz > 0x40000000u + MACH_DRAM_SIZE) {
             if (log) fprintf(log, "  %-4s %10x %9x %9x %8x  (flash/skip)\n",
@@ -456,9 +483,29 @@ uint32_t machine_rom_load(machine_t *m, FILE *log)
                              nm, lma, rma, lsz, rsz);
         }
     }
-
-    sparc_reset(&m->cpu, &m->bus);   /* clean boot state; DRAM preserved */
     return romv_entry;
+}
+
+uint32_t machine_rom_load(machine_t *m, FILE *log)
+{
+    uint32_t entry;
+    if (log) fprintf(log, "# section  run       flash     unpacked  packed   action\n");
+    rom_load_pass(m, log, 0);              /* everything except DATA */
+    entry = rom_load_pass(m, log, 1);      /* DATA last (wins SFAT overlap) */
+    /* entry (ROMV) came from pass 0; recover it */
+    if (!entry) {
+        /* ROMV is loaded in pass 0; re-scan for its LMA */
+        uint32_t off = 0x10;
+        while (off + 24 <= m->flash_size) {
+            if (m->flash[off] < 32 || m->flash[off] > 126) break;
+            if (!memcmp(m->flash + off, "ROMV", 4)) {
+                entry = flash_be32(m, off + 4); break;
+            }
+            off += 24;
+        }
+    }
+    sparc_reset(&m->cpu, &m->bus);   /* clean boot state; DRAM preserved */
+    return entry;
 }
 
 static int cmp_log(const void *a, const void *b)

@@ -17,7 +17,8 @@ emulator's own I/O-access inventory is the worklist generator.
 | Core devices | timers 1/2/3 + prescaler + watchdog, UART1/2/DSU (tx→host), LEON interrupt controller, PROC2 mailbox + boot-handshake auto-ACK |
 | Unmodeled I/O | store/readback register file with an access log (the worklist) |
 | **ROM section loader** | **Working** (`--rom-load`) — parses the section table, copies raw sections, and **decompresses zipped sections by running the firmware's own codec in-emulator** (`machine_call`). The "closed `gz909`/`UNZIP2006` codec" is no longer a blocker. |
-| **Stock firmware boot** | **Decompresses and boots** — a real device dump (`dp700wd.bin`) unpacks all 5 zipped sections and runs **61k instructions of eCos HAL init** (cache, system timer @ `0x7CF`, interrupt controller) before the next device blocker. |
+| **Stock firmware boot** | **Boots into the main superloop** — a real device dump (`dp700wd.bin`) unpacks all 5 zipped sections, runs eCos HAL init, starts the PROC2 audio DSP, and reaches its watchdog-petting main loop. Parks in a table-driven register-config routine awaiting un-staged config data (see frontier below). |
+| **SDK-on-emulator demo** | **Renders** (`make demo`) — real Jupiter code (`jnes` + draw + palette) cross-compiled to SPARC V8 and run on the emulated CPU draws a splash + live NES scene into the CT952 8bpp OSD plane; snapshotted from DRAM to `demo_splash.png`. |
 
 ## Breakthrough: the compression codec, cracked by execution
 
@@ -43,17 +44,56 @@ algorithm).
 `0x40000000`, `TEXT`→`0x4001d000`, `DATA`, `SFAT`, `ENGL`, seed the boot
 trampoline registers (GR21/22) with the reset vector + a stack, and run.
 
-## Current boot frontier
+## A display window: the SDK, running on the emulated CT952
 
-`./ct952emu dp700wd.bin --rom-load` reaches eCos HAL init and stops at a
-jump to `0x9210a308` (a bad function pointer → instruction fetch from
-unmapped space). The I/O inventory shows it got through cache-control,
-the Timer1 reload (`0x7CF`), and the interrupt mask (`INT_TIMER1`) first.
-Next step: trace the source of that pointer — most likely one more
-unmodeled device read during HAL/PLL bring-up returning 0 where the
-firmware expects a real value (add a control-transfer trace, or model
-the device the inventory implicates). This is ordinary iterative
-device bring-up now — the compression wall is gone.
+`make demo` cross-compiles real JupiterSDK code (`tests/demo_splash.c` +
+`jnes.c` + `jrgb2yuv.c`) for SPARC V8 and runs it *inside* ct952emu --
+the same CPU + machine model that boots the stock ROM -- then snapshots
+the OSD framebuffer out of emulated DRAM to a PPM (`demo_run.c`). The
+result (`demo_splash.png`) is a genuine picture drawn by the ported SDK
+executing on the emulated hardware: a colour-bar test card, a title band
+in a built-in 5x7 font, a 64-step grey ramp, and the ported `jnes`
+background renderer drawing a live 256x224 scene in true NES colours into
+the CT952's native 8bpp palette-indexed OSD plane. No firmware, no libc
+-- `start.S` sets the trap table + stack and calls `testmain()`; every
+pixel is produced by SPARC instructions the interpreter executed.
+
+This closes the arc: port the SDK -> build the emulator -> run the SDK on
+the emulator -> see a display window.
+
+## Stock-firmware boot frontier
+
+`./ct952emu dp700wd.bin --rom-load` now boots far past the old
+`0x9210a308` wild jump. Fixes that moved the frontier this pass:
+
+1. **SFAT/DATA overlap** -- DATA now loads last so its VSR dispatch table
+   at `0x40020878` isn't clobbered by SFAT (was the `0x9210a308` crash).
+2. **Hardware IIC/EEPROM master** (`0x80004200`, undocumented in the
+   headers) -- the boot config read (flash `0x62538`) writes a command to
+   `0x4210` and spins on the bit2 "busy" flag. The store/readback file
+   left it stuck set; we self-clear it on read (transaction completes
+   instantly), matching self-clearing trigger silicon.
+3. **PROC2 audio-DSP boot ACK** (`0x800007e4`) -- the firmware writes
+   `0x10003` and spins until bits [31:16] read **0** (hdecoder.c:724).
+   The stand-in DSP now clears the high half instead of setting it.
+
+With those, the firmware decompresses all sections, runs eCos HAL init,
+starts the audio DSP, and reaches its **main superloop** (pets the
+watchdog at `0x8000004c`, reads `SYSTEM_CONFIGURATION1` at `0x8000031c`
+each pass). It currently parks in a table-driven register-config routine
+(SFAT region, tight loop `0x4002050c..0x40020638`): a nested walk over
+halfword count tables at `%i0/%i4/%l5` that programs engine registers via
+a pointer table at `0x40046800`. The inner exit compares
+`(%l4 & 0xff) < *(u16*)%i0`; with the current table contents that outer
+count exceeds 255, so it can't terminate -- one of the config tables it
+walks still holds a value that depends on state we haven't staged (a real
+EEPROM image / earlier device init). The display engine (`0x80001A00`) is
+not touched yet, so the firmware hasn't reached its own display init.
+Next step: trace who calls the `0x40020480` routine and with which
+tables, and stage the missing table/device. The tooling for this landed
+this pass: `--dump-dram`, the jmpl trace ring, and a 64-deep
+per-instruction PC ring (which is exactly how the spin loop above was
+pinpointed).
 
 ### The older status (pre-dump), kept for context
 
@@ -165,6 +205,7 @@ remaining blocker is now *named and located* rather than mysterious.
 cd jupiter/emu
 make            # builds ct952emu, test_sparc, and the SPARC test image
 make check      # CPU verification (bit-exact vs native)
+make demo       # run the SDK splash on the emulator -> demo_splash.ppm
 make boot       # run the stock ../../DVD909.rom, capture UART + I/O log
 
 ./ct952emu <flash.rom> [--instr N] [--uart FILE] [--iolog FILE]

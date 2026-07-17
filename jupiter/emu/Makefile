@@ -25,6 +25,36 @@ test_sparc: test_sparc.c sparc.c machine.c tests/testprog.c \
 probe_unzip: probe_unzip.c sparc.c machine.c sparc.h machine.h
 	$(CC) $(CFLAGS) -I. -o $@ probe_unzip.c sparc.c machine.c
 
+# ---- SDK splash demo: real Jupiter code run on the emulated CT952 ----
+XCFLAGS = -m32 -mcpu=v8 -msoft-float -O2 -ffreestanding -fno-builtin \
+          -mno-app-regs -I.. -I../..
+
+demo_run: demo_run.c sparc.c machine.c sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ demo_run.c sparc.c machine.c
+
+tests/demo_splash.o: tests/demo_splash.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/jnes_s.o: ../jnes.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/jrgb2yuv_s.o: ../jrgb2yuv.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+
+tests/demo_splash.elf: tests/start.o tests/demo_splash.o tests/jnes_s.o \
+                       tests/jrgb2yuv_s.o tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_splash.o tests/jnes_s.o \
+	    tests/jrgb2yuv_s.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/demo_splash.o tests/jnes_s.o tests/jrgb2yuv_s.o
+
+tests/demo_splash.bin: tests/demo_splash.elf
+	$(XOBJCOPY) -O binary $< $@
+
+demo: demo_run tests/demo_splash.bin
+	./demo_run tests/demo_splash.bin demo_splash.ppm
+
 tests/start.o: tests/start.S
 	$(XCC) -m32 -mcpu=v8 -c -o $@ $<
 

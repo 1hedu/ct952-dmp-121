@@ -15,6 +15,7 @@
 int main(int argc, char **argv)
 {
     const char *rom_path = NULL, *uart_path = NULL, *iolog_path = NULL;
+    const char *dram_path = NULL;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
     int rom_load = 0;
@@ -32,6 +33,8 @@ int main(int argc, char **argv)
             uart_path = argv[++i];
         else if (!strcmp(argv[i], "--iolog") && i + 1 < argc)
             iolog_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-dram") && i + 1 < argc)
+            dram_path = argv[++i];
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
@@ -110,11 +113,46 @@ int main(int argc, char **argv)
             m->cpu.pc, m->cpu.npc, m->cpu.psr, m->cpu.tbr,
             (unsigned)(m->cpu.psr & PSR_CWP), m->cpu.wim);
 
+    /* control-flow trail leading to the stop (last register-indirect
+     * jumps) -- pinpoints the source of a wild jump */
+    {
+        int n = m->cpu.tr_i < 16 ? m->cpu.tr_i : 16;
+        int k;
+        fprintf(stderr, "[ct952emu] last %d indirect jumps (from -> to):\n", n);
+        for (k = n; k > 0; k--) {
+            int idx = (m->cpu.tr_i - k) & 31;
+            fprintf(stderr, "    0x%08x -> 0x%08x\n",
+                    m->cpu.tr_from[idx], m->cpu.tr_to[idx]);
+        }
+    }
+
+    /* last 64 PCs executed -- pinpoints the exact hot loop body */
+    {
+        int k;
+        fprintf(stderr, "[ct952emu] last 64 PCs (oldest first):\n   ");
+        for (k = 0; k < 64; k++) {
+            int idx = (m->cpu.pc_ri + k) & 63;
+            fprintf(stderr, " %08x", m->cpu.pc_ring[idx]);
+            if ((k & 7) == 7) fprintf(stderr, "\n   ");
+        }
+        fprintf(stderr, "\n");
+    }
+
     if (iolog_path) {
         FILE *lf = fopen(iolog_path, "w");
         if (lf) { machine_dump_iolog(m, lf); fclose(lf); }
     } else {
         machine_dump_iolog(m, stderr);
+    }
+
+    if (dram_path) {
+        FILE *df = fopen(dram_path, "wb");
+        if (df) {
+            fwrite(machine_dram_ptr(m, 0x40000000u), 1, MACH_DRAM_SIZE, df);
+            fclose(df);
+            fprintf(stderr, "[ct952emu] dumped DRAM (%u bytes) to %s\n",
+                    MACH_DRAM_SIZE, dram_path);
+        }
     }
 
     if (m->uart_file) fclose(m->uart_file);

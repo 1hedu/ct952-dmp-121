@@ -161,6 +161,7 @@ static int step(sparc_t *c)
         do_trap(c, TT_INSTR_ACCESS, pc, npc);
         return c->halted;
     }
+    c->pc_ring[c->pc_ri++ & 63] = pc;
     c->icount++;
 
     {
@@ -398,6 +399,9 @@ static int step(sparc_t *c)
                 do_trap(c, TT_CP_DISABLED, pc, npc); return c->halted;
             case 0x38: {  /* jmpl */
                 uint32_t target = a + b;
+                c->tr_from[c->tr_i & 31] = pc;
+                c->tr_to[c->tr_i & 31] = target;
+                c->tr_i++;
                 if (target & 3) {
                     do_trap(c, TT_UNALIGNED, pc, npc); return c->halted;
                 }

@@ -555,3 +555,72 @@ make boot       # run the stock ../../DVD909.rom, capture UART + I/O log
 
 Requires `gcc` for the host build and `sparc64-linux-gnu-gcc` (with
 `-m32`) for the CPU test image.
+
+---
+
+## Update: from "Loading . . ." into photo-display mode
+
+Two device-model gaps were keeping the stock DP700WD firmware parked on the
+`Loading . . .` screen, spinning ~38M times per run polling the video decoder
+for progress that never came. Both are now modeled (`machine.c`), and the
+firmware advances through decoder init into slideshow/photo mode -- it clears
+the loading OSD to expose the video plane.
+
+### 1. Display VSYNC interrupt (the missing heartbeat)
+
+The panel's field tick drives the firmware's display/slideshow state machine
+(`interrupt.c`: `INT_Proc1_1st_isr` -> `ISR_DISPSaveClearStatus`). It arrives
+on a *secondary* interrupt controller -- "PROC1 1st" at `0x800000b0..bc`
+(`ctkav_platform.h`) -- that cascades into LEON interrupt line 13
+(`INT_NO_PROC1_1ST`). The firmware unmasks line 13 and enables all secondary
+sources (`REG_PLAT_PROC1_1ST_INT_MASK_ENABLE = 0xffffffff`), then waits.
+
+Modeled:
+* the secondary controller registers -- `MASK_ENABLE` (0xb0, direct RW mask),
+  `PENDING` (0xb4, RW; VSYNC source sets bit0), `STATUS`/`CLEAR` (0xb8, R /
+  W1C), `MASK_DISABLE` (0xbc, W1C into the mask);
+* a **level-triggered cascade**: LEON line 13 asserts whenever
+  `(PENDING & MASK_ENABLE) != 0`, computed live in `bus_irq_level`;
+* a **field-rate VSYNC source** in `machine_cycle` (env-tunable divider
+  `CT952_VSYNC_DIV`, default 200000 cycles).
+
+With this the display ISR runs and the firmware programs the video window
+(`REG_DISP_VIDEO_POS` becomes `0x00150065`).
+
+### 2. PROC2 vdec command handshake
+
+PROC1 commands the video decoder by writing `REG_SRAM_PLAYMODE` (`0xb0000190`,
+in the vdec SRAM `ctkav_vdec.h`); the decoder microcode on PROC2 overwrites it
+with a **completion state** (`comdec.h` `EN_VDEC_CMD`) that PROC1's wait loops
+poll for -- e.g. `_Wait_Decoder_Stop_CMD_ACK` (`hal.c`) waits for
+`MODE_STOPPED`. Command values observed from the firmware: `0x10` MODE_STOP,
+`0x11` MODE_STOPPED, `0x80` MODE_PREDECODE, `0x86` MODE_RELEASE_MODE, `0x00`
+NONE/reset.
+
+We don't execute the PROC2 microcode, so a stand-in delivers the ack after a
+short poll latency (`proc2_ack_of`): `STOP->STOPPED`, `SCAN->SCAN_DONE`,
+`PREDECODE->PREDEC_DONE`, `reset/NONE->STOP`. This carries the firmware through
+several decoder-reset/command cycles it otherwise dead-locked on.
+
+### The built-in demo photos
+
+The frame ships five 640x360 demo images -- the Windows sample-picture set
+(zebra-longwing butterfly, Grand Teton barn, chrysanthemum, Golden Gate, ...) --
+as ordinary JFIF/EXIF JPEGs at flash `0x160000/0x170000/0x180000/0x190000/
+0x1a0000` (one per 64 KiB slot, each followed by two thumbnails).
+`tools/extract_photos.py` pulls them out and renders them at the 480x234 panel
+geometry (what the LCD actually shows).
+
+### Remaining path to a firmware-rendered photo on screen
+
+The firmware now reaches photo mode but does not yet complete an actual frame
+decode (the DISP video frame-buffer registers `REG_DISP_F0Y/F0C_ADDR` and the
+BIU bitstream source stay 0). To close the loop:
+
+1. Drive the firmware's still-JPEG decode far enough that it programs the video
+   frame buffers and the BIU bitstream-read channel (the JPEG source in DRAM).
+2. Intercept the decode kick; decode the JPEG host-side (or model the JPU) and
+   write the result into the destination frame buffer in the hardware's tiled
+   YUV 4:2:0 layout (`jfb.h`).
+3. Add a DISP **video-plane** scan-out path (currently only the 8bpp OSD plane
+   is composited by `machine_disp_scanout`); composite video + OSD to a PPM.

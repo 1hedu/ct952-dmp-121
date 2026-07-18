@@ -918,8 +918,14 @@ disappears from the hot set** — the boot thread is past the decoder-init
 handshake and now sits in ordinary sequential `OS_DelayTime` init pacing
 (`0x59850`, a plain busy-delay: `get t0; {delay; } while (now-t0 < N)`), with no
 stuck poll-condition alongside it. That signature (pure delay primitive hot, no
-condition body) suggests the remaining distance to `POWERONMENU_Initial` is
-**time/pacing, not another hard gate** — under test with a long run.
+condition body) *suggested* the remaining distance to `POWERONMENU_Initial`
+might be time/pacing — **but a 1.5-billion-instruction run (~11 s emulated) with
+both gates forced still shows `GPU ops = 0`**. So it is NOT pacing: the boot
+thread is **delay-*polling* a third condition** (the `0x59850` `OS_DelayTime` is
+the wait *between* poll iterations, not sequential init). A third gate remains
+before the menu draws — find what the boot thread reads between the `0x59850`
+delays with both gates already forced. This is an iterative chain of decoder/
+display-init handshakes; 2 links cleared, ≥1 remains.
 
 **Root cause & the faithful fix direction.** The whole chain exists because
 **PROC2 is deliberately held in reset at the menu** (§10.9), so no DSP drives the

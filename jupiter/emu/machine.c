@@ -567,6 +567,9 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
          * before the state settles to STOPPED(0x11). See machine.h. */
         if (m->cycles < m->vdec_stop_until && addr == 0x40039cd0u)
             return 0x10u;
+        if (addr == 0x40039cd0u && getenv("CT952_TEST_MIRROR10") &&
+            m->cpu.icount > 45000000ull)
+            return 0x10u;   /* DIAGNOSTIC: is the 0x612b0 poll the block? */
         /* EXPERIMENT (CT952_VDEC_IDLE): present the boot thread's decoder-init
          * handshake flags as "decoder idle/ready" so INITIAL_PowerONStatus's
          * chain of MODE_STOP-style waits (0x61170 -> next gate 0x40039f24==1 ...)
@@ -599,6 +602,8 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
              * the getter (0x6f054) adds no busy bit and returns the mirror's
              * MODE_STOP(0x10) cleanly. */
             if (m->cycles < m->vdec_stop_until) return 0x11u;
+            if (getenv("CT952_TEST_MIRROR10") && m->cpu.icount > 45000000ull)
+                return 0x11u;   /* DIAGNOSTIC: no busy bit so getter=mirror(0x10) */
             static int fp = -1;
             if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
                           fp = e ? (int)strtoul(e, NULL, 0) : -2; }
@@ -695,6 +700,13 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         if ((cmd == 0x10u || cmd == 0x11u) &&
             m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f400u)
             m->vdec_stop_until = m->cycles + m->proc2_ack_dwell;
+        if (getenv("CT952_STOPTRACE") && m->cpu.icount > 55000000ull) {
+            static int sn; if (sn < 24) {
+                fprintf(stderr, "[PMwr>55M] b0000190=%02x pc=%08x armed=%d icount=%llu\n",
+                        cmd, m->cpu.pc,
+                        (m->cycles < m->vdec_stop_until), (unsigned long long)m->cpu.icount);
+                sn++; }
+        }
     }
 
     /* Trace who writes the vdec playmode + its software mirrors (the state the

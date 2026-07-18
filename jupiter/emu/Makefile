@@ -140,9 +140,11 @@ bootreal: ct952emu
 # decoder -> a PPM. Proves the firmware->emulator decode path end to end.
 logo: ct952emu
 	CT952_PROC2=1 ./ct952emu dp700wd.bin --instr 800000000 --quiet \
-	    --fb-addr 0x4005f000 --fb-wh 480x234 \
-	    --decode-jpeg --jpeg-src 0x401dc000 --jpeg-out dp700wd_logo.ppm
+	    --fb-addr 0x4005f000 --fb-wh 480x234 --decode-jpeg \
+	    --jpeg-src 0x401dc000 --jpeg-out dp700wd_logo.ppm \
+	    --fb-out dp700wd_logo_panel.ppm
 	@echo "decoded firmware-staged logo -> dp700wd_logo.ppm"
+	@echo "composited onto the 480x234 panel  -> dp700wd_logo_panel.ppm"
 
 # Standalone decoder self-test: decode a JPEG file to a PPM.
 jpeg_selftest: tests/jpeg_selftest.c emujpeg.c picojpeg.c emujpeg.h picojpeg.h

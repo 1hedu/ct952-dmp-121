@@ -37,7 +37,11 @@ static void machine_do_jpeg_decode(machine_t *m)
         fprintf(stderr, "[ct952emu] JPEG decode: %dx%d from 0x%08x -> %s\n",
                 w, h, m->jpeg_src, m->jpeg_out);
     }
-    free(rgb);
+    /* keep the raster for the scan-out video-plane composite */
+    free(m->jpeg_rgb);
+    m->jpeg_rgb = rgb;
+    m->jpeg_w = w;
+    m->jpeg_h = h;
 }
 
 /* LEON core block offsets (ctkav_platform.h:19-97) */
@@ -674,6 +678,8 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     m->jpeg_done = 0;
     m->jpeg_src = 0x401dc000u;
     m->jpeg_out = NULL;
+    m->jpeg_rgb = NULL;
+    m->jpeg_w = m->jpeg_h = 0;
     sparc_reset(&m->cpu2, &m->bus2);
     m->cpu2.halted = 1;      /* idle until PROC1 releases it */
     return 0;
@@ -705,6 +711,7 @@ void machine_free(machine_t *m)
     free(m->dram);
     free(m->bram);
     free(m->rx_buf);
+    free(m->jpeg_rgb);
     m->flash = NULL;
     m->dram = NULL;
     m->bram = NULL;
@@ -972,12 +979,25 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     f = fopen(ppm_path, "wb");
     if (!f) return -1;
     fprintf(f, "P6\n%u %u\n255\n", w, h);
-    /* render the OSD plane content regardless of the hardware enable bit
-     * (the firmware draws before flipping enable); enable state is still
-     * reported via the return value */
+    /* Composite the panel: the decoded photo on the video/main plane (scaled
+     * to the panel), with the OSD plane on top -- OSD index 0 is transparent,
+     * so the photo shows through wherever no UI is drawn. Renders the OSD
+     * content regardless of the hardware enable bit (the firmware draws before
+     * flipping enable); enable state is still reported via the return value. */
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++) {
-            uint32_t c = pal[fb[(uint64_t)y * stride + x]];
+            uint8_t idx = fb[(uint64_t)y * stride + x];
+            uint32_t c;
+            if (idx == 0 && m->jpeg_rgb && m->jpeg_w > 0 && m->jpeg_h > 0) {
+                /* transparent OSD pixel -> sample the video plane */
+                int vx = (int)((uint64_t)x * m->jpeg_w / (w ? w : 1));
+                int vy = (int)((uint64_t)y * m->jpeg_h / (h ? h : 1));
+                const uint8_t *p = m->jpeg_rgb +
+                                   ((size_t)vy * m->jpeg_w + vx) * 3;
+                c = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+            } else {
+                c = pal[idx];
+            }
             fputc((int)((c >> 16) & 0xFF), f);
             fputc((int)((c >> 8) & 0xFF), f);
             fputc((int)(c & 0xFF), f);

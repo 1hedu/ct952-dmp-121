@@ -70,6 +70,10 @@ typedef struct machine {
     int jpeg_decode_en, jpeg_done;
     uint32_t jpeg_src;
     const char *jpeg_out;
+    /* decoded RGB888 raster, kept so the scan-out can composite it as the
+     * video plane under the OSD (the panel = photo on video + UI on OSD) */
+    uint8_t *jpeg_rgb;
+    int jpeg_w, jpeg_h;
 
     /* PROC2 vdec stand-in: PROC1 writes a VDEC command to REG_SRAM_PLAYMODE
      * (0xb0000190); the real decoder microcode acks by overwriting it with a

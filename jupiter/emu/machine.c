@@ -385,6 +385,22 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
     case R_UART1_DATA: uart_tx(m, 1, v); return;
     case R_UART2_DATA: uart_tx(m, 2, v); return;
     case R_DSU_UART_DATA: uart_tx(m, 3, v); return;
+    case R_TIMER1_CNT:
+    case R_TIMER1_RLD: {
+        /* Time compression (CT952_TICK_MULT): the eCos system tick is TIMER1
+         * (IRQ bit 0x100 = L8). Many boot-thread decoder-state polls with PROC2
+         * held in reset are timeout-bound (2999/30015 ticks ~ billions of
+         * instructions). Scaling the TIMER1 reload/count down by N makes the
+         * tick advance N x faster, so those timeouts fire in 1/N the
+         * instructions and the boot progresses through the chain in a runnable
+         * budget -- relative firmware timing is preserved. */
+        static int mult = -1;
+        if (mult < 0) { const char *e = getenv("CT952_TICK_MULT");
+                        mult = e ? atoi(e) : 1; if (mult < 1) mult = 1; }
+        if (mult > 1) { v = v / (uint32_t)mult; if (!v) v = 1; }
+        io_set(m, off, v);
+        return;
+    }
     case R_TIMER1_CTL:
     case R_TIMER2_CTL: {
         uint32_t cnt_off = (off == R_TIMER1_CTL) ? R_TIMER1_CNT : R_TIMER2_CNT;

@@ -141,6 +141,10 @@ static void machine_maybe_jpeg_decode(machine_t *m)
 #define R_VLD_MBINT    0x21C0        /* HDR/RL/MC done + JPEG_ST bits */
 #define VLD_MB_RDY     0x4000000u
 #define VLD_DONE_BITS  0x80Bu        /* JPEG_ST|MC_DONE|RL_DONE|HDR_DONE */
+/* MCU audio bitstream-buffer remainder (ctkav_mcu.h:185): the audio-hang
+ * monitor treats a frozen value as a dead DSP and resets PROC2. */
+#define R_MCU_A0REM    0x2F10
+#define R_MCU_A1REM    0x2F14
 
 #define UART_STAT_READY 0x6u   /* TX shift + holding empty, no RX data */
 #define UART_STAT_DATA_READY 0x1u   /* RX byte available (ctkav_platform.h) */
@@ -227,6 +231,13 @@ static uint32_t io_read(machine_t *m, uint32_t off)
     case R_VLD_MBINT:
         /* per-stage done bits (header/run-length/motion-comp/JPEG) */
         return io_get(m, R_VLD_MBINT) | VLD_DONE_BITS;
+    case R_MCU_A0REM:
+    case R_MCU_A1REM:
+        /* Audio bitstream-buffer remainder: the audio-hang monitor treats a
+         * frozen value as a dead DSP. Present a live, changing value so audio
+         * looks alive. (Not the current menu blocker -- that is a config-apply
+         * callback loop -- but correct modelling regardless.) */
+        return (uint32_t)((~(m->cycles >> 6)) & 0x00FFFFFCu) | 4u;
     case 0xc10:
         /* Decoder progress/state word. The firmware's wait loop (flash
          * 0x72810) polls bits[20:16] for >=7. This is driven by the hardware

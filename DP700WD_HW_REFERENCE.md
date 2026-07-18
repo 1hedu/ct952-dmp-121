@@ -528,3 +528,119 @@ running the retail image in an emulator (`jupiter/emu/`, see its `BRINGUP.md` fo
 the blow-by-blow). On-hardware specifics — whether the retail DP700WD image muxes
 the UART pins, and the exact 480×234 TCON timing — must still be confirmed on the
 bench.*
+
+---
+
+## 9. The DMP app state machine — how photos actually get displayed
+
+Traced from source (this exact `DMP952A_EVAL` build). This is the control-flow
+map a re-implementation (or MicroPython app) needs.
+
+### 9.1 Boot → power-on icon menu (NO auto-slideshow in this build)
+
+- `main()` (`cc.c`) → `INITIAL_System` → **`POWERONMENU_Initial()`** (`cc.c:1320`)
+  → `CC_DVD_MainLoop()` superloop (`cc.c:1396`/`836`).
+- `SUPPORT_POWERON_MENU` is **on**; `SUPPORT_PLAY_MEDIA_DIRECTLY_POWER_ON` is
+  **off** (`Winav.h:1559`), and `MM_PlayPhotoInFlash()` is compiled out. The
+  JPEG screensaver (`osdss.c`) is off (`NO_SCREEN_SAVER`). **So there is no
+  keyless path that auto-plays the built-in photos** — the frame sits on the
+  power-on icon menu and waits for input. (A retail unit that *does* auto-play
+  simply ships with `SUPPORT_PLAY_MEDIA_DIRECTLY_POWER_ON` defined.)
+- The built-in demo photos play when the user selects the **Favorite icon** →
+  `_POWERONMENU_EnterFavoriteMode()` (`poweronmenu.c:1617`), or via the
+  thumbnail **Edit** mode (`thumb.c:2356/2811`).
+
+### 9.2 The built-in-photo play trigger
+
+`_POWERONMENU_EnterFavoriteMode()` (gated on `__bMMJPGEncodeNum > 0`):
+```
+__wDiscType = BOOK_M1;  __wPlayItem = 1;
+__SF_SourceGBL[0].bSourceIndex = SOURCE_SPI;   // read photos from serial flash
+__bModeCmd = KEY_PLAY;  UTL_PlayItem(1, 0);     // -> parser -> UTL_ShowJPEG_Slide
+```
+- `__bMMJPGEncodeNum` is armed at boot by `MM_EncodeFile_Init()`
+  (`initial.c:1326` → `mm_play.c:2402`): if setup-flash byte
+  `SETUP_ADDR_JPG_ENCODE_MASK != 0xEE`, it sets `__bMMJPGEncodeNum =
+  BUILD_IN_JPG_ENCODE_NUM (=3)` (erased `0xFF` flash → armed).
+- Built-in photos are read as **raw SPI-flash sectors** by the `SOURCE_SPI`
+  source, NOT by section name: `srcfilter.c:515` `__dwSFSPIStartAddr =
+  SRCFTR_SPI_ENCODE_ADDR + dwStartPos*2048`, 64 KiB per slot. In *this* SDK
+  `SRCFTR_SPI_ENCODE_ADDR = 0x110000` (`srcfilter.h:357`); the retail image's
+  photos sit at `0x160000+`, so the retail build sets this base differently —
+  confirm on the real flash.
+
+### 9.3 Media detection (the "no media" gate / hang risk)
+
+`MEDIA_MonitorStatus` (`cc.c:1049`) → `_MEDIA_MonitorMediaStatus`
+(`media.c:1384`) reads USB/card presence through `SrcFilter_GetStatus` →
+`USBSRC_GetUSBSRCStatus` (cached `_bUSBSRCState`), set by the USBSRC worker
+thread from **`USB_CheckConnect()` / `USB_CheckStatus()` /
+`CARD_CardStatus_Inserted()`** — all in the precompiled `usb.a`/`card.a` blobs
+(the opaque HW boundary). Not-present → `_bUSBSRCState = NO_MEDIA` → clean fall
+back to the power-on menu (`media.c:1570`). **Hang risk for an emulator:** if
+those polls never return a not-present verdict (or the thread never posts
+`SRCFILTER_FLAG_STATUS`), `_bTriggerCmd1` latches with no timeout — so a model
+must make USB/card detection resolve to "no device".
+
+### 9.4 `__bMMAutoPlay`
+
+Set only in the poweron-menu mode-entry functions from stored ImageFrame
+settings (`poweronmenu.c:1516/1565/...`, `thumb.c:3063`). Gates the *external
+media* slideshow auto-start (`mm_ui.c:1960`), not the built-in Favorite path
+(which calls `UTL_PlayItem` directly). No idle timeout starts a slideshow.
+
+## 10. The photo display pipeline (decode → tiled YUV → panel)
+
+`UTL_ShowJPEG_Slide` (`utl.c:377`): parse header → `HALJPEG_Decode()` →
+`HALJPEG_Display(frame)`. **[SRC]**
+
+### 10.1 Display frame buffers (16 Mbit DRAM)
+
+Slideshow (single-buffer full-screen, `JPG_SINGLE_FRAME_BUFFER` +
+`JPEG_SINGLE_BUFFER_FULL_SCREEN`): `DISP_FrameBufferSet(DS_FRAMEBUF_ST_SLIDESHOW
+…)` (`haljpeg.c:95`). `DS_FRAMEBUF_ST_SLIDESHOW = 0x40065000`,
+`DS_FRAMEBUF_END_SLIDESHOW = 0x401AC000` (`dvd_dram_16m.h`). Decode buffer is
+**720×448**. Resulting `__DISPFrameInfo[0]`: **Y = 0x40065000**, **C =
+0x400B3C00** (Y + 720*448). Robust read: `Y = REG_DISP_F0Y_ADDR*8 + 0x40000000`,
+`C = REG_DISP_F0C_ADDR*8 + 0x40000000` (`gdi.c:3576`).
+
+### 10.2 Pixel format — macroblock-tiled YUV 4:2:0, semi-planar
+
+From `GDI_FBDrawDot` (`gdi.c:3548`, `SUPPORT_CT909S`), already implemented in
+`jupiter/jfb.c`/`jfb.h`:
+- **Y**: `off = (y>>4)*strip + (x>>2)*64 + (y&15)*4 + (x&3)`
+- **C** (cx=x/2, cy=y/2): `off = (cy>>4)*strip + (cx>>3)*256 + ((cx&7)>>2)*64 +
+  (cy&15)*4 + (cx&3)`; **U at off, V at off+128**
+- **strip** = `((REG_DISP_STRIPE & 0xFF) << 8) / 4` (the `/4` is 909P-specific);
+  720-wide → `strip = 0x2D00`. `REG_DISP_STRIPE = 0x80001A0C`.
+
+### 10.3 The display kick (which DISP registers, library-internal in display.a)
+
+`HALJPEG_Display` (`haljpeg.c:954`): `DISP_Display(frame, DISP_MAINVIDEO)` (page-
+flip, latched at VSYNC) + `DISP_DisplayCtrl(DISP_MAINVIDEO, TRUE)`. Register
+effects: `REG_DISP_F0Y_ADDR (0x1AC0)=Y/8`, `F0C (0x1AC4)=C/8`,
+`STRIPE (0x1A0C)`; window `REG_DISP_VIDEO_POS (0x1A48)` /
+`REG_DISP_VIDEO_SIZE (0x1A4C)`; **enable = `DISP_VIDEO_EN (0x10000000)` in
+`REG_DISP_VIDEO_SIZE`**.
+
+### 10.4 Compositing & scaling
+
+Four planes, top→bottom: SP2/SP1 (subpicture) > **OSD** (8bpp, 0x4005F000) >
+**main video** (the photo) > background (`REG_DISP_MAIN_BG 0x1A34`). **OSD index
+0 = transparent color key** (`DISP_OSD_T_EN 0x01000000` in `REG_DISP_OSD_CR1
+0x1A5C`; `setup.c:4659`). Two scaling stages: **JPU** scales the photo to
+720×448 in the tiled buffer at decode time (`REG_JPU_HEIWID_SRC/DST 0x2890/94`,
+`HVSC_FACTOR 0x2898`, kicked by `JPU_GO`); then the **DISP** video scaler
+(`REG_DISP_VSCALE_CR 0x1A1C`, `HU_SCALE 0x1A20`, `HD_SCALE 0x1A24`) shrinks the
+720×448 window onto the ~480×234 panel.
+
+### 10.5 Emulator status / the current blocker
+
+The functional JPEG decode (picojpeg, §8/`emujpeg.c`) satisfies the
+`0x80000c10` decode-progress gate, but the firmware's full `HALJPEG_Decode`
+(JPU scaler + JPEG status) does **not** complete: observed that the firmware
+never writes `REG_DISP_F0Y_ADDR` and never sets `DISP_VIDEO_EN` — i.e. it does
+not reach `HALJPEG_Display`. Reaching a natural on-panel photo needs the JPU
+decode/scale handshake modeled far enough that `HALJPEG_Decode` returns success
+and the firmware programs the video plane; then the scan-out reads the tiled YUV
+at `REG_DISP_F0Y/F0C` (§10.2) and composites it under the OSD.

@@ -297,10 +297,18 @@ static void gpu_exec(machine_t *m, uint32_t ctl0)
 {
     uint32_t sz = io_get(m, R_GPU_OP_SIZE);
     uint32_t w = sz & 0xFFFF, h = (sz >> 16) & 0x7FF;
-    uint32_t ag = io_get(m, R_GPU_AG_OFF) >> 16;
-    uint32_t agw = (ag >> 8) & 0xFF, ago = ag & 0xFF;
-    uint32_t stride = (agw + ago > 1) ? (agw + ago - 1) * 8u : 616u;
     uint32_t dest = io_get(m, R_GPU_DEST);
+    /* Row pitch of the destination plane. gdi.c GDI_SetGpuAddr derives
+     *   ag_width  = (op_width + (addr&3) + 3) >> 2
+     *   ag_offset = ((OSD_width+3)>>2) - ag_width + 1     (REG_GPU_AG_OFF>>16)
+     * so that ag_width+ag_offset-1 == (OSD_width+3)>>2 is a CONSTANT plane
+     * pitch regardless of the op's own width. Reconstruct it the same way:
+     * take ag_offset from the register and ag_width from OP_SIZE.w, so a
+     * width-set draw (w!=0) lands on the same physical plane pitch as a
+     * full-width (w==0) draw instead of shearing. */
+    uint32_t ago = (io_get(m, R_GPU_AG_OFF) >> 16) & 0xFFFF;
+    uint32_t agw = (w + (dest & 3) + 3) >> 2;
+    uint32_t stride = (agw + ago > 1) ? (agw + ago - 1) * 8u : 616u;
     uint32_t opmode = (ctl0 >> 2) & 0x7;
 
     if (m->gpu_ops == 0 && getenv("CT952_TRACE"))
@@ -1268,8 +1276,12 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     {
         int loaded = 0;
         for (i = 0; i < 256; i++) {
-            pal[i] = disp_yuv_to_rgb(io_get(m, R_DISP_GAM_OSD + (uint32_t)i * 4));
-            if (i && pal[i]) loaded = 1;
+            uint32_t raw = io_get(m, R_DISP_GAM_OSD + (uint32_t)i * 4);
+            pal[i] = disp_yuv_to_rgb(raw);
+            /* Test the RAW palette word, not the converted RGB: an all-zero
+             * GAM_OSD entry converts to (0,135,0) green (BT.601 Y=U=V=0), which
+             * is nonzero and would falsely read as "palette loaded". */
+            if (i && raw) loaded = 1;
         }
         /* if the firmware hasn't loaded the OSD palette RAM yet, fall back
          * to a visible per-index ramp so drawn content stays legible */

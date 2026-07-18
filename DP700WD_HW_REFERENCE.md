@@ -1135,3 +1135,40 @@ menu and then the built-in butterfly slideshow (§9.2 / §10.10).
 --instr 250000000 --fb-addr 0x4005f000 --fb-wh 480x234 --fb-out out.ppm`
 (look for `[GPU-FIRST]` in `CT952_TRACE`; the OSD plane at `0x4005F000` holds the
 drawn UI).
+
+### 10.16 BREAKTHROUGH — "Loading" render fidelity (GPU font-op stride fix)
+
+The first render of the "Loading" screen had the correct box but **streak/line
+artifacts sheared across the full width** (rows 3–10). Root cause was in
+`gpu_exec`'s row-pitch reconstruction. The firmware draws the `"Loading ."`
+string to the same OSD-plane dest (`0x4005F668`) **twice**: first with a
+width-set op (`OP_SIZE.w=128`, `AG_OFF>>16=0x1d=29`) then with the normal
+full-width op (`OP_SIZE.w=0`, `AG_OFF>>16=0x3d=61`). The plane pitch must be the
+same 480 for both (a single physical plane), but the emulator was deriving the
+GPU `ag_width` from the **high byte of the AG_OFF register** (`(ag>>8)&0xFF`),
+which is `0` for both — so the width-set op collapsed to `(0+29-1)*8 = 224`
+instead of `480` and its 13 glyphs sheared diagonally across the plane.
+
+**Fix** (matches `gdi.c` `GDI_SetGpuAddr`): derive `ag_width` from the op width,
+not the register:
+
+```
+ag_offset = REG_GPU_AG_OFF >> 16
+ag_width  = (OP_SIZE.w + (dest & 3) + 3) >> 2
+row_pitch = (ag_width + ag_offset - 1) * 8      (bytes; the *8 is the
+            emulator's plane-pitch scale matching the 480-wide scan-out)
+```
+
+- width-set op:  `ag_width=(128+0+3)>>2=32`, `(32+29-1)*8 = 480` ✓
+- full-width op: `ag_width=(0+0+3)>>2=0`,   `(0+61-1)*8 = 480` ✓
+
+Both reconstruct to 480, so the two draws land on identical rows and the second
+simply over-writes the first — no shear. This unifies font, fill, and blit under
+one gdi-derived formula (the SMPTE `disp` test still renders clean bars, no
+regression). The `osd_stride` learn-the-pitch hack is removed.
+
+**Result (verified):** the OSD plane now holds a compact `"Loading . . ."` —
+white text (index 3) on a blue highlight box (index 2, `x 200..303 y 3..18`) on
+black (index 0), and **nothing outside that box** (histogram: only indices
+0/2/3). Matches the real device. Render with the faithful palette (0=black,
+2=blue `(28,104,164)`, 3=white) since the firmware hasn't loaded `GAM_OSD` yet.

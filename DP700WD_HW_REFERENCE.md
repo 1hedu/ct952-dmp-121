@@ -887,6 +887,51 @@ sub-inits: display/panel bring-up, decoder init, media/servo detect, a
 device-ack poll). That single wait is the gate to the whole menu → logo →
 slideshow chain.
 
+### 10.11 Boot-thread block located: the MODE_STOP poll in INITIAL_PowerONStatus
+
+The block is **one call past `INITIAL_System`** — inside **`INITIAL_PowerONStatus`**
+(`initial.c:632`, called from `cc.c:1315`, between `INITIAL_System` at 1312 and
+`POWERONMENU_Initial` at 1320). Call chain on the **main boot thread**:
+`cc main → INITIAL_PowerONStatus (flash 0x418f0) → decoder-cmd dispatcher 0x59e90
+→ 0x61170` (the poll; hot PC `0x61240`). Function addresses anchored via debug
+strings: `INITIAL_System=0x416f4` ("INIT Platform error code"),
+`INITIAL_PowerONStatus=0x418f0` ("Some thread not initial done"). Forward
+call-graph proof: `0x416f4` does NOT reach `0x61170`; `0x418f0` DOES.
+
+This **vindicates the `0x61240` finding that §10.9 had recanted** — it *is* the
+boot-thread gate, reached synchronously by the boot thread (not merely the vdec
+thread). `0x61170` is a precompiled decoder-library routine (`dec_dram.a`, no
+`.c`) that stops the video decoder and two-stage busy-polls for the MODE_STOP
+ack: stage-1 timeout `0xbb7`=2999 ticks waiting `0x375a0(x,0)==1`, stage-2
+`0x752f`=30015 ticks waiting `0x375a0(x,1)==1` — both satisfied only when the
+decoder **playmode == `0x10` (MODE_STOP)** (`comdec.h:29`). The firmware's own
+stand-in state cycler (PROC2 is in reset) transitions `0x10→0x11` too fast for
+the boot poll to latch `0x10`, so both stages ride out their (billions-of-instr)
+timeouts. (`0x841f0`, the other hot PC, is the background command-queue thread's
+idle wait — a confirmed red herring.)
+
+**It's a short chain, and it clears.** `CT952_FORCE_PLAYMODE=0x10` (hold
+`0xB0000190`=`0x10`) clears gate 1 and exposes gate 2: `0x70240` waits
+`*(uint16*)0x40039f24 == 1`. `CT952_VDEC_IDLE=1` presents that as 1. **With both
+forced, every decoder-poll PC (`0x375a0`/`0x61240`/`0x70240`/`0x6f0xx`)
+disappears from the hot set** — the boot thread is past the decoder-init
+handshake and now sits in ordinary sequential `OS_DelayTime` init pacing
+(`0x59850`, a plain busy-delay: `get t0; {delay; } while (now-t0 < N)`), with no
+stuck poll-condition alongside it. That signature (pure delay primitive hot, no
+condition body) suggests the remaining distance to `POWERONMENU_Initial` is
+**time/pacing, not another hard gate** — under test with a long run.
+
+**Root cause & the faithful fix direction.** The whole chain exists because
+**PROC2 is deliberately held in reset at the menu** (§10.9), so no DSP drives the
+decoder state machine, and the emulator's `proc2_ack_of` stand-in collapses
+`MODE_STOP(0x10)→STOPPED(0x11)` with zero dwell — erasing the `0x10` window the
+boot poll needs. The faithful model (vs the `FORCE_*`/`VDEC_IDLE` experiment
+hooks) is to make the halted-decoder stand-in **hold `MODE_STOP(0x10)` for a
+number of polls before advancing to `STOPPED(0x11)`**, giving the boot poll a
+real window to latch — matching how the real decoder holds the stop state until
+acknowledged. Experiment hooks added: `CT952_VDEC_IDLE` (gate-2 flag
+`0x40039f24==1`), composed with `CT952_FORCE_PLAYMODE`.
+
 ### 10.10 JPEG datapath implementation spec (ready to apply once §10.9 is cleared)
 
 Full evidence-backed recipe for when the firmware does kick the decode:

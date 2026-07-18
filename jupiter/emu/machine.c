@@ -534,6 +534,16 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         if (m->skip_panelcfg && addr == 0x4002f770u)
             return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
+        /* EXPERIMENT (CT952_VDEC_IDLE): present the boot thread's decoder-init
+         * handshake flags as "decoder idle/ready" so INITIAL_PowerONStatus's
+         * chain of MODE_STOP-style waits (0x61170 -> next gate 0x40039f24==1 ...)
+         * completes and the firmware proceeds to draw the menu. Measures how
+         * deep the chain is (each cleared gate exposes the next). */
+        {
+            static int vi = -1;
+            if (vi < 0) vi = getenv("CT952_VDEC_IDLE") ? 1 : 0;
+            if (vi && addr == 0x40039f24u) return 1;   /* gate 2: ==1 */
+        }
         return mem_read_raw(m->dram + (addr - 0x40000000u), size);
     }
     if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)

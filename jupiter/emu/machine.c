@@ -11,7 +11,7 @@
 static long g_irq13_asserted, g_irq13_taken;
 static long g_proc2_reset_writes;   /* writes to REG_PLAT_RESET_CONTROL_ENABLE (0x80000324) */
 static long g_irq_taken[16];        /* per-level interrupt-take counts */
-static int  g_pm_trace = -1, g_pm_n; /* decoder-playmode focused trace */
+static int  g_pm_trace = -1, g_pm_n, g_pm_wn; /* decoder-playmode focused trace */
 
 /* Cheap signature of the staged bitstream (a few sampled bytes) so we only
  * re-decode when the firmware has staged a *different* JPEG. */
@@ -613,6 +613,16 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         m->proc2_cmd = (uint8_t)val;
         m->proc2_ack_countdown = (proc2_ack_of((uint8_t)val) != (uint8_t)val)
                                  ? 8 : 0;
+    }
+
+    /* Trace who writes the vdec playmode + its software mirrors (the state the
+     * boot poll 0x375a0 reads). CT952_PMTRACE. */
+    if (g_pm_trace == 1 && (addr == 0xB0000190u || addr == 0x40039cd0u ||
+                            addr == 0x40039d34u || addr == 0x40039f24u) &&
+        g_pm_wn < 60) {
+        fprintf(stderr, "[PM wr] %08x=%02x pc=%08x icount=%llu\n", addr,
+                val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        g_pm_wn++;
     }
 
     if (addr < MACH_FLASH_MAX)

@@ -737,7 +737,30 @@ manages the vdec playmode *itself* (routine `0x6f800`, keyed on the VDEC
 reset-control bits `btst 0x300, *(0x80000304)`; converts a `0x86` command to
 `0x10`). The emulator's `proc2_ack_of` stand-in (which rewrites playmode on
 firmware writes, e.g. `0x10→0x11`) can therefore *fight* the firmware's own
-state management. Next step: make the emulator present the decoder as
-"idle/MODE_STOP" **consistently with PROC2 being in reset** — i.e. don't ack a
-command the real (halted) DSP would never ack, so the firmware's own
-`0x86→0x10` path and the poll converge — rather than forcing a single register.
+state management.
+
+**Refinement (`CT952_PMTRACE` write-side).** The decoder state machine is in
+fact **alive and cycling** on its own: the firmware writes playmode
+`0x10 (MODE_STOP) → 0x11 (STOPPED) → 0x80 → 0x00` in a steady loop (flash
+`0x6f3f8`/`0x70208`/`0x70980`/`0x70f2c`), updating the mirrors `0x40039cd0`/
+`0x40039d34`/`0x40039f24` in lock-step. So the hot `0x375a0`/`0x61240` poll is
+the **decoder-command thread doing normal work**, *not* a hung menu thread —
+attributing it to the menu blocker (via PC samples alone) was an over-read.
+`CT952_FORCE_PLAYMODE` perturbs that thread but does not itself draw the menu.
+
+**Where the menu draw really stalls (current best model).** `POWERONMENU_Initial`
+(`poweronmenu.c:380`, called once from `cc.c:1320` after `INITIAL_System`) runs
+`UTL_ShowLogo()` then `_POWERONMENU_DrawAllUI()`. The boot log confirms the COBY
+logo *is* staged, yet neither the video plane (`DISP_VIDEO_EN`,
+`REG_DISP_F0Y_ADDR`) nor the OSD plane (`DISP_OSD_EN`, bit28 of `0x80001A54`)
+is ever enabled (§10.5). So the display *calls* issue but never *complete*: the
+gap is the **DISP / `display.a` display-completion handshake** (a
+library-internal register/VSYNC sequence we don't model gate-for-gate), not a
+CPU control-flow deadlock. That — not the decoder poll — is the next real
+target for a natural on-panel image.
+
+**Note on symbols.** `DVD909.sym` (168 KB, `T`/`U`/`D` entries incl.
+`POWERONMENU_Initial @ 0x4b808`) is for the **DVD909 player build and does NOT
+map to `dp700wd.bin`** (that address is mid-function in the DP700WD image).
+Useful for names/source cross-ref only; addresses must come from `dp700wd.bin`
+directly.

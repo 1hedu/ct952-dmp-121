@@ -326,6 +326,8 @@ static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
         if (size == 1) return (v >> ((3 - (addr & 3)) * 8)) & 0xFF;
         return (v >> ((addr & 2) ? 0 : 16)) & 0xFFFF;
     }
+    if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u)
+        return mem_read_raw(m->bram + (addr - 0xB0000000u), size);
     if (addr >= 0x90000000u && addr < 0x90010000u)
         return 0;                        /* DSU stub */
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
@@ -364,6 +366,10 @@ static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
             val = (cur & ~(mask << sh)) | ((val & mask) << sh);
         }
         io_write(m, off, val);
+        return;
+    }
+    if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u) {
+        mem_write_raw(m->bram + (addr - 0xB0000000u), val, size);
         return;
     }
     if (addr >= 0x90000000u && addr < 0x90010000u)
@@ -443,11 +449,13 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
         return -1;
     m->flash = (uint8_t *)malloc(MACH_FLASH_MAX);
     m->dram = (uint8_t *)malloc(MACH_DRAM_SIZE);
-    if (!m->flash || !m->dram)
+    m->bram = (uint8_t *)malloc(0x10000u);
+    if (!m->flash || !m->dram || !m->bram)
         return -1;
     memset(m->flash, 0xFF, MACH_FLASH_MAX);
     memcpy(m->flash, flash, flash_size);
     memset(m->dram, 0, MACH_DRAM_SIZE);
+    memset(m->bram, 0, 0x10000u);
     m->flash_size = flash_size;
     m->uart_echo = 1;
 
@@ -490,9 +498,11 @@ void machine_free(machine_t *m)
 {
     free(m->flash);
     free(m->dram);
+    free(m->bram);
     free(m->rx_buf);
     m->flash = NULL;
     m->dram = NULL;
+    m->bram = NULL;
     m->rx_buf = NULL;
 }
 

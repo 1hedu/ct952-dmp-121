@@ -42,6 +42,7 @@ typedef struct machine {
     uint8_t *flash;
     uint32_t flash_size;
     uint8_t *dram;
+    uint8_t *bram;          /* 0xB0000000 scratch SRAM (firmware RW use) */
     uint32_t io[MACH_IO_SIZE / 4];
 
     /* timers */

@@ -202,3 +202,18 @@ jgpu_check: jgpu_check.c sparc.c machine.c sparc.h machine.h
 	$(CC) $(CFLAGS) -I. -o $@ jgpu_check.c sparc.c machine.c
 gpucheck: jgpu_check tests/jgpu_hw_test.bin
 	./jgpu_check tests/jgpu_hw_test.bin
+
+# ---- OSD palette path: jup_argb_to_yuv -> GAM_OSD -> DISP scanout ----
+tests/pal_test.o: tests/pal_test.c
+	$(XCC) $(XCFLAGS) -I. -c -o $@ $<
+tests/pal_test.elf: tests/start.o tests/pal_test.o tests/jrgb2yuv_s.o tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/pal_test.o tests/jrgb2yuv_s.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/pal_test.o tests/jrgb2yuv_s.o
+tests/pal_test.bin: tests/pal_test.elf
+	$(XOBJCOPY) -O binary $< $@
+pal_check: pal_check.c sparc.c machine.c sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ pal_check.c sparc.c machine.c
+palcheck: pal_check tests/pal_test.bin
+	./pal_check tests/pal_test.bin

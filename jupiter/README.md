@@ -102,7 +102,13 @@ above). What has NOT been exercised on hardware:
 
 - The OSD bring-up sequence in `jvid_open()` (region config, mix ratio,
   activation) follows the firmware's own idiom (`osdnd.c`/`osdmm.c`)
-  but has not run on a CT952.
+  but has not run on a CT952. **The palette-load path *is* now verified
+  on the emulated DISP** (`emu: make palcheck`): colours loaded via
+  `jvid_load_palette` -> `GAM_OSD` scan back out through the DISP model
+  within 1 LSB. That check also caught and fixed a real bug -- the load
+  passed already-converted YUV to `GDI_ChangePALEntry` without the
+  `GDI_VALUE_YUV` tag, so the firmware re-ran RGB->YUV on it, corrupting
+  every colour (worst channel error 240/255); the tag is now set.
 - `jlayer_ct952.c` follows char_subpict.c's SPU-bitmap recipe exactly
   but is hardware-unverified; the 2bpp in-byte pixel order
   (leftmost = high bits) is inferred from the GDI conventions and

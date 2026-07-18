@@ -81,8 +81,14 @@ void jvid_load_palette(uint8_t base, const uint32_t *argb, int count)
 {
     int i;
     for (i = 0; i < count; i++)
+        /* Tag the value with GDI_VALUE_YUV (top byte 0x5A) so
+         * GDI_ChangePALEntry stores our BT.601 YUV directly. Without the
+         * tag it treats the word as RGB and runs COMUTL_RGB2YUV again --
+         * a double conversion that corrupts every colour (gdi.c:886-901,
+         * the 0xFE000000==GDI_VALUE_YUV check). */
         GDI_ChangePALEntry((BYTE)(base + i),
-                           (DWORD)jup_argb_to_yuv(argb[i]), FALSE);
+                           GDI_VALUE_YUV | (DWORD)jup_argb_to_yuv(argb[i]),
+                           FALSE);
     GDI_WaitPaletteComplete();
 }
 

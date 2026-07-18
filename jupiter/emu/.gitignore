@@ -8,6 +8,7 @@ demo_run
 dram.bin
 jgpu_check
 pal_check
+spr_check
 probe_unzip
 romv_out.bin
 test_sparc

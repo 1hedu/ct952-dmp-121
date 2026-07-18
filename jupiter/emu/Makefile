@@ -217,3 +217,25 @@ pal_check: pal_check.c sparc.c machine.c sparc.h machine.h
 	$(CC) $(CFLAGS) -I. -o $@ pal_check.c sparc.c machine.c
 palcheck: pal_check tests/pal_test.bin
 	./pal_check tests/pal_test.bin
+
+# ---- jspr sprite API on the emulated GPU: clip/flip/opaque vs its model ----
+# -DJUP_HOST_BUILD: no register-touching default executor (jgpu_submit/
+# jgpu_sync live in the firmware-only jgpu_ct952.c). The test installs its
+# own exec, so the null default is correct and keeps .data empty.
+tests/jspr_s.o: ../jspr.c
+	$(XCC) $(XCFLAGS) -DJUP_HOST_BUILD -c -o $@ $<
+tests/jspr_hw_test.o: tests/jspr_hw_test.c
+	$(XCC) $(XCFLAGS) -I. -c -o $@ $<
+tests/jspr_hw_test.elf: tests/start.o tests/jspr_hw_test.o tests/jspr_s.o \
+                        tests/jgpu_s.o tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/jspr_hw_test.o tests/jspr_s.o tests/jgpu_s.o \
+	    -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/jspr_hw_test.o tests/jspr_s.o tests/jgpu_s.o
+tests/jspr_hw_test.bin: tests/jspr_hw_test.elf
+	$(XOBJCOPY) -O binary $< $@
+spr_check: spr_check.c sparc.c machine.c sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ spr_check.c sparc.c machine.c
+sprcheck: spr_check tests/jspr_hw_test.bin
+	./spr_check tests/jspr_hw_test.bin

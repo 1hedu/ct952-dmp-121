@@ -231,7 +231,7 @@ static void gpu_exec(machine_t *m, uint32_t ctl0)
         return;
     }
 
-    if (opmode == 6 && !(ctl0 & GPU_FONT_1BIT)) {   /* GPU_FILLRECTANGLE */
+    if ((opmode == 6 || opmode == 7) && !(ctl0 & GPU_FONT_1BIT)) {  /* GPU_FILLRECTANGLE / _HP */
         uint8_t color = (io_get(m, R_GPU_CTL1) >> 24) & 0xFF;
         uint8_t *fb;
         uint32_t r, c;
@@ -250,6 +250,34 @@ static void gpu_exec(machine_t *m, uint32_t ctl0)
         for (r = 0; r < h; r++)
             for (c = 0; c < w; c++)
                 fb[r * fstride + c] = color;
+    }
+    else if (opmode == 4 || opmode == 5) {   /* GPU_BMPCOPY / _HP: blit */
+        /* Color-keyed / horizontally-mirrored 8bpp copy. CTL1[23:16] =
+         * key; CTL0[8] col-key enable; CTL0[6] mirror (HP only). Both
+         * surface pitches reconstructed from AG_OFF (dst hi16 / src lo16)
+         * the GXA way -- identical to jgpu_model_exec's BMPCOPY. */
+        uint32_t src = io_get(m, R_GPU_SRC_ADDR);
+        uint32_t agf = io_get(m, R_GPU_AG_OFF);
+        uint32_t dgap = (agf >> 16) & 0xFFFF, sgap = agf & 0xFFFF;
+        uint32_t dagw = (w + (dest & 3) + 3) >> 2;
+        uint32_t sagw = (w + (src & 3) + 3) >> 2;
+        uint32_t dpitch = (dgap + dagw >= 1) ? (dgap + dagw - 1) * 4u : w;
+        uint32_t spitch = (sgap + sagw >= 1) ? (sgap + sagw - 1) * 4u : w;
+        uint8_t key = (io_get(m, R_GPU_CTL1) >> 16) & 0xFF;
+        int keyed  = (ctl0 & 0x100u) != 0;   /* GPU_COL_KEY_EN */
+        int mirror = (ctl0 & 0x040u) != 0;   /* GPU_MIRROR_EN  */
+        uint32_t r, c;
+        if (!w || !h) { m->gpu_fontn = 0; return; }
+        for (r = 0; r < h; r++) {
+            const uint8_t *sp = dram_rw(m, src + r * spitch, w);
+            uint8_t *dp = dram_rw(m, dest + r * dpitch, w);
+            if (!sp || !dp) continue;
+            for (c = 0; c < w; c++) {
+                uint8_t px = mirror ? sp[w - 1 - c] : sp[c];
+                if (keyed && px == key) continue;
+                dp[c] = px;
+            }
+        }
     }
     m->gpu_fontn = 0;   /* consume the font-index queue */
 }

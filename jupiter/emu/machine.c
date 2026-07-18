@@ -5,6 +5,7 @@
 #include "machine.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 /* LEON core block offsets (ctkav_platform.h:19-97) */
 #define R_TIMER1_CNT   0x040
@@ -283,18 +284,22 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
     case R_PARAM1:
         /* AM mailbox: PROC1 writes cmd with [31:30]=1 write / 2 read;
          * PROC2 acks by clearing [31:30] (hdecoder.c:1718-1727).
-         * Stand-in DSP: ack immediately; reads return 0 via PARAM2. */
-        if ((v >> 30) == 2)
-            io_set(m, R_PARAM2, 0);
-        io_set(m, R_PARAM1, v & 0x3FFFFFFFu);
+         * Stand-in DSP: ack immediately; reads return 0 via PARAM2.
+         * Skipped once the real PROC2 core is running (it acks for real). */
+        if (!m->proc2_enable) {
+            if ((v >> 30) == 2)
+                io_set(m, R_PARAM2, 0);
+            io_set(m, R_PARAM1, v & 0x3FFFFFFFu);
+            return;
+        }
+        io_set(m, R_PARAM1, v);
         return;
     case R_AUDIO_CMD:
         /* PROC1 writes 0x10003, then spins reading this word and shifting
          * right 16; it breaks when [31:16] == 0 (hdecoder.c:724-737).
-         * PROC2 signals "audio boot OK" by clearing the high half. Our
-         * stand-in DSP acks instantly: keep the low 16 (audio type),
-         * clear [31:16]. */
-        io_set(m, R_AUDIO_CMD, v & 0xFFFFu);
+         * PROC2 signals "audio boot OK" by clearing the high half. The
+         * stand-in acks instantly; the real PROC2 core does it itself. */
+        io_set(m, R_AUDIO_CMD, m->proc2_enable ? v : (v & 0xFFFFu));
         return;
     default:
         log_access(m, 0x80000000u + off, 1, v);
@@ -336,13 +341,21 @@ static uint8_t proc2_ack_of(uint8_t cmd)
     }
 }
 
-static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
+static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
 {
-    machine_t *m = M(b);
     *fault = 0;
 
-    /* PROC2 vdec stand-in: deliver the command ack after a read latency */
-    if (addr == 0xB0000190u &&
+    /* DSU2 block (0x98000000): PROC1 reads PROC2's live PC here to monitor
+     * it (REG_PLAT_DSU2_PC = 0x98080010). Back the PC/nPC; rest reads 0. */
+    if (addr >= 0x98000000u && addr < 0x98100000u) {
+        if (addr == 0x98080010u) return m->cpu2.pc;
+        if (addr == 0x98080014u) return m->cpu2.npc;
+        return 0;
+    }
+
+    /* PROC2 vdec stand-in: deliver the command ack after a read latency.
+     * Skipped once the real PROC2 core is running -- it drives PLAYMODE. */
+    if (!m->proc2_enable && addr == 0xB0000190u &&
         m->proc2_ack_countdown > 0 && --m->proc2_ack_countdown == 0)
         m->bram[0x190] = proc2_ack_of(m->proc2_cmd);
 
@@ -379,11 +392,47 @@ static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
     return 0;
 }
 
-static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
-                      int size, int *fault)
+/* boot PROC2: seed the second core at the entry/SP PROC1 staged in the AIU GR
+ * bank (GR22 = 0x800007d8 start, GR21 = 0x800007d4 SP) and let it run. */
+static void proc2_boot(machine_t *m)
 {
-    machine_t *m = M(b);
+    uint32_t entry = io_get(m, R_PROC2_START);
+    uint32_t sp    = io_get(m, R_PROC2_SP);
+    if (m->proc2_on || !m->proc2_enable || (entry & 0xF0000000u) != 0x40000000u)
+        return;
+    sparc_reset(&m->cpu2, &m->bus2);
+    m->cpu2.pc = entry;
+    m->cpu2.npc = entry + 4;
+    sparc_set_reg(&m->cpu2, 14, sp);   /* %o6 / %sp */
+    m->proc2_on = 1;
+}
+
+static void proc2_halt(machine_t *m)
+{
+    m->proc2_on = 0;
+}
+
+static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
+                   int size, int *fault)
+{
     *fault = 0;
+
+    /* PROC2 reset/debug control (writes from PROC1) */
+    if (m->proc2_enable) {
+        int was = m->proc2_on;
+        if (addr == 0x80000304u && (val & 0x1u)) { proc2_boot(m); }  /* RESET_DISABLE: release */
+        else if (addr == 0x80000324u && (val & 0x1u)) { proc2_halt(m); } /* RESET_ENABLE: hold */
+        else if (addr == 0x98000000u) {              /* DSU2 control */
+            if (val & 0x00080000u) proc2_boot(m);    /* PLAT_DSU_CTL_RE */
+            else if (val & 0x000000A0u) proc2_halt(m); /* BN|BW: break */
+        }
+        if (was != m->proc2_on && getenv("CT952_TRACE"))
+            fprintf(stderr, "[P2] %s via %08x=%08x entry=%08x pc1=%08x\n",
+                    m->proc2_on ? "BOOT" : "HALT", addr, val,
+                    io_get(m, R_PROC2_START), m->cpu.pc);
+    }
+    if (addr >= 0x98000000u && addr < 0x98100000u)
+        return;   /* DSU2 register file: writes accepted, not modeled */
 
     /* PROC1 issued a VDEC command via REG_SRAM_PLAYMODE: arm the PROC2 ack
      * (delivered after a few status polls, mimicking the microcode latency). */
@@ -428,6 +477,27 @@ static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
     }
     m->unmapped_writes++;
 }
+
+/* ---- bus dispatch: two views onto the same machine ---- */
+/* cpu1's bus is machine.bus (first field -> plain cast). cpu2's bus is
+ * machine.bus2 (container-of by offset). Both hit the same memory/I/O; only
+ * the interrupt wiring differs. */
+static machine_t *M2(sparc_bus_t *b)
+{ return (machine_t *)((char *)b - offsetof(machine_t, bus2)); }
+
+static uint32_t bus_read(sparc_bus_t *b, uint32_t a, int s, int *f)
+{ return bus_rd(M(b), a, s, f); }
+static void bus_write(sparc_bus_t *b, uint32_t a, uint32_t v, int s, int *f)
+{ bus_wr(M(b), a, v, s, f); }
+static uint32_t bus2_read(sparc_bus_t *b, uint32_t a, int s, int *f)
+{ return bus_rd(M2(b), a, s, f); }
+static void bus2_write(sparc_bus_t *b, uint32_t a, uint32_t v, int s, int *f)
+{ bus_wr(M2(b), a, v, s, f); }
+/* PROC2 has its own interrupt controller; we don't wire it yet -- the
+ * decoder microcode drives the datapath by polling, so run it with no
+ * asynchronous interrupts rather than misdelivering PROC1's. */
+static int  bus2_irq_level(sparc_bus_t *b) { (void)b; return 0; }
+static void bus2_irq_ack(sparc_bus_t *b, int lvl) { (void)b; (void)lvl; }
 
 static int bus_irq_level(sparc_bus_t *b)
 {
@@ -545,6 +615,16 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     m->bus.irq_level = bus_irq_level;
     m->bus.irq_ack = bus_irq_ack;
     sparc_reset(&m->cpu, &m->bus);
+
+    /* PROC2 second core (gated during bring-up) */
+    m->bus2.read = bus2_read;
+    m->bus2.write = bus2_write;
+    m->bus2.irq_level = bus2_irq_level;
+    m->bus2.irq_ack = bus2_irq_ack;
+    m->proc2_enable = getenv("CT952_PROC2") ? 1 : 0;
+    m->proc2_on = 0;
+    sparc_reset(&m->cpu2, &m->bus2);
+    m->cpu2.halted = 1;      /* idle until PROC1 releases it */
     return 0;
 }
 
@@ -565,6 +645,11 @@ void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len)
 
 void machine_free(machine_t *m)
 {
+    if (getenv("CT952_TRACE"))
+        fprintf(stderr, "[EXIT] pc1=%08x  PROC2 on=%d pc=%08x icount=%llu "
+                "halted=%d (%s)\n", m->cpu.pc, m->proc2_on, m->cpu2.pc,
+                (unsigned long long)m->cpu2.icount, m->cpu2.halted,
+                m->cpu2.halt_reason[0] ? m->cpu2.halt_reason : "-");
     free(m->flash);
     free(m->dram);
     free(m->bram);
@@ -605,6 +690,10 @@ uint64_t machine_run(machine_t *m, uint64_t n)
         done += ran;
         for (i = 0; i < ran; i++)
             machine_cycle(m);
+        /* Interleave PROC2 on the same wall-clock budget. It shares the bus
+         * (DRAM / vdec SRAM / JPU), so its decode work is visible to PROC1. */
+        if (m->proc2_on && !m->cpu2.halted)
+            sparc_run(&m->cpu2, ran ? ran : chunk);
         if (ran < chunk)
             break;
     }

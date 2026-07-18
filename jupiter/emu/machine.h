@@ -39,6 +39,16 @@ typedef struct machine {
     sparc_bus_t bus;        /* must be first (container-of via cast) */
     sparc_t cpu;
 
+    /* PROC2: the CT909's second SPARC V8 core (LEON2-class), running the
+     * audio / JPEG-decoder microcode PROC1 loads to 0x40002000. Shares the
+     * bus (DRAM, vdec SRAM 0xb0000000, JPU regs). Released from reset by
+     * PROC1 via REG_PLAT_RESET_CONTROL_DISABLE / the DSU2 control. Gated by
+     * CT952_PROC2 while under bring-up. */
+    sparc_t cpu2;
+    sparc_bus_t bus2;       /* cpu2's bus view (no PROC1 interrupts) */
+    int proc2_enable;       /* feature gate (env CT952_PROC2) */
+    int proc2_on;           /* released and running */
+
     uint8_t *flash;
     uint32_t flash_size;
     uint8_t *dram;

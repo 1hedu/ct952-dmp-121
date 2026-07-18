@@ -759,3 +759,33 @@ The path to the logo actually on screen is now well-defined:
 3. Advance `0x80000c10` / the BIU-ready bit to signal completion.
 4. Render the output via the DISP path the firmware uses for the logo (OSD blit
    vs. video plane -- the GPU was blitting to the OSD plane `0x4005F668`).
+
+---
+
+## Milestone: the firmware-staged logo is decoded into pixels
+
+The functional hardware-JPEG-decode model is in (`emujpeg.c` + vendored
+public-domain `picojpeg.c`, wired through `machine.c`/`main.c`). Running the
+**retail firmware**, the emulator now:
+
+1. lets the firmware boot and `memcpy` the COBY power-on logo (`LOG3`, 480x270
+   JFIF) from flash `0x10ff88` into DRAM `0x401dc000` -- its own decode staging
+   buffer;
+2. at the decoder-state poll (`0x80000c10`), decodes that staged DRAM buffer
+   in-host and writes the result out (`--jpeg-out`), then reports the decoder
+   done so PROC1 proceeds;
+3. → `dp700wd_logo.ppm`: the COBY logo, 480x270, straight out of the buffer the
+   firmware built. `make logo` reproduces it end to end.
+
+This is the firmware *driving* the decode (staging + kick + done handshake); the
+emulator supplies the decode the missing DMA/VLD/JPU silicon would have done.
+
+### Remaining: put it on the emulated panel (gate-exact)
+
+The firmware does **not** program the DISP video-plane frame buffers
+(`0x80001ac0/ac4`) for the logo -- it displays via a different path (the GPU was
+blitting to the OSD plane `0x4005F668`; `JPU_ADDR_W_ST` held `0x4009e600`). To
+show the decoded logo through the firmware's own scan-out we still need to (a)
+write the decode into the exact output buffer/format the firmware displays from
+(tiled YUV vs. the RGB we emit) and (b) model that scan-out plane. Until then
+the decode is captured to a PPM rather than composited onto the emulated glass.

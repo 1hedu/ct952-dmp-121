@@ -644,3 +644,47 @@ not reach `HALJPEG_Display`. Reaching a natural on-panel photo needs the JPU
 decode/scale handshake modeled far enough that `HALJPEG_Decode` returns success
 and the firmware programs the video plane; then the scan-out reads the tiled YUV
 at `REG_DISP_F0Y/F0C` (§10.2) and composites it under the OSD.
+
+### 10.6 Boot-state ground truth — the firmware BOOTS; it is not stuck
+
+Three earlier working theories about "why the menu never draws" were **empirically
+falsified** by instrumenting the emulator (whole-run PC histogram + a PROC2-reset
+counter + PC-ring dump). Recording them so the same dead ends aren't re-walked:
+
+* **NOT a PROC2-reset loop.** The config-apply path resets PROC2 (`0x80000324`,
+  `HAL_ReloadAudioDecoder`, `hdecoder.c:719`) **exactly once** per boot, not
+  ~70 000×. A direct counter on writes-to-`0x80000324` reads **1**. The "70K"
+  figure counted config-walk iterations/PIL writes, not resets.
+* **NOT a high-PIL interrupt-starvation spin.** At any sample point PROC1 runs
+  with `PIL=0, ET=1`. VSYNC (LEON line 13) *is* serviced — just slowly
+  (~25 takes / 300M instr). IRQ13 is "asserted" (pending+enabled) only ~5 000×
+  in 300M instr, i.e. it is rarely *pending*, not chronically *masked*.
+* **NOT halted / not a config-descriptor deadlock.** `--skip-panelcfg`
+  (forcing desc+0x14 `0x4002f770 = -1`, §BRINGUP) and `--build-panelcfg` change
+  the assert count but **not** the outcome — because the firmware was never
+  blocked there.
+
+**What is actually happening:** the retail image boots all the way into **eCos**
+and its scheduler runs normally. Evidence from the whole-run PC histogram
+(`CT952_PCHIST=1`, dumps hottest PC buckets at exit):
+
+| rank | PC (DRAM) | what it is |
+|------|-----------|------------|
+| hot  | `0x40001010` / `0x40001064` | SPARC **window overflow / underflow** trap handlers (`save`/`restore` + `wr %wim` + `rett`) — ~63% of all cycles |
+| hot  | `0x40001000` | generic **trap dispatcher**: `ld [0x40020878 + tt*4], %l6; jmp %l6` (software trap table base `0x40020878`) |
+| hot  | `0x4001d7f0` | eCos scheduler **find-lowest-set-bit** over the ready-priority bitmap (`sll 1,i,%g2; btst mask,%g2; loop bits 0..31`) — the run-queue scan |
+
+A hot lowest-set-bit run-queue scan + heavy window-trap traffic is the fingerprint
+of a **live, context-switching RTOS**, not a hang. The menu (OSD plane, enable =
+bit28 of `REG_DISP_OSD_SIZE 0x80001A54`) simply has not been drawn yet: the UI
+thread either needs far more emulated time or is blocked on a resource we don't
+model (media-detect poll §9.3, a timer, or the audio DSP). This *relocates* the
+remaining work from "unblock a stuck CPU" to "let the UI thread reach the draw" —
+a scheduling/time or missing-device-ack problem, not a control-flow deadlock.
+
+**New emulator diagnostics (all opt-in, zero cost when off):**
+* `CT952_PCHIST=1` — whole-run PC histogram, top-16 hot buckets at exit
+  (`sparc.c: pch_sample` / `sparc_pchist_dump`). The tool that found the above.
+* `CT952_TRACE=1` now also prints the last-64 **PC ring** + exit `%psr`
+  (PIL/ET), a **PROC2-reset-write counter** (`0x80000324`), and per-core
+  `icount`/`halted`/`halt_reason`.

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdio.h>
 static long g_irq13_asserted, g_irq13_taken;
+static long g_proc2_reset_writes;   /* writes to REG_PLAT_RESET_CONTROL_ENABLE (0x80000324) */
 
 /* Cheap signature of the staged bitstream (a few sampled bytes) so we only
  * re-decode when the firmware has staged a *different* JPEG. */
@@ -545,6 +546,11 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
 {
     *fault = 0;
 
+    /* Count PROC2-reset asserts regardless of the PROC2 feature gate: the
+     * config-callback-walk loop hammers 0x80000324 whether or not we model the
+     * second core, so this measures the loop directly (diagnostic). */
+    if (addr == 0x80000324u && (val & 0x1u)) g_proc2_reset_writes++;
+
     /* PROC2 reset/debug control (writes from PROC1) */
     if (m->proc2_enable) {
         int was = m->proc2_on;
@@ -787,10 +793,28 @@ void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len)
 
 void machine_free(machine_t *m)
 {
-    if (getenv("CT952_TRACE")) fprintf(stderr, "[IRQ13] asserted=%ld taken=%ld\n", g_irq13_asserted, g_irq13_taken);
+    if (getenv("CT952_TRACE")) fprintf(stderr, "[IRQ13] asserted=%ld taken=%ld  [PROC2-reset writes(0x324)]=%ld\n", g_irq13_asserted, g_irq13_taken, g_proc2_reset_writes);
+    if (getenv("CT952_TRACE")) {
+        /* Dump the last 64 PROC1 PCs: for a persistent high-PIL spin this ring
+         * IS the loop. psr shows PIL/ET at exit. */
+        int k; uint32_t lo = 0xFFFFFFFFu, hi = 0;
+        fprintf(stderr, "[PCRING] psr=%08x (PIL=%u ET=%u)\n", m->cpu.psr,
+                (m->cpu.psr & 0xF00u) >> 8, (m->cpu.psr >> 5) & 1u);
+        for (k = 0; k < 64; k++) {
+            uint32_t p = m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63];
+            if (p < lo) lo = p; if (p > hi) hi = p;
+            fprintf(stderr, " %08x", p);
+            if ((k & 7) == 7) fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "[PCRING] span=%08x..%08x\n", lo, hi);
+        sparc_pchist_dump(stderr, 16);
+    }
     if (getenv("CT952_TRACE"))
-        fprintf(stderr, "[EXIT] pc1=%08x  PROC2 on=%d pc=%08x icount=%llu "
-                "halted=%d (%s)\n", m->cpu.pc, m->proc2_on, m->cpu2.pc,
+        fprintf(stderr, "[EXIT] pc1=%08x icount1=%llu halted1=%d (%s)  "
+                "PROC2 on=%d pc=%08x icount=%llu halted=%d (%s)\n",
+                m->cpu.pc, (unsigned long long)m->cpu.icount, m->cpu.halted,
+                m->cpu.halt_reason[0] ? m->cpu.halt_reason : "-",
+                m->proc2_on, m->cpu2.pc,
                 (unsigned long long)m->cpu2.icount, m->cpu2.halted,
                 m->cpu2.halt_reason[0] ? m->cpu2.halt_reason : "-");
     free(m->flash);

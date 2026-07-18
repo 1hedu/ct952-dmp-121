@@ -13,6 +13,8 @@
 #ifndef CT952EMU_SPARC_H
 #define CT952EMU_SPARC_H
 
+#include <stdio.h>
+
 #include <stdint.h>
 
 #define SPARC_NWIN 8
@@ -86,6 +88,9 @@ void sparc_reset(sparc_t *c, sparc_bus_t *bus);
 /* Execute up to n instructions (stops early if halted). Returns the
  * number executed. */
 uint64_t sparc_run(sparc_t *c, uint64_t n);
+
+/* Dump the hottest `topn` PC buckets accumulated when CT952_PCHIST is set. */
+void sparc_pchist_dump(FILE *f, int topn);
 
 /* Register access helpers (r index 0..31 in the current window) */
 uint32_t sparc_get_reg(sparc_t *c, int idx);

@@ -10,6 +10,41 @@
 #include "sparc.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+/* Whole-run PC histogram (opt-in via CT952_PCHIST): bucket PROC1 PCs to
+ * 16-byte granularity into an open-addressing table; dump the hottest at
+ * exit. Finds the dominant region across the entire run, unlike the 64-entry
+ * ring which only shows where the cutoff landed. */
+#define PCH_N 65536u
+static uint32_t g_pch_key[PCH_N];
+static uint64_t g_pch_cnt[PCH_N];
+static int g_pch_on = -1;
+static void pch_sample(uint32_t pc)
+{
+    if (g_pch_on < 0) g_pch_on = getenv("CT952_PCHIST") ? 1 : 0;
+    if (!g_pch_on) return;
+    uint32_t k = pc >> 4;
+    uint32_t h = (k * 2654435761u) & (PCH_N - 1);
+    for (uint32_t i = 0; i < PCH_N; i++) {
+        uint32_t s = (h + i) & (PCH_N - 1);
+        if (g_pch_cnt[s] == 0) { g_pch_key[s] = k; g_pch_cnt[s] = 1; return; }
+        if (g_pch_key[s] == k) { g_pch_cnt[s]++; return; }
+    }
+}
+void sparc_pchist_dump(FILE *f, int topn)
+{
+    if (g_pch_on <= 0) return;
+    for (int t = 0; t < topn; t++) {
+        uint32_t best = 0; uint64_t bc = 0;
+        for (uint32_t i = 0; i < PCH_N; i++)
+            if (g_pch_cnt[i] > bc) { bc = g_pch_cnt[i]; best = i; }
+        if (!bc) break;
+        fprintf(f, "[PCHIST] %2d  pc~%08x  %llu\n", t,
+                g_pch_key[best] << 4, (unsigned long long)bc);
+        g_pch_cnt[best] = 0;   /* consume so next scan finds the next-hottest */
+    }
+}
 
 #define CWP(c)   ((int)((c)->psr & PSR_CWP))
 #define NWIN     SPARC_NWIN
@@ -167,6 +202,7 @@ static int step(sparc_t *c)
     }
     c->pc_ring[c->pc_ri++ & 63] = pc;
     c->icount++;
+    pch_sample(pc);
 
     {
         uint32_t op = inst >> 30;

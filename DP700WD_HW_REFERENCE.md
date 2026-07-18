@@ -825,3 +825,19 @@ Steps 1–2 unblock `HALJPEG_Decode → JPEG_STATUS_OK → HALJPEG_Display`; ste
 what makes the displayed pixels the actual photo rather than frame-buffer
 garbage. This is the through-line to the user's goal: the firmware's own
 slideshow drawing the built-in butterfly, on the panel, naturally.
+
+**Empirical result — faking the poll status alone is NOT enough.** The worker's
+poll loop lives at DRAM `0x4001fe90`
+(`ldub [base+0x2d3]; sll 2; ld [tbl+idx]; btst %o1,%mask; be loop` — a generic
+"wait status-bit with retry" helper). Forcing its status register
+(`0x80002a28`/`0x2a30`/`0x2a34`) to read `0xFFFFFFFF` (`CT952_JPEG_DMA=1`) makes
+each poll succeed instantly — but the worker then just churns the channel ~5.5 M×
+and **still never sets `DISP_VIDEO_EN`** (`0x80001a4c` stays 0, `F0Y 0x80001AC0`
+never written). Reason: the worker's *completion* is driven by real decode
+progress (bitstream EOI flowing BIU→VLD→JPU), not by the ready bit alone —
+satisfying the poll just spins it over a bitstream that isn't there. So the
+model must actually **move the bitstream / produce the decoded output** (plan
+step 2+3 together: advance the read pointer to EOI *and* write the tiled-YUV
+result), not merely answer the status poll. The poll helper, its register table
+(indexed by the channel byte at `base+0x2d3`), and the `0x4001fe90` address are
+the concrete hooks for that work.

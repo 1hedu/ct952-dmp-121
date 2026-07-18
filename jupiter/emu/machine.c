@@ -484,6 +484,29 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         return 0;
     }
 
+    /* Capture the PC that polls the BIU bit-stream read channel (0x80002a28
+     * / 0x80002a34), so we can disassemble the poll loop and learn the exact
+     * "drained/ready" value the JPEG worker wants. CT952_BIUTRACE. */
+    if (getenv("CT952_BIUTRACE") &&
+        (addr == 0x80002a28u || addr == 0x80002a34u || addr == 0x80002a30u)) {
+        static int bn; if (bn < 12) {
+            fprintf(stderr, "[BIU rd] %08x pc=%08x\n", addr, m->cpu.pc); bn++; }
+    }
+
+    /* EXPERIMENT (CT952_JPEG_DMA): the JPEG worker thread (DRAM 0x4001fe90)
+     * spins on `while ((*0x80002a28 & mask)==0) ...` waiting for the BIU
+     * bit-stream read-channel DMA to signal ready/drained -- a DMA we don't
+     * model, so it times out and JPEG_Status stays UNFINISH. Present the
+     * channel-status registers as "ready" so the worker can finish and reach
+     * HALJPEG_Display. */
+    {
+        static int jd = -1;
+        if (jd < 0) jd = getenv("CT952_JPEG_DMA") ? 1 : 0;
+        if (jd && (addr == 0x80002a28u || addr == 0x80002a30u ||
+                   addr == 0x80002a34u))
+            return 0xFFFFFFFFu;
+    }
+
     /* PROC2 vdec stand-in: deliver the command ack after a read latency.
      * Skipped once the real PROC2 core is running -- it drives PLAYMODE. */
     if (!m->proc2_on && addr == 0xB0000190u &&

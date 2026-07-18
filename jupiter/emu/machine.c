@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
+static long g_irq13_asserted, g_irq13_taken;
 
 /* Cheap signature of the staged bitstream (a few sampled bytes) so we only
  * re-decode when the firmware has staged a *different* JPEG. */
@@ -626,14 +627,17 @@ static int bus_irq_level(sparc_bus_t *b)
     uint32_t eff = pend & io_get(m, R_INT_MASK);
     int lvl;
     for (lvl = 15; lvl >= 1; lvl--)
-        if (eff & (1u << lvl))
+        if (eff & (1u << lvl)) {
+            if (lvl == 13) g_irq13_asserted++;
             return lvl;
+        }
     return 0;
 }
 
 static void bus_irq_ack(sparc_bus_t *b, int level)
 {
     machine_t *m = M(b);
+    if (level == 13) g_irq13_taken++;
     io_set(m, R_INT_PENDING, io_get(m, R_INT_PENDING) & ~(1u << level));
     io_set(m, R_INT_FORCE, io_get(m, R_INT_FORCE) & ~(1u << level));
 }
@@ -772,6 +776,7 @@ void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len)
 
 void machine_free(machine_t *m)
 {
+    if (getenv("CT952_TRACE")) fprintf(stderr, "[IRQ13] asserted=%ld taken=%ld\n", g_irq13_asserted, g_irq13_taken);
     if (getenv("CT952_TRACE"))
         fprintf(stderr, "[EXIT] pc1=%08x  PROC2 on=%d pc=%08x icount=%llu "
                 "halted=%d (%s)\n", m->cpu.pc, m->proc2_on, m->cpu2.pc,

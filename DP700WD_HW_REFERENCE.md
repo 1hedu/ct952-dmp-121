@@ -683,8 +683,61 @@ remaining work from "unblock a stuck CPU" to "let the UI thread reach the draw" 
 a scheduling/time or missing-device-ack problem, not a control-flow deadlock.
 
 **New emulator diagnostics (all opt-in, zero cost when off):**
-* `CT952_PCHIST=1` — whole-run PC histogram, top-16 hot buckets at exit
-  (`sparc.c: pch_sample` / `sparc_pchist_dump`). The tool that found the above.
+* `CT952_PCHIST=1` (+ `CT952_PCHIST_N=<n>`) — whole-run PC histogram, top-N hot
+  buckets at exit (`sparc.c: pch_sample` / `sparc_pchist_dump`). The tool that
+  found the above.
 * `CT952_TRACE=1` now also prints the last-64 **PC ring** + exit `%psr`
-  (PIL/ET), a **PROC2-reset-write counter** (`0x80000324`), and per-core
+  (PIL/ET), a **PROC2-reset-write counter** (`0x80000324`), **per-IRQ-level take
+  counts**, the **eCos tick** value (`*(*(0x400398f8)+8)`), and per-core
   `icount`/`halted`/`halt_reason`.
+* `CT952_P2TRACE=1` — logs PROC2-core reset/release events (`0x304`/`0x324`
+  bit0, DSU2 `0x98000000`) with pc + staged entry.
+* `CT952_PMTRACE=1` — logs the first 80 decoder-playmode reads
+  (`0xb0000190` + software mirrors `0x40039cd0`/`0x40039d34`) with pc/icount.
+* `CT952_FORCE_PLAYMODE=0x10` — **experiment hook**: presents the vdec playmode
+  as a fixed value (stands in for the decoder microcode reaching a state).
+  Proved the decoder-state poll below is a real gate.
+
+### 10.7 The real menu-draw gate — decoder-state polls with PROC2 held in reset
+
+Tracing the boot thread's actual hot PCs (`CT952_PCHIST`, filter to flash
+`<0x40000000`) pinned the block to a **two-stage decoder-state poll** in the
+boot/init path:
+
+* flash **`0x61240`** — stage 1 waits up to `0xbb7 = 2999` eCos ticks for
+  `0x375a0(x,0)==1`; stage 2 (`0x612e0`) waits up to `0x752f = 30015` ticks for
+  `0x375a0(x,1)==1`. At ~7.3 ticks / M-instr, the stage-2 *timeout* alone is
+  ~4 billion instructions — so booting in reasonable time **requires the poll
+  condition to actually be met**, not time out.
+* flash **`0x375a0`** returns `1` (what the poll wants) only when the decoder
+  **playmode state == `0x10` (MODE_STOP)**; state `0x11` (STOPPED) returns `0`.
+  It reads the state via **`0x6f054`**, which uses the hw playmode
+  `REG_SRAM_PLAYMODE 0xb0000190` when non-zero, else the software mirror
+  `*(0x40039cd0)`.
+* Observed: `0xb0000190` reads **`0x00`** throughout; the mirror is **`0x11`**.
+  So the poll never sees `0x10` and waits out the full (billions-of-instr)
+  timeout. **Forcing** the playmode to `0x10` (`CT952_FORCE_PLAYMODE=0x10`)
+  makes the poll's PCs vanish from the hot set — boot advances to the *next*
+  decoder gate (`0x70240`, which checks `*(0x40039f24)==1`). Confirms the poll
+  is a real gate, and the blocker is a **chain** of decoder-state handshakes.
+
+**Root cause — PROC2 is deliberately held in reset at the menu.** The only
+PROC2-core event in a whole boot is a single reset *assert*
+(`REG_PLAT_RESET_CONTROL_ENABLE 0x80000324 = PLAT_RESET_PROC2_ENABLE(0x1)`, at
+flash `0x3f9c4`, ~icount 5M). It is **never released** — no `0x80000304` bit0,
+no DSU2 (`0x98000000`) write. The release lives in **`HAL_ReloadAudioDecoder`**
+(`hdecoder.c:616`, `MACRO_PLAT_RELEASE_PROC2` line 700 / `0x80000304 =
+PLAT_RESET_PROC2_DISABLE` line 719), and its **only** caller is
+`hdecoder.c:2127`, guarded by `bResetProc2` inside the **CHEERDVD
+media-playback thread** — *not* the boot path. So the decoder DSP starts only
+when you play media; the power-on menu is meant to draw with PROC2 in reset.
+
+**Implication for the model.** With PROC2 legitimately halted, the firmware
+manages the vdec playmode *itself* (routine `0x6f800`, keyed on the VDEC
+reset-control bits `btst 0x300, *(0x80000304)`; converts a `0x86` command to
+`0x10`). The emulator's `proc2_ack_of` stand-in (which rewrites playmode on
+firmware writes, e.g. `0x10→0x11`) can therefore *fight* the firmware's own
+state management. Next step: make the emulator present the decoder as
+"idle/MODE_STOP" **consistently with PROC2 being in reset** — i.e. don't ack a
+command the real (halted) DSP would never ack, so the firmware's own
+`0x86→0x10` path and the poll converge — rather than forcing a single register.

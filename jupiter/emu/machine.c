@@ -10,6 +10,8 @@
 #include <stdio.h>
 static long g_irq13_asserted, g_irq13_taken;
 static long g_proc2_reset_writes;   /* writes to REG_PLAT_RESET_CONTROL_ENABLE (0x80000324) */
+static long g_irq_taken[16];        /* per-level interrupt-take counts */
+static int  g_pm_trace = -1, g_pm_n; /* decoder-playmode focused trace */
 
 /* Cheap signature of the staged bitstream (a few sampled bytes) so we only
  * re-decode when the firmware has staged a *different* JPEG. */
@@ -488,6 +490,19 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         m->proc2_ack_countdown > 0 && --m->proc2_ack_countdown == 0)
         m->bram[0x190] = proc2_ack_of(m->proc2_cmd);
 
+    /* Focused decoder-playmode trace (CT952_PMTRACE): the boot thread polls
+     * the vdec state (flash 0x6f054/0x375a0) waiting for MODE_STOP(0x10);
+     * log the first reads of the hw playmode + its software mirrors. */
+    if (g_pm_trace < 0) g_pm_trace = getenv("CT952_PMTRACE") ? 1 : 0;
+    if (g_pm_trace && (addr == 0xB0000190u || addr == 0x40039cd0u ||
+                       addr == 0x40039d34u) && g_pm_n < 80) {
+        uint32_t v = (addr == 0xB0000190u) ? m->bram[0x190]
+                     : mem_read_raw(m->dram + (addr - 0x40000000u), 1);
+        fprintf(stderr, "[PM rd] %08x=%02x pc=%08x icount=%llu\n", addr,
+                v & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        g_pm_n++;
+    }
+
     if (addr < MACH_FLASH_MAX) {
         if (addr + (uint32_t)size <= m->flash_size)
             return mem_read_raw(m->flash + addr, size);
@@ -508,8 +523,19 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         if (size == 1) return (v >> ((3 - (addr & 3)) * 8)) & 0xFF;
         return (v >> ((addr & 2) ? 0 : 16)) & 0xFFFF;
     }
-    if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u)
+    if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u) {
+        /* EXPERIMENT (CT952_FORCE_PLAYMODE): present the vdec playmode
+         * (0xb0000190) as a fixed value, standing in for the PROC2 decoder
+         * microcode reaching MODE_STOP(0x10). Tests whether the boot thread's
+         * decoder-state poll (flash 0x375a0/0x6f054) is the menu-draw gate. */
+        if (addr == 0xB0000190u) {
+            static int fp = -1;
+            if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
+                          fp = e ? (int)strtoul(e, NULL, 0) : -2; }
+            if (fp >= 0) { m->bram[0x190] = (uint8_t)fp; }
+        }
         return mem_read_raw(m->bram + (addr - 0xB0000000u), size);
+    }
     if (addr >= 0x90000000u && addr < 0x90010000u)
         return 0;                        /* DSU stub */
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
@@ -550,6 +576,19 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
      * config-callback-walk loop hammers 0x80000324 whether or not we model the
      * second core, so this measures the loop directly (diagnostic). */
     if (addr == 0x80000324u && (val & 0x1u)) g_proc2_reset_writes++;
+
+    /* Log every PROC2 reset-control / release write + the staged entry, to see
+     * whether the firmware ever tries to RELEASE PROC2 (0x80000304 bit0) and
+     * with what entry (GR22 @0x800007d8). Gated on CT952_P2TRACE. */
+    if (getenv("CT952_P2TRACE")) {
+        /* Log only PROC2-CORE reset/release (0x304/0x324 bit0) + DSU2 ctrl --
+         * the events that actually start/stop the second core. */
+        int hit = ((addr == 0x80000304u || addr == 0x80000324u) && (val & 1u))
+                  || addr == 0x98000000u;
+        if (hit) fprintf(stderr, "[P2core] %08x=%08x pc=%08x start=%08x icount=%llu\n",
+                         addr, val, m->cpu.pc, io_get(m, R_PROC2_START),
+                         (unsigned long long)m->cpu.icount);
+    }
 
     /* PROC2 reset/debug control (writes from PROC1) */
     if (m->proc2_enable) {
@@ -655,6 +694,7 @@ static void bus_irq_ack(sparc_bus_t *b, int level)
 {
     machine_t *m = M(b);
     if (level == 13) g_irq13_taken++;
+    if (level >= 0 && level < 16) g_irq_taken[level]++;
     io_set(m, R_INT_PENDING, io_get(m, R_INT_PENDING) & ~(1u << level));
     io_set(m, R_INT_FORCE, io_get(m, R_INT_FORCE) & ~(1u << level));
 }
@@ -793,7 +833,20 @@ void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len)
 
 void machine_free(machine_t *m)
 {
-    if (getenv("CT952_TRACE")) fprintf(stderr, "[IRQ13] asserted=%ld taken=%ld  [PROC2-reset writes(0x324)]=%ld\n", g_irq13_asserted, g_irq13_taken, g_proc2_reset_writes);
+    if (getenv("CT952_TRACE")) {
+        int L; fprintf(stderr, "[IRQ13] asserted=%ld taken=%ld  [PROC2-reset writes(0x324)]=%ld\n[IRQ take/level]", g_irq13_asserted, g_irq13_taken, g_proc2_reset_writes);
+        for (L = 1; L < 16; L++) if (g_irq_taken[L]) fprintf(stderr, " L%d=%ld", L, g_irq_taken[L]);
+        fprintf(stderr, "\n");
+        /* eCos software tick: OS_GetSysTimer reads *(*(0x400398f8)+8) (64-bit).
+         * If this froze while instructions kept running, the RTOS time base
+         * (and every OS_DelayTime / poll timeout) is dead. */
+        uint32_t clkobj = machine_dram_rd(m, 0x400398f8u, 4);
+        if ((clkobj & 0xF0000000u) == 0x40000000u) {
+            uint32_t tick = machine_dram_rd(m, clkobj + 8u + 4u, 4); /* low word of 64b */
+            fprintf(stderr, "[eCos tick] clkobj=%08x  counter@%08x=%u\n",
+                    clkobj, clkobj + 8u, tick);
+        }
+    }
     if (getenv("CT952_TRACE")) {
         /* Dump the last 64 PROC1 PCs: for a persistent high-PIL spin this ring
          * IS the loop. psr shows PIL/ET at exit. */
@@ -807,7 +860,8 @@ void machine_free(machine_t *m)
             if ((k & 7) == 7) fprintf(stderr, "\n");
         }
         fprintf(stderr, "[PCRING] span=%08x..%08x\n", lo, hi);
-        sparc_pchist_dump(stderr, 16);
+        { const char *e = getenv("CT952_PCHIST_N");
+          sparc_pchist_dump(stderr, e ? atoi(e) : 16); }
     }
     if (getenv("CT952_TRACE"))
         fprintf(stderr, "[EXIT] pc1=%08x icount1=%llu halted1=%d (%s)  "

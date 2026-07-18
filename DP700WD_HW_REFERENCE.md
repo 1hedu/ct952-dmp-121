@@ -1006,12 +1006,44 @@ clears the decoder-command polls *naturally*, reaching the same post-poll state
 the forces produced. Playmode now visibly cycles `00→10→11→12`. **But the menu
 still doesn't draw** (`GPU ops = 0`): it lands in the same delay region, i.e.
 gate-3's requirement that the **software mirror `0x40039cd0`** also read `0x11`
-is still unmet — the dwell drives the *live* reg `0xB0000190`, but the firmware's
-own decoder-command cycle that writes the mirror hasn't completed. So the dwell
-is a **necessary, faithful piece but not the whole handshake**. Next link: trace
-why the firmware's mirror-update (the path that copies STOPPED into `0x40039cd0`)
-doesn't run — likely it waits on yet another live-reg/`AM`-mailbox ack the
-stand-in still collapses. `disp` regression passes with the dwell.
+is still unmet.
+
+**CORRECTION (verified) — the dwell fully solves the decoder chain.** A widened
+`PMTRACE` proved the "mirror stays 0x00" above was an artifact of the *forced*
+runs (`FORCE_PLAYMODE` pins live=0x10 so the mirror never gets 0x11). With the
+**faithful dwell and no forces**, the sequence completes: live `0xB0000190`
+0x10→(dwell ~301827 cyc)→`0x11` (boot poll latches STOPPED at pc `0x3c810`), then
+the firmware's own mirror-writer (`0x6ffb4`→`0x70070`, gated on
+`*(u16*)0x40039f24 != 1`, which is 0 at the menu) writes **`0x40039cd0 = 0x11`**.
+Getter `0x6f054` returns `0x11`; gates `0x33dac` (`==0x11`) and `0x36ff0`
+(`0x375a0(id,3)==1`) **both pass**. The whole decoder-STOP handshake (gates 1/2/3)
+is cleared by the dwell alone. `disp`/`logo`/`check` regressions pass.
+
+### 10.14 Block moved to the boot logo display — §10.10 is now the LIVE target
+
+With the decoder chain cleared, the boot thread advances into
+`INITIAL_PowerONStatus`'s post-STOP sequence and now stalls in
+**`_INITIAL_ShowFirstLOGO()`** (the boot splash logo), *before* `OSD_Initial()` /
+`POWERONMENU_Initial()`. Direct evidence: with the dwell, reads of the JPEG
+decode-progress gate **`0x80000C10` jump from 8 to 15 436** — the boot is now
+spinning in the logo's decode-wait. This is exactly the §10.10 path, and it means
+that spec is **no longer "dead code / trigger never fires" (§10.9)** — the dwell
+made the JPEG-decode kick reachable. (`§10.9`'s "kick never fires" was measured at
+the *old* pre-dwell stall point, upstream of `_INITIAL_ShowFirstLOGO`.)
+
+Satisfying the `0x80000C10` gate (`--decode-jpeg`, which also runs the functional
+picojpeg decode — logo decodes 480×270) lets the decode "report done" but the
+menu still does **not** draw (`GPU ops=0`): the logo path also needs the
+`display.a` completion — the JPU/BCR08 kick + `DISP_VIDEO_EN` program — modeled
+per §10.10 (still `BCR08`/`JPU_GO`/`F0Y` = never written; the firmware's
+`HALJPEG_Display` isn't reached yet because its own decode-status thread-var
+needs the full BIU/VLD/JPU handshake, not just the `0xC10` gate). **Next
+implementation:** auto-arm the `0xC10` gate during boot (not just under
+`--decode-jpeg`) and drive the §10.10 datapath (functional decode → tiled YUV to
+`0x40065000`/`0x400B3C00` → present BIU/VLD/JPU polls done) so
+`_INITIAL_ShowFirstLOGO`'s `HALJPEG_Decode` completes, the firmware runs
+`HALJPEG_Display`, sets `DISP_VIDEO_EN`, and boot proceeds to draw the menu —
+after which the logo/photo is on the panel through the firmware's own pipeline.
 
 ### 10.10 JPEG datapath implementation spec (ready to apply once §10.9 is cleared)
 

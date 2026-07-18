@@ -990,6 +990,29 @@ mirror) should clear gates 1, 3, and likely 2 together, letting the boot thread
 reach `POWERONMENU_Initial` and draw the menu on its own. That is the single
 remaining piece before the §10.10 JPEG-display path opens.
 
+### 10.13 Decoder-stop dwell implemented — clears the poll gates, mirror still lags
+
+Implemented the faithful dwell (`machine.h` `proc2_ack_cycle`/`proc2_ack_dwell`,
+`machine.c` bus_wr/bus_rd + `machine_init`; default 300 000 cycles, tunable via
+`CT952_VDEC_DWELL`): a playmode write whose ack differs from the commanded value
+now **holds the commanded state for a dwell in cycles** (real decoder holds
+"stopping" until acknowledged) before delivering the ack — replacing the old
+8-*read* countdown that the busy decoder-command thread consumed before the boot
+poll could latch `0x10`.
+
+**Result:** with the dwell (and **no** `FORCE_*`/`VDEC_IDLE`), the decoder-poll
+PCs (`0x375a0`/`0x61240`/`0x70240`) **vanish from the hot set** — the boot thread
+clears the decoder-command polls *naturally*, reaching the same post-poll state
+the forces produced. Playmode now visibly cycles `00→10→11→12`. **But the menu
+still doesn't draw** (`GPU ops = 0`): it lands in the same delay region, i.e.
+gate-3's requirement that the **software mirror `0x40039cd0`** also read `0x11`
+is still unmet — the dwell drives the *live* reg `0xB0000190`, but the firmware's
+own decoder-command cycle that writes the mirror hasn't completed. So the dwell
+is a **necessary, faithful piece but not the whole handshake**. Next link: trace
+why the firmware's mirror-update (the path that copies STOPPED into `0x40039cd0`)
+doesn't run — likely it waits on yet another live-reg/`AM`-mailbox ack the
+stand-in still collapses. `disp` regression passes with the dwell.
+
 ### 10.10 JPEG datapath implementation spec (ready to apply once §10.9 is cleared)
 
 Full evidence-backed recipe for when the firmware does kick the decode:

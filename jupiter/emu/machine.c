@@ -507,11 +507,17 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             return 0xFFFFFFFFu;
     }
 
-    /* PROC2 vdec stand-in: deliver the command ack after a read latency.
-     * Skipped once the real PROC2 core is running -- it drives PLAYMODE. */
-    if (!m->proc2_on && addr == 0xB0000190u &&
-        m->proc2_ack_countdown > 0 && --m->proc2_ack_countdown == 0)
+    /* PROC2 vdec stand-in: deliver the command ack after a dwell.
+     * Skipped once the real PROC2 core is running -- it drives PLAYMODE.
+     * The commanded (intermediate) state stays visible in bram[0x190] until
+     * m->cycles reaches proc2_ack_cycle, then we overwrite it with the ack --
+     * so a boot poll waiting for the intermediate state (e.g. MODE_STOP 0x10)
+     * has a real window before it advances to the ack (STOPPED 0x11). */
+    if (!m->proc2_on && addr == 0xB0000190u && m->proc2_ack_cycle &&
+        m->cycles >= m->proc2_ack_cycle) {
         m->bram[0x190] = proc2_ack_of(m->proc2_cmd);
+        m->proc2_ack_cycle = 0;
+    }
 
     /* Focused decoder-playmode trace (CT952_PMTRACE): the boot thread polls
      * the vdec state (flash 0x6f054/0x375a0) waiting for MODE_STOP(0x10);
@@ -644,8 +650,11 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
      * (delivered after a few status polls, mimicking the microcode latency). */
     if (addr == 0xB0000190u) {
         m->proc2_cmd = (uint8_t)val;
-        m->proc2_ack_countdown = (proc2_ack_of((uint8_t)val) != (uint8_t)val)
-                                 ? 8 : 0;
+        /* Arm the dwell only when the ack differs from the commanded value
+         * (e.g. STOP 0x10 -> STOPPED 0x11). Hold the commanded state for
+         * proc2_ack_dwell cycles so the boot poll can latch it first. */
+        m->proc2_ack_cycle = (proc2_ack_of((uint8_t)val) != (uint8_t)val)
+                             ? m->cycles + m->proc2_ack_dwell : 0;
     }
 
     /* Trace who writes the vdec playmode + its software mirrors (the state the
@@ -843,6 +852,14 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     m->bus2.irq_ack = bus2_irq_ack;
     m->proc2_enable = getenv("CT952_PROC2") ? 1 : 0;
     m->proc2_on = 0;
+    /* Decoder-stop dwell (cycles). Default sized to span a boot-thread poll
+     * interval (~2 eCos ticks) so the MODE_STOP(0x10) window is visible before
+     * the ack to STOPPED(0x11); tunable for bring-up. */
+    {
+        const char *e = getenv("CT952_VDEC_DWELL");
+        m->proc2_ack_dwell = e ? (uint32_t)strtoul(e, NULL, 0) : 300000u;
+    }
+    m->proc2_ack_cycle = 0;
 
     /* functional JPEG decode (opt-in via main.c CLI); default source is the
      * power-on logo staging buffer */

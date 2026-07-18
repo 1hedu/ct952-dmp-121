@@ -84,6 +84,17 @@ typedef struct machine {
     uint8_t proc2_cmd;
     int proc2_ack_countdown;
 
+    /* Halted-decoder STOP->STOPPED dwell: when PROC2 is held in reset (the
+     * power-on menu case) the firmware's boot thread runs the decoder-stop
+     * handshake and polls first for MODE_STOP(0x10) then MODE_STOPPED(0x11)
+     * (INITIAL_PowerONStatus, DP700WD_HW_REFERENCE.md 10.12). A zero-dwell ack
+     * collapses 0x10->0x11 before the boot poll can latch 0x10. We instead hold
+     * the commanded intermediate state for a fixed number of cycles (a real
+     * decoder holds "stopping" until acknowledged), then deliver the ack, so
+     * both the 0x10 and the 0x11 poll windows exist. */
+    uint64_t proc2_ack_cycle;   /* m->cycles at which to deliver the ack (0=idle) */
+    uint32_t proc2_ack_dwell;   /* dwell length in cycles (env CT952_VDEC_DWELL) */
+
     /* uart capture */
     FILE *uart_file;         /* optional capture file (may be NULL) */
     int uart_echo;           /* echo UART bytes to stdout */

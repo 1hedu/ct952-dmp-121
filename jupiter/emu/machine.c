@@ -879,6 +879,16 @@ void machine_free(machine_t *m)
             fprintf(stderr, "[eCos tick] clkobj=%08x  counter@%08x=%u\n",
                     clkobj, clkobj + 8u, tick);
         }
+        /* GPU 2-D op accounting: the power-on menu is drawn via GPU font/blit
+         * ops into the OSD plane. Many font ops => _POWERONMENU_ShowIcon ran =>
+         * POWERONMENU_Initial was reached. Near-zero => the stall is upstream
+         * of the menu (still in INITIAL_System / the logo splash). */
+        fprintf(stderr, "[GPU] ops=%llu font=%llu fill/blit-by-mode=",
+                (unsigned long long)m->gpu_ops,
+                (unsigned long long)m->gpu_font_ops);
+        { int gi; for (gi = 0; gi < 8; gi++)
+            fprintf(stderr, "%llu ", (unsigned long long)m->gpu_mode_ops[gi]); }
+        fprintf(stderr, "\n");
     }
     if (getenv("CT952_TRACE")) {
         /* Dump the last 64 PROC1 PCs: for a persistent high-PIL spin this ring

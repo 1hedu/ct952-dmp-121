@@ -871,6 +871,22 @@ never fires). Priority order is (1) find/clear the upstream logo-display stall s
 the firmware *itself* kicks the decode, then (2) apply the JPEG datapath model
 below so the kicked decode produces real pixels.
 
+**Decisive locator — the menu is never drawn; the stall is in `INITIAL_System`.**
+GPU 2-D op accounting over a whole boot (`CT952_TRACE` `[GPU]` line): **`ops=0,
+font=0`, every mode 0**. The power-on menu is drawn exclusively via GPU font/blit
+ops (`_POWERONMENU_ShowIcon` → `gdi.c` GPU ops into the OSD plane); zero ops means
+`_POWERONMENU_DrawAllUI` **never ran**, so `POWERONMENU_Initial` (`cc.c:1320`) is
+never reached. Boot therefore stalls **upstream, inside `INITIAL_System`**
+(`cc.c:1312`, `initial.c:408`) — before the menu, before any logo decode. This
+also means the ~1664 stray OSD pixels seen earlier are *not* menu content (no GPU
+op produced them). **The true blocker is a wait inside `INITIAL_System`'s
+hardware bring-up on the main boot thread** — a different thread from the vdec /
+decoder-command thread whose state-cycling (§10.7/§10.9) was a red herring. Next:
+locate the main boot thread's blocked wait inside `INITIAL_System` (candidate
+sub-inits: display/panel bring-up, decoder init, media/servo detect, a
+device-ack poll). That single wait is the gate to the whole menu → logo →
+slideshow chain.
+
 ### 10.10 JPEG datapath implementation spec (ready to apply once §10.9 is cleared)
 
 Full evidence-backed recipe for when the firmware does kick the decode:

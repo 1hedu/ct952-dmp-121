@@ -3,9 +3,42 @@
  * Register offsets from ctkav_platform.h (cited per block).
  */
 #include "machine.h"
+#include "emujpeg.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdio.h>
+
+/* Functional hardware-JPEG decode: pull the JPEG the firmware staged in DRAM
+ * (jpeg_src), decode it in-host, and write it out as a PPM. Models the CT952
+ * DMA/VLD/JPU decoder block, whose progress the firmware polls at 0x80000c10.
+ * Runs once; sets jpeg_done so the poll reports the decode complete. */
+static void machine_do_jpeg_decode(machine_t *m)
+{
+    uint8_t *src, *rgb = NULL;
+    uint32_t avail;
+    int w = 0, h = 0;
+    FILE *f;
+
+    m->jpeg_done = 1;                 /* one-shot regardless of outcome */
+    if (m->jpeg_src < 0x40000000u ||
+        m->jpeg_src >= 0x40000000u + MACH_DRAM_SIZE)
+        return;
+    src = m->dram + (m->jpeg_src - 0x40000000u);
+    avail = (0x40000000u + MACH_DRAM_SIZE) - m->jpeg_src;
+    if (src[0] != 0xFF || src[1] != 0xD8)   /* need a JPEG SOI */
+        return;
+    if (emu_jpeg_decode(src, avail, &rgb, &w, &h) != 0)
+        return;
+    if (m->jpeg_out && (f = fopen(m->jpeg_out, "wb"))) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        fwrite(rgb, 1, (size_t)w * h * 3, f);
+        fclose(f);
+        fprintf(stderr, "[ct952emu] JPEG decode: %dx%d from 0x%08x -> %s\n",
+                w, h, m->jpeg_src, m->jpeg_out);
+    }
+    free(rgb);
+}
 
 /* LEON core block offsets (ctkav_platform.h:19-97) */
 #define R_TIMER1_CNT   0x040
@@ -145,10 +178,13 @@ static uint32_t io_read(machine_t *m, uint32_t off)
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
     case 0xc10:
-        /* EXPERIMENT(CT952_DECRDY): decoder-state word. PROC1 wait loops poll
-         * bits[20:16] for >=7 ("decode advanced"). Report ready so we can see
-         * where the firmware goes next. */
-        if (getenv("CT952_DECRDY"))
+        /* Decoder progress/state word. The firmware's wait loop (flash
+         * 0x72810) polls bits[20:16] for >=7. This is driven by the hardware
+         * JPEG decoder consuming the staged bitstream; with the functional
+         * decode armed, run it here (once) and then report >=7 (done). */
+        if (m->jpeg_decode_en && !m->jpeg_done)
+            machine_do_jpeg_decode(m);
+        if (m->jpeg_done)
             return (io_get(m, 0xc10) & ~0x001f0000u) | 0x00070000u;
         log_access(m, 0x80000c10u, 0, 0);
         return io_get(m, 0xc10);
@@ -631,6 +667,13 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     m->bus2.irq_ack = bus2_irq_ack;
     m->proc2_enable = getenv("CT952_PROC2") ? 1 : 0;
     m->proc2_on = 0;
+
+    /* functional JPEG decode (opt-in via main.c CLI); default source is the
+     * power-on logo staging buffer */
+    m->jpeg_decode_en = 0;
+    m->jpeg_done = 0;
+    m->jpeg_src = 0x401dc000u;
+    m->jpeg_out = NULL;
     sparc_reset(&m->cpu2, &m->bus2);
     m->cpu2.halted = 1;      /* idle until PROC1 releases it */
     return 0;

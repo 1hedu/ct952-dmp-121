@@ -62,6 +62,15 @@ typedef struct machine {
     /* display VSYNC generation (secondary PROC1-1st IRQ, LEON line 13) */
     uint32_t vsync_cnt, vsync_div;
 
+    /* Functional hardware-JPEG-decode model: the CT952 decodes the staged
+     * JPEG (e.g. the power-on COBY logo at DRAM 0x401dc000) in a DMA/VLD block
+     * we don't model gate-for-gate. When armed, the emulator decodes the JPEG
+     * at jpeg_src in-host at the decode-wait, writes the result to jpeg_out,
+     * and reports the decoder done. */
+    int jpeg_decode_en, jpeg_done;
+    uint32_t jpeg_src;
+    const char *jpeg_out;
+
     /* PROC2 vdec stand-in: PROC1 writes a VDEC command to REG_SRAM_PLAYMODE
      * (0xb0000190); the real decoder microcode acks by overwriting it with a
      * completion state (comdec.h EN_VDEC_CMD). We deliver that ack after a

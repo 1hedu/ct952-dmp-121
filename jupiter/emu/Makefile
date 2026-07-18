@@ -14,23 +14,26 @@ CFLAGS   ?= -O2 -Wall
 
 all: ct952emu test_sparc tests/testprog.bin
 
-ct952emu: main.c sparc.c machine.c sparc.h machine.h
-	$(CC) $(CFLAGS) -o $@ main.c sparc.c machine.c
+ct952emu: main.c sparc.c machine.c emujpeg.c picojpeg.c sparc.h machine.h \
+          emujpeg.h picojpeg.h
+	$(CC) $(CFLAGS) -o $@ main.c sparc.c machine.c emujpeg.c picojpeg.c
 
-test_sparc: test_sparc.c sparc.c machine.c tests/testprog.c \
-            sparc.h machine.h tests/testapi.h
-	$(CC) $(CFLAGS) -I. -o $@ test_sparc.c sparc.c machine.c \
+EMU_SRC = sparc.c machine.c emujpeg.c picojpeg.c
+
+test_sparc: test_sparc.c $(EMU_SRC) tests/testprog.c \
+            sparc.h machine.h emujpeg.h picojpeg.h tests/testapi.h
+	$(CC) $(CFLAGS) -I. -o $@ test_sparc.c $(EMU_SRC) \
 	    tests/testprog.c
 
-probe_unzip: probe_unzip.c sparc.c machine.c sparc.h machine.h
-	$(CC) $(CFLAGS) -I. -o $@ probe_unzip.c sparc.c machine.c
+probe_unzip: probe_unzip.c $(EMU_SRC) sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ probe_unzip.c $(EMU_SRC)
 
 # ---- SDK splash demo: real Jupiter code run on the emulated CT952 ----
 XCFLAGS = -m32 -mcpu=v8 -msoft-float -O2 -ffreestanding -fno-builtin \
           -mno-app-regs -I.. -I../..
 
-demo_run: demo_run.c sparc.c machine.c sparc.h machine.h
-	$(CC) $(CFLAGS) -I. -o $@ demo_run.c sparc.c machine.c
+demo_run: demo_run.c $(EMU_SRC) sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ demo_run.c $(EMU_SRC)
 
 tests/demo_splash.o: tests/demo_splash.c
 	$(XCC) $(XCFLAGS) -c -o $@ $<
@@ -132,6 +135,19 @@ bootreal: ct952emu
 	@echo '--- boot log ---'; tr -c '[:print:]\n\t' ' ' < dp700wd_boot.log | tr -s ' '
 	@echo; echo '--- boot screen written to dp700wd_screen.ppm (the OSD plane) ---'
 
+# Functional JPEG decode: run the real firmware, let it stage the power-on
+# COBY logo in DRAM, then decode that staged buffer with the emulator's own
+# decoder -> a PPM. Proves the firmware->emulator decode path end to end.
+logo: ct952emu
+	CT952_PROC2=1 ./ct952emu dp700wd.bin --instr 800000000 --quiet \
+	    --fb-addr 0x4005f000 --fb-wh 480x234 \
+	    --decode-jpeg --jpeg-src 0x401dc000 --jpeg-out dp700wd_logo.ppm
+	@echo "decoded firmware-staged logo -> dp700wd_logo.ppm"
+
+# Standalone decoder self-test: decode a JPEG file to a PPM.
+jpeg_selftest: tests/jpeg_selftest.c emujpeg.c picojpeg.c emujpeg.h picojpeg.h
+	$(CC) $(CFLAGS) -o $@ tests/jpeg_selftest.c emujpeg.c picojpeg.c
+
 clean:
-	rm -f ct952emu test_sparc tests/*.o tests/*.elf tests/*.bin \
+	rm -f ct952emu test_sparc jpeg_selftest tests/*.o tests/*.elf tests/*.bin \
 	    boot_uart.log boot_iolog.txt

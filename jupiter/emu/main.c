@@ -25,6 +25,9 @@ int main(int argc, char **argv)
     int rom_load = 0;
     int m_skip_panelcfg = 0;
     int m_build_panelcfg = 0;
+    int m_jpeg_en = 0;
+    uint32_t m_jpeg_src = 0x401dc000u;
+    const char *jpeg_out_path = NULL;
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -61,6 +64,13 @@ int main(int argc, char **argv)
             m_skip_panelcfg = 1;
         else if (!strcmp(argv[i], "--build-panelcfg"))
             m_build_panelcfg = 1;
+        else if (!strcmp(argv[i], "--decode-jpeg"))
+            m_jpeg_en = 1;
+        else if (!strcmp(argv[i], "--jpeg-src") && i + 1 < argc)
+            m_jpeg_src = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--jpeg-out") && i + 1 < argc) {
+            jpeg_out_path = argv[++i]; m_jpeg_en = 1;
+        }
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -94,6 +104,9 @@ int main(int argc, char **argv)
     free(img);
     m->skip_panelcfg = m_skip_panelcfg;
     m->build_panelcfg = m_build_panelcfg;
+    m->jpeg_decode_en = m_jpeg_en;
+    m->jpeg_src = m_jpeg_src;
+    m->jpeg_out = jpeg_out_path;
 
     for (i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--quiet"))

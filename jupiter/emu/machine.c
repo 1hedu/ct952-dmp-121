@@ -5,6 +5,7 @@
 #include "machine.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 /* LEON core block offsets (ctkav_platform.h:19-97) */
 #define R_TIMER1_CNT   0x040
@@ -26,6 +27,16 @@
 #define R_INT_PENDING  0x094
 #define R_INT_FORCE    0x098
 #define R_INT_CLEAR    0x09C
+/* Secondary "PROC1 1st" interrupt controller (ctkav_platform.h:58-64):
+ * cascades into LEON interrupt line 13 (INT_NO_PROC1_1ST). Bit0 = VSYNC,
+ * the display-timing tick that drives the firmware's display/slideshow
+ * state machine (interrupt.c: INT_Proc1_1st_isr -> ISR_DISPSaveClearStatus). */
+#define R_P1_1ST_MASK  0x0B0        /* MASK_ENABLE: direct RW enable mask */
+#define R_P1_1ST_PEND  0x0B4        /* PENDING: RW; VSYNC source ORs bit0 */
+#define R_P1_1ST_STCL  0x0B8        /* STATUS(R) / CLEAR(W1C) */
+#define R_P1_1ST_MDIS  0x0BC        /* MASK_DISABLE (W1C into MASK) */
+#define INT_NO_PROC1_1ST 13
+#define IRQ_P1_1ST_VSYNC 0x1u
 #define R_DSU_UART_DATA 0x0C0
 #define R_DSU_UART_STAT 0x0C4
 /* Command block (ctkav_platform.h:474-481): PARAMETER1 = 0x364 */
@@ -52,28 +63,12 @@
 #define R_IIC_DATA     0x4214
 #define IIC_BUSY       0x4u
 
-/* Serial (SPI) flash controller (ctkav_platform.h PROM block, CT909P
- * offsets; spflash.c drives it). Bulk data reads go through the
- * memory-mapped ASI-0x7 window (handled as flash in bus_read); only the
- * JEDEC/device-ID + status handshake goes through these registers. */
-#define R_SPI_CMD      0x2A24   /* command byte written here */
-#define R_SPI_OP       0x2A28   /* format write / status read */
-#define R_SPI_RD       0x2A34   /* read-data result */
-#define SPI_IDLE       0x0200u
-#define SPI_IOR        0x0400u
-#define SPI_IOW        0x0800u
-#define SPI_WAITCMD    0x1000u
-#define SPI_DONE       (SPI_IDLE | SPI_IOR | SPI_IOW | SPI_WAITCMD)
-/* MX25L1605 -- a 2 MB serial flash; the device dump is 2 MB, and the
- * firmware matches (RD_REG & 0xffff) == 0xC214 via the 0x90 read-ID cmd
- * (spflash.c _SPF_ReadID, MX25L1605). Manufacturer 0xC2, device 0x14. */
-#define SPI_ID_MXIC    0xC214u
-
 #define TIMER_ENABLE   1u
 #define TIMER_RELOAD   2u
 #define TIMER_LOAD     4u
 
 #define UART_STAT_READY 0x6u   /* TX shift + holding empty, no RX data */
+#define UART_STAT_DATA_READY 0x1u   /* RX byte available (ctkav_platform.h) */
 
 static machine_t *M(sparc_bus_t *b) { return (machine_t *)b; }
 
@@ -123,36 +118,144 @@ static uint32_t io_read(machine_t *m, uint32_t off)
 {
     switch (off) {
     case R_UART1_STAT:
+        /* TX always ready; RX ready iff bytes are queued (host -> device) */
+        return UART_STAT_READY |
+               ((m->rx_pos < m->rx_len) ? UART_STAT_DATA_READY : 0u);
     case R_UART2_STAT:
     case R_DSU_UART_STAT:
         return UART_STAT_READY;
     case R_UART1_DATA:
+        /* pop one queued RX byte (or 0 if none) */
+        if (m->rx_pos < m->rx_len)
+            return m->rx_buf[m->rx_pos++];
+        return 0;
     case R_UART2_DATA:
     case R_DSU_UART_DATA:
-        return 0;                     /* no RX modeled yet */
+        return 0;                     /* RX not modeled on these ports */
     case R_TIMER3_VAL:
         return (uint32_t)m->t3_value;
     case R_PRESC_CNT:
         return m->presc_cnt;
     case R_INT_PENDING:
         return io_get(m, R_INT_PENDING);
+    case R_P1_1ST_STCL:
+        /* STATUS read: the live secondary pending register */
+        return io_get(m, R_P1_1ST_PEND);
     case R_IIC_CMD:
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
-    case R_SPI_OP:
-        /* every command completes instantly: all state bits ready */
-        return io_get(m, R_SPI_OP) | SPI_DONE;
-    case R_SPI_RD:
-        return m->spi_rd;
     default:
         log_access(m, 0x80000000u + off, 0, 0);
         return io_get(m, off);
     }
 }
 
+/* ---- GPU 2-D engine (ctkav_gpu.h offsets; programming per gdi.c) ---- */
+#define R_GPU_CTL0     0x2880
+#define R_GPU_CTL1     0x2884
+#define R_GPU_COL_NDX  0x2888
+#define R_GPU_OP_SIZE  0x288C
+#define R_GPU_AG_OFF   0x2890
+#define R_GPU_SRC_ADDR 0x2894
+#define R_GPU_DEST     0x2898
+#define R_GPU_FONT_ADR 0x289C
+#define R_GPU_FONT_CFG 0x28A0
+#define R_GPU_FONT_IDX 0x28A8
+#define GPU_START_BIT  0x2u
+#define GPU_STATUS_BIT 0x200u        /* CTL0[9] busy */
+#define GPU_FONT_1BIT  0x20u         /* CTL0[5] */
+
+static uint8_t *dram_rw(machine_t *m, uint32_t addr, uint32_t span)
+{
+    uint32_t off;
+    if (addr < 0x40000000u) return NULL;
+    off = addr - 0x40000000u;
+    if ((uint64_t)off + span > MACH_DRAM_SIZE) return NULL;
+    return m->dram + off;
+}
+
+/* Execute one GPU op triggered by a CTL0 write with GPU_START. Fill and
+ * 1-bit font expansion into the 8bpp OSD plane; the firmware's UI drawing
+ * (gdi.c) programs these. Row stride comes from AG_OFF (CT909P encoding:
+ * ((ag_width<<8)+ag_offset)<<16, both in 8-byte units, so bytes/row =
+ * (ag_width+ag_offset-1)*8). */
+static void gpu_exec(machine_t *m, uint32_t ctl0)
+{
+    uint32_t sz = io_get(m, R_GPU_OP_SIZE);
+    uint32_t w = sz & 0xFFFF, h = (sz >> 16) & 0x7FF;
+    uint32_t ag = io_get(m, R_GPU_AG_OFF) >> 16;
+    uint32_t agw = (ag >> 8) & 0xFF, ago = ag & 0xFF;
+    uint32_t stride = (agw + ago > 1) ? (agw + ago - 1) * 8u : 616u;
+    uint32_t dest = io_get(m, R_GPU_DEST);
+    uint32_t opmode = (ctl0 >> 2) & 0x7;
+
+    m->gpu_ops++;
+    if (ctl0 & GPU_FONT_1BIT) m->gpu_font_ops++; else m->gpu_mode_ops[opmode]++;
+
+    if (ctl0 & GPU_FONT_1BIT) {
+        /* 1-bit font expansion into the 8bpp OSD plane. Glyph table at
+         * FONT_ADDR, each glyph = capacity DWs (glyph_DW*4 bytes/row,
+         * MSB-first 1-bit rows). FONT_CONFIG = width_DW<<24 | len<<16 |
+         * capacity. COL_NDX low byte = fg index, next byte = bg. Height
+         * from OP_SIZE[26:16]; glyph advance = glyph_DW*8 pixels. */
+        uint32_t cfg = io_get(m, R_GPU_FONT_CFG);
+        uint32_t fbase = io_get(m, R_GPU_FONT_ADR);
+        uint32_t wdw = (cfg >> 24) & 0xFF; if (!wdw) wdw = 1;
+        uint32_t cap = cfg & 0xFFF;       /* DW per glyph */
+        uint32_t gh = h ? h : (cap / wdw);   /* glyph height in rows */
+        uint32_t adv = wdw * 8;              /* pixel advance per glyph */
+        uint8_t fg = io_get(m, R_GPU_COL_NDX) & 0xFF;
+        uint8_t bg = (io_get(m, R_GPU_COL_NDX) >> 8) & 0xFF;
+        uint32_t xoff = 0;
+        int gi;
+        if (!gh) gh = 16;
+        for (gi = 0; gi < m->gpu_fontn; gi++) {
+            uint32_t gnum = m->gpu_fontq[gi] & 0x1FF;
+            uint32_t gaddr = fbase + gnum * cap * 4u;
+            const uint8_t *gp = dram_rw(m, gaddr, cap * 4u);
+            uint32_t row, col;
+            if (!gp) { xoff += adv; continue; }
+            for (row = 0; row < gh; row++) {
+                for (col = 0; col < adv; col++) {
+                    uint32_t bytei = (col >> 3);
+                    uint8_t rb = gp[row * wdw * 4u + bytei];
+                    uint8_t bit = (rb >> (7 - (col & 7))) & 1;
+                    uint32_t px = dest + row * stride + xoff + col;
+                    uint8_t *d = dram_rw(m, px, 1);
+                    if (d) *d = bit ? fg : bg;
+                }
+            }
+            xoff += adv;
+        }
+        m->gpu_fontn = 0;
+        return;
+    }
+
+    if (opmode == 6 && !(ctl0 & GPU_FONT_1BIT)) {   /* GPU_FILLRECTANGLE */
+        uint8_t color = (io_get(m, R_GPU_CTL1) >> 24) & 0xFF;
+        uint8_t *fb;
+        uint32_t r, c;
+        if (!w || !h) return;
+        fb = dram_rw(m, dest, (h - 1) * stride + w);
+        if (!fb) return;
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++)
+                fb[r * stride + c] = color;
+    }
+    m->gpu_fontn = 0;   /* consume the font-index queue */
+}
+
 static void io_write(machine_t *m, uint32_t off, uint32_t v)
 {
     switch (off) {
+    case R_GPU_CTL0:
+        if (v & GPU_START_BIT) gpu_exec(m, v);
+        io_set(m, off, v & ~GPU_STATUS_BIT);   /* op completes: clear busy */
+        return;
+    case R_GPU_FONT_IDX:
+        if (m->gpu_fontn < 1024) m->gpu_fontq[m->gpu_fontn++] = (uint16_t)v;
+        io_set(m, off, v);
+        return;
     case R_UART1_DATA: uart_tx(m, 1, v); return;
     case R_UART2_DATA: uart_tx(m, 2, v); return;
     case R_DSU_UART_DATA: uart_tx(m, 3, v); return;
@@ -170,38 +273,33 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
         io_set(m, R_INT_PENDING, io_get(m, R_INT_PENDING) & ~v);
         io_set(m, R_INT_FORCE, io_get(m, R_INT_FORCE) & ~v);
         return;
+    case R_P1_1ST_STCL:
+        /* secondary CLEAR: write-1-to-clear pending bits */
+        io_set(m, R_P1_1ST_PEND, io_get(m, R_P1_1ST_PEND) & ~v);
+        return;
+    case R_P1_1ST_MDIS:
+        /* secondary MASK_DISABLE: clear the named enable bits */
+        io_set(m, R_P1_1ST_MASK, io_get(m, R_P1_1ST_MASK) & ~v);
+        return;
     case R_PARAM1:
         /* AM mailbox: PROC1 writes cmd with [31:30]=1 write / 2 read;
          * PROC2 acks by clearing [31:30] (hdecoder.c:1718-1727).
-         * Stand-in DSP: ack immediately; reads return 0 via PARAM2. */
-        if ((v >> 30) == 2)
-            io_set(m, R_PARAM2, 0);
-        io_set(m, R_PARAM1, v & 0x3FFFFFFFu);
-        return;
-    case R_SPI_CMD: {
-        /* Latch the read-data result the firmware will pull from RD_REG.
-         * cmd byte is the low 8 bits (ID/status reads); bulk data reads
-         * don't come through here. spflash.c _SPF_ReadID tries 0x9F/0x90/
-         * 0xAB; the 0x90 "read manuf/device ID" is the one that matches
-         * (RD_REG & 0xffff == 0xC214 -> MX25L1605). Read-status (0x05)
-         * returns 0 = not busy (WIP clear). */
-        uint8_t cmd = (uint8_t)(v & 0xFF);
-        switch (cmd) {
-        case 0x90: m->spi_rd = SPI_ID_MXIC;       break; /* manuf+device */
-        case 0x9F: m->spi_rd = SPI_ID_MXIC >> 8;  break; /* JEDEC 1st byte */
-        case 0x05: m->spi_rd = 0x00;              break; /* status: ready */
-        default:   m->spi_rd = 0x00;              break;
+         * Stand-in DSP: ack immediately; reads return 0 via PARAM2.
+         * Skipped once the real PROC2 core is running (it acks for real). */
+        if (!m->proc2_enable) {
+            if ((v >> 30) == 2)
+                io_set(m, R_PARAM2, 0);
+            io_set(m, R_PARAM1, v & 0x3FFFFFFFu);
+            return;
         }
-        io_set(m, R_SPI_CMD, v);
+        io_set(m, R_PARAM1, v);
         return;
-    }
     case R_AUDIO_CMD:
         /* PROC1 writes 0x10003, then spins reading this word and shifting
          * right 16; it breaks when [31:16] == 0 (hdecoder.c:724-737).
-         * PROC2 signals "audio boot OK" by clearing the high half. Our
-         * stand-in DSP acks instantly: keep the low 16 (audio type),
-         * clear [31:16]. */
-        io_set(m, R_AUDIO_CMD, v & 0xFFFFu);
+         * PROC2 signals "audio boot OK" by clearing the high half. The
+         * stand-in acks instantly; the real PROC2 core does it itself. */
+        io_set(m, R_AUDIO_CMD, m->proc2_enable ? v : (v & 0xFFFFu));
         return;
     default:
         log_access(m, 0x80000000u + off, 1, v);
@@ -229,18 +327,48 @@ static void mem_write_raw(uint8_t *p, uint32_t v, int size)
     p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
 }
 
-static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
+/* PROC2 vdec command -> completion-state ack (comdec.h EN_VDEC_CMD).
+ * The decoder microcode overwrites REG_SRAM_PLAYMODE with these once it
+ * has consumed the command; PROC1 wait loops poll for them. */
+static uint8_t proc2_ack_of(uint8_t cmd)
 {
-    machine_t *m = M(b);
+    switch (cmd) {
+    case 0x00: return 0x10;   /* reset/NONE     -> decoder idle=STOP */
+    case 0x10: return 0x11;   /* MODE_STOP      -> MODE_STOPPED      */
+    case 0x40: return 0x12;   /* MODE_SCAN      -> MODE_SCAN_DONE    */
+    case 0x80: return 0x13;   /* MODE_PREDECODE -> MODE_PREDEC_DONE  */
+    default:   return cmd;    /* PLAY/...: state stays as set        */
+    }
+}
+
+static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
+{
     *fault = 0;
+
+    /* DSU2 block (0x98000000): PROC1 reads PROC2's live PC here to monitor
+     * it (REG_PLAT_DSU2_PC = 0x98080010). Back the PC/nPC; rest reads 0. */
+    if (addr >= 0x98000000u && addr < 0x98100000u) {
+        if (addr == 0x98080010u) return m->cpu2.pc;
+        if (addr == 0x98080014u) return m->cpu2.npc;
+        return 0;
+    }
+
+    /* PROC2 vdec stand-in: deliver the command ack after a read latency.
+     * Skipped once the real PROC2 core is running -- it drives PLAYMODE. */
+    if (!m->proc2_enable && addr == 0xB0000190u &&
+        m->proc2_ack_countdown > 0 && --m->proc2_ack_countdown == 0)
+        m->bram[0x190] = proc2_ack_of(m->proc2_cmd);
 
     if (addr < MACH_FLASH_MAX) {
         if (addr + (uint32_t)size <= m->flash_size)
             return mem_read_raw(m->flash + addr, size);
         return 0xFFFFFFFFu;   /* erased flash */
     }
-    if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE)
+    if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
+        if (m->skip_panelcfg && addr == 0x4002f770u)
+            return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
         return mem_read_raw(m->dram + (addr - 0x40000000u), size);
+    }
     if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)
         return mem_read_raw(m->dram + (addr - 0xC0000000u), size);
     if (addr >= 0x80000000u && addr < 0x80000000u + MACH_IO_SIZE) {
@@ -251,36 +379,72 @@ static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
         if (size == 1) return (v >> ((3 - (addr & 3)) * 8)) & 0xFF;
         return (v >> ((addr & 2) ? 0 : 16)) & 0xFFFF;
     }
+    if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u)
+        return mem_read_raw(m->bram + (addr - 0xB0000000u), size);
     if (addr >= 0x90000000u && addr < 0x90010000u)
         return 0;                        /* DSU stub */
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 0, 0);
-        /* FCR/SDC/NFC stub. absent_ff: float the bus like real silicon
-         * with no card/media attached (many present-detect bits are
-         * active-low), instead of reading as all-zeros. */
-        return m->absent_ff ? 0xFFFFFFFFu : 0;
+        return 0;                        /* FCR/SDC/NFC stub */
     }
-    if (addr >= 0xB0000000u && addr < 0xB0010000u)
-        return mem_read_raw(m->sram + (addr - 0xB0000000u), size);
     m->unmapped_reads++;
     log_access(m, addr & ~3u, 0, 0);   /* record so it names the blocker */
     return 0;
 }
 
-static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
-                      int size, int *fault)
+/* boot PROC2: seed the second core at the entry/SP PROC1 staged in the AIU GR
+ * bank (GR22 = 0x800007d8 start, GR21 = 0x800007d4 SP) and let it run. */
+static void proc2_boot(machine_t *m)
 {
-    machine_t *m = M(b);
+    uint32_t entry = io_get(m, R_PROC2_START);
+    uint32_t sp    = io_get(m, R_PROC2_SP);
+    if (m->proc2_on || !m->proc2_enable || (entry & 0xF0000000u) != 0x40000000u)
+        return;
+    sparc_reset(&m->cpu2, &m->bus2);
+    m->cpu2.pc = entry;
+    m->cpu2.npc = entry + 4;
+    sparc_set_reg(&m->cpu2, 14, sp);   /* %o6 / %sp */
+    m->proc2_on = 1;
+}
+
+static void proc2_halt(machine_t *m)
+{
+    m->proc2_on = 0;
+}
+
+static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
+                   int size, int *fault)
+{
     *fault = 0;
+
+    /* PROC2 reset/debug control (writes from PROC1) */
+    if (m->proc2_enable) {
+        int was = m->proc2_on;
+        if (addr == 0x80000304u && (val & 0x1u)) { proc2_boot(m); }  /* RESET_DISABLE: release */
+        else if (addr == 0x80000324u && (val & 0x1u)) { proc2_halt(m); } /* RESET_ENABLE: hold */
+        else if (addr == 0x98000000u) {              /* DSU2 control */
+            if (val & 0x00080000u) proc2_boot(m);    /* PLAT_DSU_CTL_RE */
+            else if (val & 0x000000A0u) proc2_halt(m); /* BN|BW: break */
+        }
+        if (was != m->proc2_on && getenv("CT952_TRACE"))
+            fprintf(stderr, "[P2] %s via %08x=%08x entry=%08x pc1=%08x\n",
+                    m->proc2_on ? "BOOT" : "HALT", addr, val,
+                    io_get(m, R_PROC2_START), m->cpu.pc);
+    }
+    if (addr >= 0x98000000u && addr < 0x98100000u)
+        return;   /* DSU2 register file: writes accepted, not modeled */
+
+    /* PROC1 issued a VDEC command via REG_SRAM_PLAYMODE: arm the PROC2 ack
+     * (delivered after a few status polls, mimicking the microcode latency). */
+    if (addr == 0xB0000190u) {
+        m->proc2_cmd = (uint8_t)val;
+        m->proc2_ack_countdown = (proc2_ack_of((uint8_t)val) != (uint8_t)val)
+                                 ? 8 : 0;
+    }
 
     if (addr < MACH_FLASH_MAX)
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
-        if (m->watch_left > 0 && addr >= m->watch_lo && addr < m->watch_hi) {
-            fprintf(stderr, "[watch] pc=0x%08x wrote [0x%08x] = 0x%08x (%dB)\n",
-                    m->cpu.pc, addr, val, size);
-            m->watch_left--;
-        }
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
         return;
     }
@@ -301,24 +465,49 @@ static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
         io_write(m, off, val);
         return;
     }
+    if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u) {
+        mem_write_raw(m->bram + (addr - 0xB0000000u), val, size);
+        return;
+    }
     if (addr >= 0x90000000u && addr < 0x90010000u)
         return;
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 1, val);
         return;
     }
-    if (addr >= 0xB0000000u && addr < 0xB0010000u) {
-        mem_write_raw(m->sram + (addr - 0xB0000000u), val, size);
-        return;
-    }
     m->unmapped_writes++;
 }
+
+/* ---- bus dispatch: two views onto the same machine ---- */
+/* cpu1's bus is machine.bus (first field -> plain cast). cpu2's bus is
+ * machine.bus2 (container-of by offset). Both hit the same memory/I/O; only
+ * the interrupt wiring differs. */
+static machine_t *M2(sparc_bus_t *b)
+{ return (machine_t *)((char *)b - offsetof(machine_t, bus2)); }
+
+static uint32_t bus_read(sparc_bus_t *b, uint32_t a, int s, int *f)
+{ return bus_rd(M(b), a, s, f); }
+static void bus_write(sparc_bus_t *b, uint32_t a, uint32_t v, int s, int *f)
+{ bus_wr(M(b), a, v, s, f); }
+static uint32_t bus2_read(sparc_bus_t *b, uint32_t a, int s, int *f)
+{ return bus_rd(M2(b), a, s, f); }
+static void bus2_write(sparc_bus_t *b, uint32_t a, uint32_t v, int s, int *f)
+{ bus_wr(M2(b), a, v, s, f); }
+/* PROC2 has its own interrupt controller; we don't wire it yet -- the
+ * decoder microcode drives the datapath by polling, so run it with no
+ * asynchronous interrupts rather than misdelivering PROC1's. */
+static int  bus2_irq_level(sparc_bus_t *b) { (void)b; return 0; }
+static void bus2_irq_ack(sparc_bus_t *b, int lvl) { (void)b; (void)lvl; }
 
 static int bus_irq_level(sparc_bus_t *b)
 {
     machine_t *m = M(b);
-    uint32_t eff = (io_get(m, R_INT_PENDING) | io_get(m, R_INT_FORCE)) &
-                   io_get(m, R_INT_MASK);
+    uint32_t pend = io_get(m, R_INT_PENDING) | io_get(m, R_INT_FORCE);
+    /* cascade: the secondary PROC1-1st controller drives LEON line 13
+     * whenever any of its enabled sources is pending (level-triggered). */
+    if (io_get(m, R_P1_1ST_PEND) & io_get(m, R_P1_1ST_MASK))
+        pend |= (1u << INT_NO_PROC1_1ST);
+    uint32_t eff = pend & io_get(m, R_INT_MASK);
     int lvl;
     for (lvl = 15; lvl >= 1; lvl--)
         if (eff & (1u << lvl))
@@ -354,6 +543,15 @@ static void timer_tick_one(machine_t *m, uint32_t cnt_off, uint32_t rld_off,
 static void machine_cycle(machine_t *m)
 {
     m->cycles++;
+    /* Display VSYNC tick: raise the secondary VSYNC-pending bit at the
+     * panel field rate so the firmware's display state machine advances.
+     * Real timing is ~MCLK/50Hz (~2.66M cycles); we use a shorter, env-
+     * tunable divider so many fields elapse within a bring-up run. */
+    if (++m->vsync_cnt >= m->vsync_div) {
+        m->vsync_cnt = 0;
+        io_set(m, R_P1_1ST_PEND,
+               io_get(m, R_P1_1ST_PEND) | IRQ_P1_1ST_VSYNC);
+    }
     if (m->presc_cnt == 0) {
         m->presc_cnt = io_get(m, R_PRESC_RLD);
         m->t3_value++;
@@ -382,21 +580,51 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
         return -1;
     m->flash = (uint8_t *)malloc(MACH_FLASH_MAX);
     m->dram = (uint8_t *)malloc(MACH_DRAM_SIZE);
-    m->sram = (uint8_t *)malloc(0x10000);   /* 0xB0000000 scratch SRAM */
-    if (!m->flash || !m->dram || !m->sram)
+    m->bram = (uint8_t *)malloc(0x10000u);
+    if (!m->flash || !m->dram || !m->bram)
         return -1;
     memset(m->flash, 0xFF, MACH_FLASH_MAX);
     memcpy(m->flash, flash, flash_size);
     memset(m->dram, 0, MACH_DRAM_SIZE);
-    memset(m->sram, 0, 0x10000);
+    memset(m->bram, 0, 0x10000u);
     m->flash_size = flash_size;
     m->uart_echo = 1;
+
+    /* display field-rate divider for the VSYNC IRQ (see machine_cycle) */
+    {
+        const char *e = getenv("CT952_VSYNC_DIV");
+        m->vsync_cnt = 0;
+        m->vsync_div = e ? (uint32_t)strtoul(e, NULL, 0) : 200000u;
+        if (m->vsync_div == 0) m->vsync_div = 200000u;
+    }
+
+    /* SYSTEM_CONFIGURATION1 (0x8000031c): hardware strapping the boot code
+     * decodes for DRAM/flash type. Bits[4:0] must be 0b11xxx or the AP
+     * code-area calc (flash 0x40260) returns the 0x50000000 "unknown DRAM"
+     * sentinel and boot-config aborts. Overridable via CT952_SYSCFG1 for
+     * bring-up sweeps. */
+    {
+        const char *e = getenv("CT952_SYSCFG1");
+        /* 0x1e -> AP-calc returns 0x40800000 (8 MB / 64 Mbit DRAM top),
+         * matching this model's DRAM size. */
+        m->io[0x31c / 4] = e ? (uint32_t)strtoul(e, NULL, 0) : 0x1eu;
+    }
 
     m->bus.read = bus_read;
     m->bus.write = bus_write;
     m->bus.irq_level = bus_irq_level;
     m->bus.irq_ack = bus_irq_ack;
     sparc_reset(&m->cpu, &m->bus);
+
+    /* PROC2 second core (gated during bring-up) */
+    m->bus2.read = bus2_read;
+    m->bus2.write = bus2_write;
+    m->bus2.irq_level = bus2_irq_level;
+    m->bus2.irq_ack = bus2_irq_ack;
+    m->proc2_enable = getenv("CT952_PROC2") ? 1 : 0;
+    m->proc2_on = 0;
+    sparc_reset(&m->cpu2, &m->bus2);
+    m->cpu2.halted = 1;      /* idle until PROC1 releases it */
     return 0;
 }
 
@@ -406,14 +634,30 @@ void machine_seed_boot(machine_t *m, uint32_t entry, uint32_t sp)
     if (sp)    io_set(m, R_PROC2_SP, sp);
 }
 
+void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len)
+{
+    uint8_t *nb = (uint8_t *)realloc(m->rx_buf, m->rx_len + len);
+    if (!nb) return;
+    m->rx_buf = nb;
+    memcpy(m->rx_buf + m->rx_len, data, len);
+    m->rx_len += len;
+}
+
 void machine_free(machine_t *m)
 {
+    if (getenv("CT952_TRACE"))
+        fprintf(stderr, "[EXIT] pc1=%08x  PROC2 on=%d pc=%08x icount=%llu "
+                "halted=%d (%s)\n", m->cpu.pc, m->proc2_on, m->cpu2.pc,
+                (unsigned long long)m->cpu2.icount, m->cpu2.halted,
+                m->cpu2.halt_reason[0] ? m->cpu2.halt_reason : "-");
     free(m->flash);
     free(m->dram);
-    free(m->sram);
+    free(m->bram);
+    free(m->rx_buf);
     m->flash = NULL;
     m->dram = NULL;
-    m->sram = NULL;
+    m->bram = NULL;
+    m->rx_buf = NULL;
 }
 
 uint64_t machine_run(machine_t *m, uint64_t n)
@@ -422,11 +666,34 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
         uint64_t chunk = n - done;
         uint64_t ran, i;
+        /* Faithful panel-config build (opt-in): at the first fetch of the
+         * config thunk (flash 0x3d564), run the firmware's own descriptor
+         * builder (0x3ce60) on the live machine -- it reads the real SETD
+         * settings sector -- preserving the boot CPU context across the
+         * call. Reproduces the default-init pass the eCos init-callback
+         * list would run before the apply. NOTE: builds the descriptor
+         * (desc+0x10/0x14 from SETD) but is not yet sufficient on its own
+         * -- the inner register table at 0x40042000 is populated by the
+         * apply itself, which is the next layer. */
+        if (m->build_panelcfg && !m->panelcfg_built) {
+            if (m->cpu.pc == 0x3d564u) {
+                sparc_t save = m->cpu;
+                machine_call(m, 0x3ce60u, 0, 0, 0, 0x40700000u, 50000000ull);
+                m->cpu = save;
+                m->panelcfg_built = 1;
+            } else {
+                chunk = 1;   /* single-step until the thunk is reached */
+            }
+        }
         if (chunk > 4096) chunk = 4096;
         ran = sparc_run(&m->cpu, chunk);
         done += ran;
         for (i = 0; i < ran; i++)
             machine_cycle(m);
+        /* Interleave PROC2 on the same wall-clock budget. It shares the bus
+         * (DRAM / vdec SRAM / JPU), so its decode work is visible to PROC1. */
+        if (m->proc2_on && !m->cpu2.halted)
+            sparc_run(&m->cpu2, ran ? ran : chunk);
         if (ran < chunk)
             break;
     }
@@ -477,55 +744,6 @@ uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr)
     if (addr >= 0x40000000u && addr < 0x40000000u + MACH_DRAM_SIZE)
         return m->dram + (addr - 0x40000000u);
     return NULL;
-}
-
-/* ---- Display-engine scanout ----
- * Reproduce what the CT952 OSD read-channel would put on screen, from
- * the real registers any code (firmware or an SDK demo) programs:
- *   REG_MCU_VCR20   0x80000D80  OSD read-channel base (DRAM byte addr)
- *   REG_DISP_OSD_SIZE 0x80001A54  bit28 = OSD enable
- *   GAM_OSD RAM     0x80001C00..  256 palette entries, [23:0] = YCbCr
- *                                 (Y<<16|Cb<<8|Cr, BT.601 studio range),
- *                                 bit24 = per-entry mix enable.
- * The 8bpp OSD plane at the base is resolved through that palette and
- * YCbCr->RGB converted (host-side float is fine). Returns 1 and fills
- * rgb (w*h*3, top-down RGB) if the OSD is enabled with a DRAM base,
- * else 0. pitch is the plane's row stride in bytes. */
-#define R_MCU_VCR20     0x0D80
-#define R_DISP_OSD_SIZE 0x1A54
-#define R_GAM_OSD       0x1C00
-#define DISP_OSD_ENABLE 0x10000000u
-
-int machine_scanout(machine_t *m, int w, int h, int pitch, uint8_t *rgb)
-{
-    uint32_t base = io_get(m, R_MCU_VCR20);
-    uint32_t size = io_get(m, R_DISP_OSD_SIZE);
-    const uint8_t *fb;
-    int x, y;
-
-    if (!(size & DISP_OSD_ENABLE)) return 0;
-    fb = machine_dram_ptr(m, base);
-    if (!fb) return 0;
-
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            uint8_t idx = fb[(uint32_t)y * (uint32_t)pitch + (uint32_t)x];
-            uint32_t e = io_get(m, R_GAM_OSD + (uint32_t)idx * 4);
-            int Y = (int)((e >> 16) & 0xFF);
-            int Cb = (int)((e >> 8) & 0xFF) - 128;
-            int Cr = (int)(e & 0xFF) - 128;
-            /* BT.601 studio-swing YCbCr -> full-range RGB */
-            double yy = 1.164 * (double)(Y - 16);
-            int r = (int)(yy + 1.596 * Cr + 0.5);
-            int g = (int)(yy - 0.392 * Cb - 0.813 * Cr + 0.5);
-            int b = (int)(yy + 2.017 * Cb + 0.5);
-            uint8_t *o = rgb + ((uint32_t)y * (uint32_t)w + (uint32_t)x) * 3;
-            o[0] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
-            o[1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
-            o[2] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
-        }
-    }
-    return 1;
 }
 
 /* ---- Stock-ROM section loader (mask-ROM equivalent) ---- */
@@ -634,4 +852,85 @@ void machine_dump_iolog(machine_t *m, FILE *f)
                 m->log[i].last_write);
     fprintf(f, "# unmapped: %u reads, %u writes\n",
             m->unmapped_reads, m->unmapped_writes);
+}
+
+/* ---- DISP display engine: OSD plane scanout ------------------------ *
+ * The stock display path is a blob (display.a), but the OSD plane it
+ * scans is fully described by header-visible state: the 8bpp palette-
+ * indexed pixels live linearly in DRAM (the firmware's OSD region,
+ * DS_OSDFRAME_ST = 0x4005F000), and the colour palette is the DISP
+ * GAM_OSD RAM at 0x80001C00 -- 256 words of 0x00YYUUVV, BT.601 studio
+ * range (jrgb2yuv.c). This composites that plane to an RGB PPM, exactly
+ * what the DISP scan-out does before the panel TCON. Register offsets
+ * from ctkav_disp.h. */
+#define R_DISP_OSD_SIZE  0x1A54          /* bit28 = DISP_OSD_EN */
+#define R_DISP_GAM_OSD   0x1C00          /* GAM_OSD[n] = +n*4, 256 entries */
+#define DISP_OSD_EN      0x10000000u
+
+static int clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+/* BT.601 studio-range YCbCr (0x00YYUUVV) -> packed 0x00RRGGBB: the exact
+ * inverse of the SDK's jup_argb_to_yuv, so a colour loaded into the OSD
+ * palette scans back out to its original ARGB. */
+static uint32_t disp_yuv_to_rgb(uint32_t yuv)
+{
+    int y = (int)((yuv >> 16) & 0xFF);
+    int u = (int)((yuv >> 8) & 0xFF);
+    int v = (int)(yuv & 0xFF);
+    int c = y - 16, d = u - 128, e = v - 128;
+    int r = clamp8((298 * c + 409 * e + 128) >> 8);
+    int g = clamp8((298 * c - 100 * d - 208 * e + 128) >> 8);
+    int b = clamp8((298 * c + 516 * d + 128) >> 8);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+int machine_disp_scanout(machine_t *m, uint32_t osd_base,
+                         uint32_t w, uint32_t h, uint32_t stride,
+                         const char *ppm_path)
+{
+    uint32_t pal[256];
+    const uint8_t *fb;
+    uint64_t span;
+    FILE *f;
+    uint32_t x, y;
+    int osd_en, i;
+
+    {
+        int loaded = 0;
+        for (i = 0; i < 256; i++) {
+            pal[i] = disp_yuv_to_rgb(io_get(m, R_DISP_GAM_OSD + (uint32_t)i * 4));
+            if (i && pal[i]) loaded = 1;
+        }
+        /* if the firmware hasn't loaded the OSD palette RAM yet, fall back
+         * to a visible per-index ramp so drawn content stays legible */
+        if (!loaded)
+            for (i = 0; i < 256; i++) {
+                uint32_t gr = i ? (uint32_t)((i * 40 + 40) & 0xFF) : 0u;
+                pal[i] = (gr << 16) | (gr << 8) | gr;
+            }
+    }
+
+    osd_en = (io_get(m, R_DISP_OSD_SIZE) & DISP_OSD_EN) != 0;
+
+    if (osd_base < 0x40000000u) return -1;
+    span = (uint64_t)(h ? h - 1 : 0) * stride + w;
+    if ((uint64_t)(osd_base - 0x40000000u) + span > MACH_DRAM_SIZE) return -1;
+    fb = machine_dram_ptr(m, osd_base);
+    if (!fb) return -1;
+
+    f = fopen(ppm_path, "wb");
+    if (!f) return -1;
+    fprintf(f, "P6\n%u %u\n255\n", w, h);
+    /* render the OSD plane content regardless of the hardware enable bit
+     * (the firmware draws before flipping enable); enable state is still
+     * reported via the return value */
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            uint32_t c = pal[fb[(uint64_t)y * stride + x]];
+            fputc((int)((c >> 16) & 0xFF), f);
+            fputc((int)((c >> 8) & 0xFF), f);
+            fputc((int)(c & 0xFF), f);
+        }
+    fclose(f);
+    return osd_en ? 0 : 1;
 }

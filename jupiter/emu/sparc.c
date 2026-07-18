@@ -46,10 +46,11 @@ void sparc_reset(sparc_t *c, sparc_bus_t *bus)
     c->bus = bus;
     c->pc = 0;
     c->npc = 4;
-    /* impl=0xA ver=0 -- the real CT952 chip ID. The stock first-stage
-     * boot at flash 0x310 reads PSR[31:24] and only runs its true
-     * clock/DRAM/section-load path when it sees 0xA0; any other value
-     * drops it to a debugger-style path. S=1, ET=0, CWP=0. */
+    /* PSR impl=0xA ver=0: the real CT952 SPARC chip ID. The stock boot
+     * code reads PSR[31:24] and only takes its full clock/DRAM/section
+     * init path when it reads 0xa0 (else it falls to a debugger-style
+     * trampoline that expects pre-staged entry/SP registers). S=1, ET=0,
+     * CWP=0. */
     c->psr = 0xA0000000u | PSR_S;
     c->wim = 0;
     c->tbr = 0;
@@ -165,11 +166,6 @@ static int step(sparc_t *c)
         return c->halted;
     }
     c->pc_ring[c->pc_ri++ & 63] = pc;
-    if (c->cap_pc && pc == c->cap_pc && !c->cap_done) {
-        int k;
-        for (k = 0; k < 32; k++) c->cap[k] = sparc_get_reg(c, k);
-        c->cap_done = 1;
-    }
     c->icount++;
 
     {

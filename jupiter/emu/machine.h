@@ -39,19 +39,61 @@ typedef struct machine {
     sparc_bus_t bus;        /* must be first (container-of via cast) */
     sparc_t cpu;
 
+    /* PROC2: the CT909's second SPARC V8 core (LEON2-class), running the
+     * audio / JPEG-decoder microcode PROC1 loads to 0x40002000. Shares the
+     * bus (DRAM, vdec SRAM 0xb0000000, JPU regs). Released from reset by
+     * PROC1 via REG_PLAT_RESET_CONTROL_DISABLE / the DSU2 control. Gated by
+     * CT952_PROC2 while under bring-up. */
+    sparc_t cpu2;
+    sparc_bus_t bus2;       /* cpu2's bus view (no PROC1 interrupts) */
+    int proc2_enable;       /* feature gate (env CT952_PROC2) */
+    int proc2_on;           /* released and running */
+
     uint8_t *flash;
     uint32_t flash_size;
     uint8_t *dram;
-    uint8_t *sram;          /* 0xB0000000 VDEC/USB on-chip scratch SRAM */
+    uint8_t *bram;          /* 0xB0000000 scratch SRAM (firmware RW use) */
     uint32_t io[MACH_IO_SIZE / 4];
 
     /* timers */
     uint32_t presc_cnt;
     uint64_t t3_value;
 
+    /* display VSYNC generation (secondary PROC1-1st IRQ, LEON line 13) */
+    uint32_t vsync_cnt, vsync_div;
+
+    /* PROC2 vdec stand-in: PROC1 writes a VDEC command to REG_SRAM_PLAYMODE
+     * (0xb0000190); the real decoder microcode acks by overwriting it with a
+     * completion state (comdec.h EN_VDEC_CMD). We deliver that ack after a
+     * short read latency so the firmware's wait loops make progress. */
+    uint8_t proc2_cmd;
+    int proc2_ack_countdown;
+
     /* uart capture */
     FILE *uart_file;         /* optional capture file (may be NULL) */
     int uart_echo;           /* echo UART bytes to stdout */
+
+    /* uart rx: host -> firmware, drained on UART1 DATA reads */
+    uint8_t *rx_buf;
+    uint32_t rx_len, rx_pos;
+
+    /* bring-up aid: force the panel-config descriptor's validity word
+     * (0x4002f770, desc+0x14) to read as -1, so the boot config-register
+     * thunk (flash 0x3d564) takes its built-in "no override" skip path
+     * instead of spinning on the never-initialised config arena. */
+    int skip_panelcfg;
+
+    /* faithful aid: just before the config thunk (0x3d564) first runs,
+     * invoke the firmware's own descriptor builder (0x3ce60) via
+     * machine_call so the descriptor is built from the real SETD settings
+     * sector -- reproducing the default-init pass the eCos init-callback
+     * list would have run before the apply callback. */
+    int build_panelcfg, panelcfg_built;
+
+    /* GPU 2-D engine op accounting + font-index queue */
+    uint64_t gpu_ops, gpu_font_ops, gpu_mode_ops[8];
+    uint16_t gpu_fontq[1024];
+    int gpu_fontn;
 
     /* io access inventory */
     mach_logent_t log[MACH_LOG_MAX];
@@ -60,23 +102,15 @@ typedef struct machine {
 
     uint64_t cycles;
     int watchdog_fired;
-
-    /* DRAM write-watch: log the first N writes into [watch_lo, watch_hi)
-     * with the PC that issued them (find who fills a table). */
-    uint32_t watch_lo, watch_hi;
-    int watch_left;
-
-    /* stubbed storage/USB regions (0xA000xxxx / 0xB000xxxx) read as
-     * 0xFFFFFFFF ("no media, floating bus") instead of 0 */
-    int absent_ff;
-
-    /* serial-flash controller: pending RD_REG result latched at the last
-     * command write (device-ID / status handshake) */
-    uint32_t spi_rd;
 } machine_t;
 
 /* Create/reset the machine with a flash image (copied in). */
 int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size);
+
+/* Queue bytes for the firmware to read from UART1 RX (host -> device).
+ * Appends to any pending data; each byte is delivered once, in order,
+ * and the UART1 status DATA_READY bit reflects whether any remain. */
+void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len);
 
 /* Seed the boot-trampoline registers the earlier dsu_boot stage would
  * have written: GR22 (0x800007d8) = firmware entry, GR21 (0x800007d4)
@@ -102,13 +136,6 @@ int machine_call(machine_t *m, uint32_t entry,
 uint32_t machine_dram_rd(machine_t *m, uint32_t addr, int size);
 uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr);
 
-/* Display-engine scanout: render the OSD plane the way the hardware
- * read-channel would, from the registers programmed in the I/O page
- * (VCR20 base, OSD-enable, GAM_OSD YCbCr palette). Fills rgb (w*h*3,
- * top-down) and returns 1 if the OSD is enabled with a valid DRAM
- * base; returns 0 otherwise. pitch is the OSD plane row stride. */
-int machine_scanout(machine_t *m, int w, int h, int pitch, uint8_t *rgb);
-
 /* Parse the flash section table and stage every DRAM-resident section:
  * raw sections are copied, zip-flagged sections are decompressed by
  * invoking the firmware's own UZIP codec (flash 0x2000, wrapper +0xc50)
@@ -119,5 +146,15 @@ uint32_t machine_rom_load(machine_t *m, FILE *log);
 
 /* Dump the I/O access inventory (sorted by address) to f. */
 void machine_dump_iolog(machine_t *m, FILE *f);
+
+/* Model the DISP display engine's OSD scan-out: composite the 8bpp
+ * palette-indexed OSD plane at `osd_base` (w x h, `stride` bytes/row)
+ * through the modelled DISP OSD palette RAM (GAM_OSD @ 0x80001C00,
+ * BT.601 0x00YYUUVV) into an RGB PPM. Honours DISP_OSD_EN in
+ * REG_DISP_OSD_SIZE. Returns 0 if OSD is enabled, 1 if disabled (still
+ * writes the file), -1 on error. */
+int machine_disp_scanout(machine_t *m, uint32_t osd_base,
+                         uint32_t w, uint32_t h, uint32_t stride,
+                         const char *ppm_path);
 
 #endif /* CT952EMU_MACHINE_H */

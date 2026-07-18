@@ -16,12 +16,15 @@ int main(int argc, char **argv)
 {
     const char *rom_path = NULL, *uart_path = NULL, *iolog_path = NULL;
     const char *dram_path = NULL;
-    uint32_t watch_lo = 0;
-    int absent_ff = 0;
-    uint32_t cap_pc = 0;
+    const char *fb_path = NULL;
+    const char *uartin_path = NULL;
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
+    uint32_t fb_addr = 0x4005F000u;   /* DS_OSDFRAME_ST */
+    uint32_t fb_w = 616, fb_h = 440;  /* firmware OSD region geometry */
     int rom_load = 0;
+    int m_skip_panelcfg = 0;
+    int m_build_panelcfg = 0;
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -38,18 +41,26 @@ int main(int argc, char **argv)
             iolog_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dram") && i + 1 < argc)
             dram_path = argv[++i];
-        else if (!strcmp(argv[i], "--watch") && i + 1 < argc)
-            watch_lo = (uint32_t)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--regs-at") && i + 1 < argc)
-            cap_pc = (uint32_t)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--absent-ff"))
-            absent_ff = 1;
+        else if (!strcmp(argv[i], "--uart-in") && i + 1 < argc)
+            uartin_path = argv[++i];
+        else if (!strcmp(argv[i], "--fb-out") && i + 1 < argc)
+            fb_path = argv[++i];
+        else if (!strcmp(argv[i], "--fb-addr") && i + 1 < argc)
+            fb_addr = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--fb-wh") && i + 1 < argc) {
+            char *xp; fb_w = (uint32_t)strtoul(argv[++i], &xp, 0);
+            if (xp && (*xp == 'x' || *xp == 'X')) fb_h = (uint32_t)strtoul(xp + 1, NULL, 0);
+        }
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
             seed_sp = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--rom-load"))
             rom_load = 1;
+        else if (!strcmp(argv[i], "--skip-panelcfg"))
+            m_skip_panelcfg = 1;
+        else if (!strcmp(argv[i], "--build-panelcfg"))
+            m_build_panelcfg = 1;
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -57,7 +68,9 @@ int main(int argc, char **argv)
     }
     if (!rom_path) {
         fprintf(stderr, "usage: ct952emu <flash.rom> [--instr N] "
-                        "[--uart FILE] [--iolog FILE] [--quiet]\n");
+                        "[--uart FILE] [--iolog FILE] [--quiet]\n"
+                        "       [--fb-out PPM] [--fb-addr ADDR] [--fb-wh WxH]\n"
+                        "       [--uart-in FILE]\n");
         return 2;
     }
 
@@ -79,6 +92,8 @@ int main(int argc, char **argv)
         return 1;
     }
     free(img);
+    m->skip_panelcfg = m_skip_panelcfg;
+    m->build_panelcfg = m_build_panelcfg;
 
     for (i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--quiet"))
@@ -86,6 +101,19 @@ int main(int argc, char **argv)
     if (uart_path) {
         m->uart_file = fopen(uart_path, "wb");
         if (!m->uart_file) { perror(uart_path); return 1; }
+    }
+    if (uartin_path) {
+        FILE *rf = fopen(uartin_path, "rb");
+        if (!rf) { perror(uartin_path); return 1; }
+        {
+            uint8_t buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), rf)) > 0)
+                machine_uart_feed(m, buf, (uint32_t)n);
+        }
+        fclose(rf);
+        fprintf(stderr, "[ct952emu] queued %u UART RX bytes from %s\n",
+                m->rx_len, uartin_path);
     }
 
     if (rom_load) {
@@ -106,16 +134,6 @@ int main(int argc, char **argv)
         machine_seed_boot(m, seed_entry, seed_sp);
         fprintf(stderr, "[ct952emu] seeded boot entry=0x%08x sp=0x%08x\n",
                 seed_entry, seed_sp);
-    }
-
-    m->absent_ff = absent_ff;
-    m->cpu.cap_pc = cap_pc;
-    if (watch_lo) {
-        m->watch_lo = watch_lo;
-        m->watch_hi = watch_lo + 0x40;   /* watch a 64-byte window */
-        m->watch_left = 40;
-        fprintf(stderr, "[ct952emu] watching DRAM writes to [0x%08x,0x%08x)\n",
-                m->watch_lo, m->watch_hi);
     }
 
     fprintf(stderr, "[ct952emu] flash %ld bytes, running %llu instrs\n",
@@ -145,30 +163,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /* window + global registers at the stop -- names table pointers,
-     * loop counters, and the caller (%i7/%o7) at the frontier */
-    {
-        static const char *gname[8] = {"g0","g1","g2","g3","g4","g5","g6","g7"};
-        int r;
-        fprintf(stderr, "[ct952emu] registers at stop:\n");
-        for (r = 0; r < 8; r++)
-            fprintf(stderr, "    %s=%08x  o%d=%08x  l%d=%08x  i%d=%08x\n",
-                    gname[r], m->cpu.g[r],
-                    r, sparc_get_reg(&m->cpu, 8 + r),
-                    r, sparc_get_reg(&m->cpu, 16 + r),
-                    r, sparc_get_reg(&m->cpu, 24 + r));
-    }
-
-    if (m->cpu.cap_done) {
-        int r;
-        fprintf(stderr, "[ct952emu] regs first time PC hit 0x%08x:\n",
-                m->cpu.cap_pc);
-        for (r = 0; r < 8; r++)
-            fprintf(stderr, "    g%d=%08x  o%d=%08x  l%d=%08x  i%d=%08x\n",
-                r, m->cpu.cap[r], r, m->cpu.cap[8+r],
-                r, m->cpu.cap[16+r], r, m->cpu.cap[24+r]);
-    }
-
     /* last 64 PCs executed -- pinpoints the exact hot loop body */
     {
         int k;
@@ -196,6 +190,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "[ct952emu] dumped DRAM (%u bytes) to %s\n",
                     MACH_DRAM_SIZE, dram_path);
         }
+    }
+
+    if (fb_path) {
+        int r = machine_disp_scanout(m, fb_addr, fb_w, fb_h, fb_w, fb_path);
+        if (r < 0)
+            fprintf(stderr, "[ct952emu] fb scanout FAILED\n");
+        else
+            fprintf(stderr, "[ct952emu] wrote %s (%ux%u, OSD %s @ 0x%08x)\n",
+                    fb_path, fb_w, fb_h, r == 0 ? "enabled" : "DISABLED",
+                    fb_addr);
     }
 
     if (m->uart_file) fclose(m->uart_file);

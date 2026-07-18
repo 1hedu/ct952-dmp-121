@@ -624,3 +624,64 @@ BIU bitstream source stay 0). To close the loop:
    YUV 4:2:0 layout (`jfb.h`).
 3. Add a DISP **video-plane** scan-out path (currently only the 8bpp OSD plane
    is composited by `machine_disp_scanout`); composite video + OSD to a PPM.
+
+---
+
+## Update: PROC2 is a second SPARC core (the faithful decode path)
+
+The DP700WD decodes JPEG photos as **microcode on PROC2**, the CT909's second
+SPARC V8 integer unit (`sparc.h`; `SUPPORT_JPEGDEC_ON_PROC2`). Proof it's
+SPARC: `hsystem.c` pokes SPARC opcodes into PROC2's start address
+(`0x91d02000` = `ta 0`, `0x01000000` = `nop`). So the faithful way to render a
+photo is to run the real `jpegdec` microcode on an emulated PROC2 -- which the
+bit-exact `sparc.c` core can do.
+
+### PROC2 boot/reset model (all verified from ctkav_platform.h + hsystem.c)
+
+* Entry / SP live in the AIU GR bank: `GR22` = `0x800007d8`
+  (`PROC2_STARTADR`, = `DS_PROC2_STARTADDR` = `0x40002000`), `GR21` =
+  `0x800007d4` (`PROC2_SP`).
+* Reset control: `REG_PLAT_RESET_CONTROL_ENABLE` (`0x80000324`, bit0
+  `PLAT_RESET_PROC2_ENABLE`) holds PROC2 in reset;
+  `REG_PLAT_RESET_CONTROL_DISABLE` (`0x80000304`, bit0
+  `PLAT_RESET_PROC2_DISABLE`) releases it. Also releasable via the DSU2
+  control (`REG_PLAT_DSU2_CONTROL` `0x98000000`, `PLAT_DSU_CTL_RE`
+  `0x00080000`).
+* PROC1 monitors PROC2's live PC through DSU2 (`REG_PLAT_DSU2_PC`
+  `0x98080010`).
+* This build holds PROC2 in reset for audio (the `NO_PROC2` audio path) and
+  only loads + releases it for JPEG, in `HAL_ReloadAudioDecoder`
+  (`hdecoder.c:700` DSU2 release / `:719` reset-control release).
+
+### Emulator support (behind `CT952_PROC2`)
+
+A second `sparc_t cpu2` shares the bus (DRAM / vdec SRAM `0xb0000000` / JPU);
+`bus2` gives it a no-interrupt view (the decoder microcode polls). Release/halt
+are hooked on the reset-control and DSU2 writes; the stand-in PROC2 acks
+(PLAYMODE / AM mailbox / audio-boot) switch off when the feature is on so the
+real core does the work. Interleaved with PROC1 on the same instruction budget.
+
+### The decode blocker chain (what stands between boot and a rendered photo)
+
+With the stand-in acks off, PROC1 does **not** yet reach the JPEG-on-PROC2
+release -- it stalls earlier in the video-decode datapath:
+
+1. **MCU BIU bitstream-read feed loop** -- polls the read-channel FIFO status
+   `0x80002a28` for `BIU_STATUS_BIURDDRDY` (bit `0x1000`). Never set (the BIU
+   DMA isn't modelled), so it times out and retries forever.
+2. Behind that, the **decoder-state register `0x80000c10`** (bits[20:16] must
+   reach >=7) -- undocumented, almost certainly written by the running
+   decoder / PROC2.
+
+Base-address note (resolved a header ambiguity): the AV blocks use IO base
+`0x80002000` -- BIU `0x80002800`, MCU `0x80002880` (bitstream read channel
+`BCR08..0E` at `+0x1a0..0x1b8` = `0x80002a20..a38`), GPU/JPU `0x80002880` --
+while the platform/LEON blocks use `0x80000000`.
+
+### Next steps
+
+To reach a firmware-decoded photo: model the MCU BIU bitstream-read channel
+(DMA the JPEG bytes from DRAM into the decoder FIFO, report ready) and the
+`0x80000c10` decoder-state, far enough that PROC1 loads the JPEG microcode and
+releases PROC2 -- then the real microcode decodes into the frame buffer and the
+DISP video-plane scan-out (still to add) shows it.

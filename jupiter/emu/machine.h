@@ -95,6 +95,19 @@ typedef struct machine {
     uint64_t proc2_ack_cycle;   /* m->cycles at which to deliver the ack (0=idle) */
     uint32_t proc2_ack_dwell;   /* dwell length in cycles (env CT952_VDEC_DWELL) */
 
+    /* Decoder-STOP visibility window. The boot thread's stop poll (0x61170,
+     * from INITIAL_PowerONStatus / POWERONMENU CC_KeyCommand(KEY_STOP)) reads
+     * the decoder state via getter 0x6f054, which returns the SOFTWARE MIRROR
+     * (0x40039cd0) OR'd with a busy bit when the live reg 0xB0000190 is not in
+     * {0,0x11}. The poll waits for state == MODE_STOP(0x10). The firmware's own
+     * mirror-writer only ever stores STOPPED(0x11) (never 0x10) and, on an
+     * idempotent repeat-stop, the decoder is already stopped -- so with PROC2
+     * in reset nothing ever presents MODE_STOP, and the poll rides out a
+     * ~4.5-billion-instruction stage-1+stage-2 timeout. Model PROC2's behaviour:
+     * for a short window after a stop command, present the mirror read as
+     * MODE_STOP(0x10) so the poll latches it, then let it settle to STOPPED. */
+    uint64_t vdec_stop_until;   /* present mirror as MODE_STOP while cycles < this */
+
     /* uart capture */
     FILE *uart_file;         /* optional capture file (may be NULL) */
     int uart_echo;           /* echo UART bytes to stdout */

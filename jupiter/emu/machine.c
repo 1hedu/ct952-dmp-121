@@ -562,6 +562,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         if (m->skip_panelcfg && addr == 0x4002f770u)
             return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
+        /* Decoder-STOP window: present the state mirror (0x40039cd0, read by
+         * getter 0x6f054) as MODE_STOP(0x10) so the boot stop-poll latches it
+         * before the state settles to STOPPED(0x11). See machine.h. */
+        if (m->cycles < m->vdec_stop_until && addr == 0x40039cd0u)
+            return 0x10u;
         /* EXPERIMENT (CT952_VDEC_IDLE): present the boot thread's decoder-init
          * handshake flags as "decoder idle/ready" so INITIAL_PowerONStatus's
          * chain of MODE_STOP-style waits (0x61170 -> next gate 0x40039f24==1 ...)
@@ -590,6 +595,10 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
          * microcode reaching MODE_STOP(0x10). Tests whether the boot thread's
          * decoder-state poll (flash 0x375a0/0x6f054) is the menu-draw gate. */
         if (addr == 0xB0000190u) {
+            /* During the STOP window, present the live reg as STOPPED(0x11) so
+             * the getter (0x6f054) adds no busy bit and returns the mirror's
+             * MODE_STOP(0x10) cleanly. */
+            if (m->cycles < m->vdec_stop_until) return 0x11u;
             static int fp = -1;
             if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
                           fp = e ? (int)strtoul(e, NULL, 0) : -2; }
@@ -672,29 +681,20 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
      * (delivered after a few status polls, mimicking the microcode latency). */
     if (addr == 0xB0000190u) {
         uint8_t cmd = (uint8_t)val;
-        /* Model a real decoder: a STOP command always transitions through
-         * MODE_STOP(0x10) before settling at STOPPED(0x11). The firmware writes
-         * 0x10 on a fresh stop, but on an *idempotent* repeat-stop (decoder
-         * already stopped) the COMDEC issuer (flash 0x6f2b0..0x6f400) writes
-         * 0x11 directly -- yet the boot thread's decoder-stop poll (0x61170,
-         * from INITIAL_PowerONStatus and POWERONMENU_Initial's
-         * CC_KeyCommand(KEY_STOP)) still waits for the 0x10 window. So when the
-         * ISSUER commands STOPPED(0x11), present MODE_STOP(0x10) now and deliver
-         * the 0x11 ack after the dwell -- giving the poll its 0x10 window on
-         * every stop. PC-gated to the issuer so the decoder dispatcher's own
-         * 0x11 state echoes (flash 0x70xxx) don't re-trigger and oscillate. */
-        if (cmd == 0x11u && m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f400u) {
-            val = 0x10u;                              /* store MODE_STOP now */
-            m->proc2_cmd = 0x11u;                     /* ack -> STOPPED */
-            m->proc2_ack_cycle = m->cycles + m->proc2_ack_dwell;
-        } else {
-            m->proc2_cmd = cmd;
-            /* Arm the dwell when the ack differs from the commanded value
-             * (e.g. STOP 0x10 -> STOPPED 0x11); hold the commanded state for
-             * proc2_ack_dwell cycles so the boot poll can latch it first. */
-            m->proc2_ack_cycle = (proc2_ack_of(cmd) != cmd)
-                                 ? m->cycles + m->proc2_ack_dwell : 0;
-        }
+        m->proc2_cmd = cmd;
+        /* Arm the dwell when the ack differs from the commanded value
+         * (e.g. STOP 0x10 -> STOPPED 0x11); hold the commanded state for
+         * proc2_ack_dwell cycles so the boot poll can latch it first. */
+        m->proc2_ack_cycle = (proc2_ack_of(cmd) != cmd)
+                             ? m->cycles + m->proc2_ack_dwell : 0;
+        /* A STOP command from the COMDEC issuer (flash 0x6f2b0..0x6f400) --
+         * whether a fresh stop (writes MODE_STOP 0x10) or an idempotent
+         * repeat-stop (writes STOPPED 0x11 directly) -- opens the MODE_STOP
+         * visibility window so the boot poll (which reads the mirror via
+         * 0x6f054) latches 0x10 before the state settles to 0x11. */
+        if ((cmd == 0x10u || cmd == 0x11u) &&
+            m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f400u)
+            m->vdec_stop_until = m->cycles + m->proc2_ack_dwell;
     }
 
     /* Trace who writes the vdec playmode + its software mirrors (the state the

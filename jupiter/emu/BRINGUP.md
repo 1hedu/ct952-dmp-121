@@ -8,6 +8,27 @@ This is honest, iterative hardware bring-up. Each entry records what
 works, what's blocked, and exactly what the next step is — the
 emulator's own I/O-access inventory is the worklist generator.
 
+## IT RENDERS: the firmware draws "Loading ." on screen
+
+With the real boot running (below), the firmware's application draws its UI
+through the **CT952 2-D GPU engine** (`0x80002880`, `gdi.c` programming) --
+overwhelmingly the **1-bit font** path (133k+ font ops, ~0 fills). The
+emulator now models that engine (`gpu_exec` in `machine.c`): on a
+`REG_GPU_CTL0` write with `GPU_START` it executes the op and clears the
+busy bit. FillRectangle fills the 8bpp OSD plane; the font op expands each
+queued glyph (indices written to `REG_GPU_FONT_RAM_INDEX`) from the DRAM
+glyph table (`FONT_ADDR`, 64-byte 1-bit glyphs, MSB-first) into the plane
+with the `COL_NDX` foreground/background indices, advancing per glyph.
+
+Result: `make bootreal` boots `dp700wd.bin` from reset and the OSD plane at
+`0x4005f000` (480-wide, the DP700WD panel) shows the firmware's real boot
+message -- **"Loading ."** -- rendered pixel-for-pixel by the device's own
+font engine. `--fb-out` snapshots it (rendering the plane even before the
+firmware flips the OSD-enable bit; a fallback index ramp keeps it legible
+if the OSD palette RAM isn't loaded yet). The full arc is closed: correct
+chip ID -> firmware self-boots -> eCos app runs -> 2-D engine draws -> we
+read the screen.
+
 ## BREAKTHROUGH: the real first-stage boot runs (correct chip ID)
 
 The whole "config-arena / rom_load" saga had one root cause: **the emulated

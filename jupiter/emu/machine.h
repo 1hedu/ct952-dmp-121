@@ -69,6 +69,11 @@ typedef struct machine {
      * list would have run before the apply callback. */
     int build_panelcfg, panelcfg_built;
 
+    /* GPU 2-D engine op accounting + font-index queue */
+    uint64_t gpu_ops, gpu_font_ops, gpu_mode_ops[8];
+    uint16_t gpu_fontq[1024];
+    int gpu_fontn;
+
     /* io access inventory */
     mach_logent_t log[MACH_LOG_MAX];
     int log_n;

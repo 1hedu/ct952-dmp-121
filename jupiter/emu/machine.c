@@ -136,9 +136,112 @@ static uint32_t io_read(machine_t *m, uint32_t off)
     }
 }
 
+/* ---- GPU 2-D engine (ctkav_gpu.h offsets; programming per gdi.c) ---- */
+#define R_GPU_CTL0     0x2880
+#define R_GPU_CTL1     0x2884
+#define R_GPU_COL_NDX  0x2888
+#define R_GPU_OP_SIZE  0x288C
+#define R_GPU_AG_OFF   0x2890
+#define R_GPU_SRC_ADDR 0x2894
+#define R_GPU_DEST     0x2898
+#define R_GPU_FONT_ADR 0x289C
+#define R_GPU_FONT_CFG 0x28A0
+#define R_GPU_FONT_IDX 0x28A8
+#define GPU_START_BIT  0x2u
+#define GPU_STATUS_BIT 0x200u        /* CTL0[9] busy */
+#define GPU_FONT_1BIT  0x20u         /* CTL0[5] */
+
+static uint8_t *dram_rw(machine_t *m, uint32_t addr, uint32_t span)
+{
+    uint32_t off;
+    if (addr < 0x40000000u) return NULL;
+    off = addr - 0x40000000u;
+    if ((uint64_t)off + span > MACH_DRAM_SIZE) return NULL;
+    return m->dram + off;
+}
+
+/* Execute one GPU op triggered by a CTL0 write with GPU_START. Fill and
+ * 1-bit font expansion into the 8bpp OSD plane; the firmware's UI drawing
+ * (gdi.c) programs these. Row stride comes from AG_OFF (CT909P encoding:
+ * ((ag_width<<8)+ag_offset)<<16, both in 8-byte units, so bytes/row =
+ * (ag_width+ag_offset-1)*8). */
+static void gpu_exec(machine_t *m, uint32_t ctl0)
+{
+    uint32_t sz = io_get(m, R_GPU_OP_SIZE);
+    uint32_t w = sz & 0xFFFF, h = (sz >> 16) & 0x7FF;
+    uint32_t ag = io_get(m, R_GPU_AG_OFF) >> 16;
+    uint32_t agw = (ag >> 8) & 0xFF, ago = ag & 0xFF;
+    uint32_t stride = (agw + ago > 1) ? (agw + ago - 1) * 8u : 616u;
+    uint32_t dest = io_get(m, R_GPU_DEST);
+    uint32_t opmode = (ctl0 >> 2) & 0x7;
+
+    m->gpu_ops++;
+    if (ctl0 & GPU_FONT_1BIT) m->gpu_font_ops++; else m->gpu_mode_ops[opmode]++;
+
+    if (ctl0 & GPU_FONT_1BIT) {
+        /* 1-bit font expansion into the 8bpp OSD plane. Glyph table at
+         * FONT_ADDR, each glyph = capacity DWs (glyph_DW*4 bytes/row,
+         * MSB-first 1-bit rows). FONT_CONFIG = width_DW<<24 | len<<16 |
+         * capacity. COL_NDX low byte = fg index, next byte = bg. Height
+         * from OP_SIZE[26:16]; glyph advance = glyph_DW*8 pixels. */
+        uint32_t cfg = io_get(m, R_GPU_FONT_CFG);
+        uint32_t fbase = io_get(m, R_GPU_FONT_ADR);
+        uint32_t wdw = (cfg >> 24) & 0xFF; if (!wdw) wdw = 1;
+        uint32_t cap = cfg & 0xFFF;       /* DW per glyph */
+        uint32_t gh = h ? h : (cap / wdw);   /* glyph height in rows */
+        uint32_t adv = wdw * 8;              /* pixel advance per glyph */
+        uint8_t fg = io_get(m, R_GPU_COL_NDX) & 0xFF;
+        uint8_t bg = (io_get(m, R_GPU_COL_NDX) >> 8) & 0xFF;
+        uint32_t xoff = 0;
+        int gi;
+        if (!gh) gh = 16;
+        for (gi = 0; gi < m->gpu_fontn; gi++) {
+            uint32_t gnum = m->gpu_fontq[gi] & 0x1FF;
+            uint32_t gaddr = fbase + gnum * cap * 4u;
+            const uint8_t *gp = dram_rw(m, gaddr, cap * 4u);
+            uint32_t row, col;
+            if (!gp) { xoff += adv; continue; }
+            for (row = 0; row < gh; row++) {
+                for (col = 0; col < adv; col++) {
+                    uint32_t bytei = (col >> 3);
+                    uint8_t rb = gp[row * wdw * 4u + bytei];
+                    uint8_t bit = (rb >> (7 - (col & 7))) & 1;
+                    uint32_t px = dest + row * stride + xoff + col;
+                    uint8_t *d = dram_rw(m, px, 1);
+                    if (d) *d = bit ? fg : bg;
+                }
+            }
+            xoff += adv;
+        }
+        m->gpu_fontn = 0;
+        return;
+    }
+
+    if (opmode == 6 && !(ctl0 & GPU_FONT_1BIT)) {   /* GPU_FILLRECTANGLE */
+        uint8_t color = (io_get(m, R_GPU_CTL1) >> 24) & 0xFF;
+        uint8_t *fb;
+        uint32_t r, c;
+        if (!w || !h) return;
+        fb = dram_rw(m, dest, (h - 1) * stride + w);
+        if (!fb) return;
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++)
+                fb[r * stride + c] = color;
+    }
+    m->gpu_fontn = 0;   /* consume the font-index queue */
+}
+
 static void io_write(machine_t *m, uint32_t off, uint32_t v)
 {
     switch (off) {
+    case R_GPU_CTL0:
+        if (v & GPU_START_BIT) gpu_exec(m, v);
+        io_set(m, off, v & ~GPU_STATUS_BIT);   /* op completes: clear busy */
+        return;
+    case R_GPU_FONT_IDX:
+        if (m->gpu_fontn < 1024) m->gpu_fontq[m->gpu_fontn++] = (uint16_t)v;
+        io_set(m, off, v);
+        return;
     case R_UART1_DATA: uart_tx(m, 1, v); return;
     case R_UART2_DATA: uart_tx(m, 2, v); return;
     case R_DSU_UART_DATA: uart_tx(m, 3, v); return;
@@ -624,8 +727,20 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     uint32_t x, y;
     int osd_en, i;
 
-    for (i = 0; i < 256; i++)
-        pal[i] = disp_yuv_to_rgb(io_get(m, R_DISP_GAM_OSD + (uint32_t)i * 4));
+    {
+        int loaded = 0;
+        for (i = 0; i < 256; i++) {
+            pal[i] = disp_yuv_to_rgb(io_get(m, R_DISP_GAM_OSD + (uint32_t)i * 4));
+            if (i && pal[i]) loaded = 1;
+        }
+        /* if the firmware hasn't loaded the OSD palette RAM yet, fall back
+         * to a visible per-index ramp so drawn content stays legible */
+        if (!loaded)
+            for (i = 0; i < 256; i++) {
+                uint32_t gr = i ? (uint32_t)((i * 40 + 40) & 0xFF) : 0u;
+                pal[i] = (gr << 16) | (gr << 8) | gr;
+            }
+    }
 
     osd_en = (io_get(m, R_DISP_OSD_SIZE) & DISP_OSD_EN) != 0;
 
@@ -638,9 +753,12 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     f = fopen(ppm_path, "wb");
     if (!f) return -1;
     fprintf(f, "P6\n%u %u\n255\n", w, h);
+    /* render the OSD plane content regardless of the hardware enable bit
+     * (the firmware draws before flipping enable); enable state is still
+     * reported via the return value */
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++) {
-            uint32_t c = osd_en ? pal[fb[(uint64_t)y * stride + x]] : 0u;
+            uint32_t c = pal[fb[(uint64_t)y * stride + x]];
             fputc((int)((c >> 16) & 0xFF), f);
             fputc((int)((c >> 8) & 0xFF), f);
             fputc((int)(c & 0xFF), f);

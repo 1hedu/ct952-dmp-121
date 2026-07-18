@@ -9,34 +9,63 @@
 #include <stddef.h>
 #include <stdio.h>
 
-/* Functional hardware-JPEG decode: pull the JPEG the firmware staged in DRAM
- * (jpeg_src), decode it in-host, and write it out as a PPM. Models the CT952
- * DMA/VLD/JPU decoder block, whose progress the firmware polls at 0x80000c10.
- * Runs once; sets jpeg_done so the poll reports the decode complete. */
-static void machine_do_jpeg_decode(machine_t *m)
+/* Cheap signature of the staged bitstream (a few sampled bytes) so we only
+ * re-decode when the firmware has staged a *different* JPEG. */
+static uint32_t jpeg_stage_sig(const uint8_t *p, uint32_t avail)
+{
+    static const uint32_t off[] = { 0, 3, 0x50, 0x200, 0x800, 0x2000, 0x8000 };
+    uint32_t s = 0x811c9dc5u;
+    unsigned i;
+    for (i = 0; i < sizeof(off) / sizeof(off[0]); i++)
+        if (off[i] < avail) s = (s ^ p[off[i]]) * 16777619u;
+    return s;
+}
+
+/* Functional hardware-JPEG decode: the CT952 decodes photos/logos in a
+ * DMA/VLD/JPU block we don't model gate-for-gate; the firmware stages the JPEG
+ * bitstream in the MM video buffer (DS_VDBUF_ST_MM = 0x401dc000) and polls the
+ * decoder's progress word at 0x80000c10. When armed, we decode whatever JPEG is
+ * currently staged, keep the raster for the scan-out video-plane composite, and
+ * report the decoder done. Re-arms whenever a *new* bitstream is staged, so the
+ * firmware's logo and every slideshow frame each decode in turn. */
+static void machine_maybe_jpeg_decode(machine_t *m)
 {
     uint8_t *src, *rgb = NULL;
-    uint32_t avail;
+    uint32_t avail, sig;
     int w = 0, h = 0;
-    FILE *f;
 
-    m->jpeg_done = 1;                 /* one-shot regardless of outcome */
+    m->jpeg_done = 1;                 /* decoder reports ready once armed */
     if (m->jpeg_src < 0x40000000u ||
         m->jpeg_src >= 0x40000000u + MACH_DRAM_SIZE)
         return;
     src = m->dram + (m->jpeg_src - 0x40000000u);
     avail = (0x40000000u + MACH_DRAM_SIZE) - m->jpeg_src;
-    if (src[0] != 0xFF || src[1] != 0xD8)   /* need a JPEG SOI */
+    if (src[0] != 0xFF || src[1] != 0xD8)   /* need a JPEG SOI staged */
+        return;
+    sig = jpeg_stage_sig(src, avail);
+    if (sig == m->jpeg_sig)           /* same frame as last time -> done */
         return;
     if (emu_jpeg_decode(src, avail, &rgb, &w, &h) != 0)
         return;
-    if (m->jpeg_out && (f = fopen(m->jpeg_out, "wb"))) {
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        fwrite(rgb, 1, (size_t)w * h * 3, f);
-        fclose(f);
-        fprintf(stderr, "[ct952emu] JPEG decode: %dx%d from 0x%08x -> %s\n",
-                w, h, m->jpeg_src, m->jpeg_out);
+    m->jpeg_sig = sig;
+    m->jpeg_count++;
+    if (m->jpeg_out) {
+        /* first frame -> jpeg_out as given; later frames -> name.NN.ppm */
+        char path[512];
+        FILE *f;
+        if (m->jpeg_count == 1)
+            snprintf(path, sizeof(path), "%s", m->jpeg_out);
+        else
+            snprintf(path, sizeof(path), "%s.%02d.ppm", m->jpeg_out,
+                     m->jpeg_count);
+        if ((f = fopen(path, "wb"))) {
+            fprintf(f, "P6\n%d %d\n255\n", w, h);
+            fwrite(rgb, 1, (size_t)w * h * 3, f);
+            fclose(f);
+        }
     }
+    fprintf(stderr, "[ct952emu] JPEG decode #%d: %dx%d from 0x%08x\n",
+            m->jpeg_count, w, h, m->jpeg_src);
     /* keep the raster for the scan-out video-plane composite */
     free(m->jpeg_rgb);
     m->jpeg_rgb = rgb;
@@ -186,10 +215,10 @@ static uint32_t io_read(machine_t *m, uint32_t off)
          * 0x72810) polls bits[20:16] for >=7. This is driven by the hardware
          * JPEG decoder consuming the staged bitstream; with the functional
          * decode armed, run it here (once) and then report >=7 (done). */
-        if (m->jpeg_decode_en && !m->jpeg_done)
-            machine_do_jpeg_decode(m);
-        if (m->jpeg_done)
+        if (m->jpeg_decode_en) {
+            machine_maybe_jpeg_decode(m);
             return (io_get(m, 0xc10) & ~0x001f0000u) | 0x00070000u;
+        }
         log_access(m, 0x80000c10u, 0, 0);
         return io_get(m, 0xc10);
     default:
@@ -680,6 +709,8 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     m->jpeg_out = NULL;
     m->jpeg_rgb = NULL;
     m->jpeg_w = m->jpeg_h = 0;
+    m->jpeg_sig = 0;
+    m->jpeg_count = 0;
     sparc_reset(&m->cpu2, &m->bus2);
     m->cpu2.halted = 1;      /* idle until PROC1 releases it */
     return 0;

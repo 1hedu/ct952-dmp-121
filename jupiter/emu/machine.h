@@ -74,6 +74,8 @@ typedef struct machine {
      * video plane under the OSD (the panel = photo on video + UI on OSD) */
     uint8_t *jpeg_rgb;
     int jpeg_w, jpeg_h;
+    uint32_t jpeg_sig;      /* signature of the last-decoded staged bitstream */
+    int jpeg_count;         /* number of distinct frames decoded */
 
     /* PROC2 vdec stand-in: PROC1 writes a VDEC command to REG_SRAM_PLAYMODE
      * (0xb0000190); the real decoder microcode acks by overwriting it with a

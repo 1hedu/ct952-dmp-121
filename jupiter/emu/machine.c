@@ -133,6 +133,14 @@ static void machine_maybe_jpeg_decode(machine_t *m)
 #define TIMER_RELOAD   2u
 #define TIMER_LOAD     4u
 
+/* VLD entropy-decoder status (ctkav_vdec.h): the JPEG decoder thread polls
+ * these for per-picture completion. Reported done so HALJPEG_Decode's thread
+ * finishes (the real pixels come from the functional decode). */
+#define R_VLD_STATUS   0x2208        /* VLD_MB_RDY = bit26 (0x4000000) */
+#define R_VLD_MBINT    0x21C0        /* HDR/RL/MC done + JPEG_ST bits */
+#define VLD_MB_RDY     0x4000000u
+#define VLD_DONE_BITS  0x80Bu        /* JPEG_ST|MC_DONE|RL_DONE|HDR_DONE */
+
 #define UART_STAT_READY 0x6u   /* TX shift + holding empty, no RX data */
 #define UART_STAT_DATA_READY 0x1u   /* RX byte available (ctkav_platform.h) */
 
@@ -210,6 +218,14 @@ static uint32_t io_read(machine_t *m, uint32_t off)
     case R_IIC_CMD:
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
+    case R_VLD_STATUS:
+        /* VLD entropy decode: report macroblock-ready so the JPEG decoder
+         * thread's completion poll advances (the real pixels come from the
+         * functional decode). */
+        return io_get(m, R_VLD_STATUS) | VLD_MB_RDY;
+    case R_VLD_MBINT:
+        /* per-stage done bits (header/run-length/motion-comp/JPEG) */
+        return io_get(m, R_VLD_MBINT) | VLD_DONE_BITS;
     case 0xc10:
         /* Decoder progress/state word. The firmware's wait loop (flash
          * 0x72810) polls bits[20:16] for >=7. This is driven by the hardware
@@ -241,6 +257,12 @@ static uint32_t io_read(machine_t *m, uint32_t off)
 #define GPU_START_BIT  0x2u
 #define GPU_STATUS_BIT 0x200u        /* CTL0[9] busy */
 #define GPU_FONT_1BIT  0x20u         /* CTL0[5] */
+/* The 0x2880 block is shared JPU/GPU (ctkav_jpu.h): JPU_GPU_OP (CTL[28])
+ * selects which register set is live. JPU ops signal completion by clearing
+ * JPU_BUSY (CTL[0]); the JPEG decoder thread spins on `while (CTRL & 1)`. */
+#define JPU_GPU_OP     0x10000000u   /* CTL[28]: 1=GPU op, 0=JPU op */
+#define JPU_GO_BIT     0x2u          /* CTL[1] */
+#define JPU_BUSY_BIT   0x1u          /* CTL[0] */
 
 static uint8_t *dram_rw(machine_t *m, uint32_t addr, uint32_t span)
 {
@@ -326,8 +348,16 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
 {
     switch (off) {
     case R_GPU_CTL0:
-        if (v & GPU_START_BIT) gpu_exec(m, v);
-        io_set(m, off, v & ~GPU_STATUS_BIT);   /* op completes: clear busy */
+        if (v & JPU_GPU_OP) {
+            /* GPU 2-D op (font/fill): run it, clear the GPU busy bit (CTL[9]) */
+            if (v & GPU_START_BIT) gpu_exec(m, v);
+            io_set(m, off, v & ~GPU_STATUS_BIT);
+        } else {
+            /* JPU op (scale/decode/fill): the actual pixels are produced by the
+             * functional JPEG decode; here just complete the handshake so the
+             * decoder thread's `while (REG_JPU_CTRL & 1)` exits. */
+            io_set(m, off, v & ~JPU_BUSY_BIT);
+        }
         return;
     case R_GPU_FONT_IDX:
         if (m->gpu_fontn < 1024) m->gpu_fontq[m->gpu_fontn++] = (uint16_t)v;

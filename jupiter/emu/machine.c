@@ -455,8 +455,17 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
     /* DSU2 block (0x98000000): PROC1 reads PROC2's live PC here to monitor
      * it (REG_PLAT_DSU2_PC = 0x98080010). Back the PC/nPC; rest reads 0. */
     if (addr >= 0x98000000u && addr < 0x98100000u) {
-        if (addr == 0x98080010u) return m->cpu2.pc;
-        if (addr == 0x98080014u) return m->cpu2.npc;
+        /* REG_PLAT_DSU2_PC/NPC: PROC1's monitor reads PROC2's live PC and
+         * resets PROC2 if it looks hung / out of the firmware DRAM range.
+         * When the real core isn't running, report an advancing PC inside
+         * PROC2's code range (DS_PROC2_STARTADDR 0x40002000 .. SP 0x4001cf00)
+         * so the monitor sees the audio DSP as alive and stops resetting it. */
+        if (addr == 0x98080010u)
+            return m->proc2_on ? m->cpu2.pc
+                   : 0x40002000u + (uint32_t)((m->cycles >> 4) & 0x3FFFu) * 4u;
+        if (addr == 0x98080014u)
+            return m->proc2_on ? m->cpu2.npc
+                   : 0x40002000u + (uint32_t)((m->cycles >> 4) & 0x3FFFu) * 4u + 4u;
         return 0;
     }
 

@@ -393,7 +393,7 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
          * PROC2 acks by clearing [31:30] (hdecoder.c:1718-1727).
          * Stand-in DSP: ack immediately; reads return 0 via PARAM2.
          * Skipped once the real PROC2 core is running (it acks for real). */
-        if (!m->proc2_enable) {
+        if (!m->proc2_on) {
             if ((v >> 30) == 2)
                 io_set(m, R_PARAM2, 0);
             io_set(m, R_PARAM1, v & 0x3FFFFFFFu);
@@ -406,7 +406,7 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
          * right 16; it breaks when [31:16] == 0 (hdecoder.c:724-737).
          * PROC2 signals "audio boot OK" by clearing the high half. The
          * stand-in acks instantly; the real PROC2 core does it itself. */
-        io_set(m, R_AUDIO_CMD, m->proc2_enable ? v : (v & 0xFFFFu));
+        io_set(m, R_AUDIO_CMD, m->proc2_on ? v : (v & 0xFFFFu));
         return;
     default:
         log_access(m, 0x80000000u + off, 1, v);
@@ -462,7 +462,7 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
 
     /* PROC2 vdec stand-in: deliver the command ack after a read latency.
      * Skipped once the real PROC2 core is running -- it drives PLAYMODE. */
-    if (!m->proc2_enable && addr == 0xB0000190u &&
+    if (!m->proc2_on && addr == 0xB0000190u &&
         m->proc2_ack_countdown > 0 && --m->proc2_ack_countdown == 0)
         m->bram[0x190] = proc2_ack_of(m->proc2_cmd);
 

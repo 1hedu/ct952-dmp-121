@@ -841,3 +841,72 @@ step 2+3 together: advance the read pointer to EOI *and* write the tiled-YUV
 result), not merely answer the status poll. The poll helper, its register table
 (indexed by the channel byte at `base+0x2d3`), and the `0x4001fe90` address are
 the concrete hooks for that work.
+
+### 10.9 CORRECTION — the logo JPEG decode is never kicked; the stall is upstream
+
+A follow-up iolog+DRAM audit of a plain boot **overturns the framing of §10.8**:
+the heavy `0x80002a28` poll (337 926×) is **NOT** the logo JPEG. During a whole
+boot the actual JPEG-hardware kick registers are **never written**:
+
+* `REG_MCU_BCR08` (0x80002a20, read-channel *base* = the bitstream address) —
+  **never written**.
+* `REG_JPU_CTRL` / `JPU_GO` (0x80002880) — **0 writes** (2 reads only): no JPU
+  scale/decode is ever kicked.
+* `REG_DISP_F0Y_ADDR` (0x80001AC0) — **never written**; `DISP_VIDEO_EN` and
+  `DISP_OSD_EN` never set.
+
+So the `0x80002a28`/`0x4001fe90` poll is the **vdec/decoder-command thread's own
+generic indexed-register work** (a reusable "poll `reg[table[idx]] & mask`"
+helper — *not* JPEG-specific), and attributing it to the logo decode was the
+same PC/register-sample over-read as the earlier `0x375a0` mistake. The logo
+bitstream *is* staged (`0x401DC000` = `DS_VDBUF_ST_MM`, bytes `FF D8 FF E0…JFIF`,
+which is why `make logo` can decode it), but **the firmware never reaches the
+point of handing it to the JPEG hardware**. The stall is **upstream** — in the
+`UTL_ShowLogo` / `POWERONMENU_Initial` display-bring-up (`display.a` /
+decoder-command completion handshake), *before* any JPEG kick. That, not the
+JPEG datapath, is the true remaining blocker to locate.
+
+**Implication:** modeling the JPEG datapath now would be dead code (its trigger
+never fires). Priority order is (1) find/clear the upstream logo-display stall so
+the firmware *itself* kicks the decode, then (2) apply the JPEG datapath model
+below so the kicked decode produces real pixels.
+
+### 10.10 JPEG datapath implementation spec (ready to apply once §10.9 is cleared)
+
+Full evidence-backed recipe for when the firmware does kick the decode:
+
+* **Kick (canonical):** `io_write` to `REG_MCU_BCR08` (0x80002a20) with a value
+  `V ≥ 0x40000000` where `DRAM[V]==0xFF, DRAM[V+1]==0xD8` → decode source `B=V`.
+  (`ctkav_mcu.h:84,445`; §8.5.) Reachable-today substitute: read of `0x80000C10`
+  with `jpeg_decode_en`, `B = 0x401DC000` (already in `machine.c`).
+* **Run pixels on the JPU scale kick:** `io_write` to `REG_JPU_CTRL` (0x80002880)
+  with `JPU_GO`(0x2), op bits[6:4]=`001` (`JPU_SC_OP`), bit28(`JPU_GPU_OP`)=0 —
+  the bit the existing `JPU_BUSY`-clear model already watches (`machine.c`).
+* **Output buffer (single-buffered, page 0, full-screen 720×448):**
+  Y → **`0x40065000`** (`DS_FRAMEBUF_ST_SLIDESHOW`, `haljpeg.c:95`,
+  `dvd_dram_16m.h:103`), C → **`0x400B3C00`** (= Y + `dwYMax(0x9D80)*8` =
+  Y + `0x4EC00` = Y + 720×448). Not double-buffered (F0=F1=F3). Robust: the
+  scan-out should read `Y=REG_DISP_F0Y_ADDR*8+0x40000000`,
+  `C=REG_DISP_F0C_ADDR*8+0x40000000` (`gdi.c:3576`).
+* **Tiling (verified `gdi.c:3548–3568`, 909P branch), strip=`0x2D00` always
+  (buffer is always 720-wide):**
+  - Y:  `off = (y>>4)*0x2D00 + (x>>2)*64 + (y&15)*4 + (x&3)`
+  - C (cx=x/2, cy=y/2): `off = (cy>>4)*0x2D00 + (cx>>3)*256 + ((cx&7)>>2)*64 +
+    (cy&15)*4 + (cx&3)`, **U at `off`, V at `off+128`** (semi-planar).
+* **Present-as-done so the firmware flips the plane itself:** BIU read-channel
+  polls (`0x80002a28/2a30/2a34`) ready (≥`BIU_STATUS_BIURDDRDY 0x1000`; the
+  `CT952_JPEG_DMA` hook returns `0xFFFFFFFF`), `0x80000C10` bits[20:16]≥7, VLD
+  `0x80002208`|`VLD_MB_RDY`, `0x800021C0`|`0x80B` (VLD/JPU/gate already modeled).
+  → `JPEG_Status(JPEG_DECODE)` reaches `JPEG_STATUS_OK(1)`, `UTL_ShowJPEG_Slide`
+  (`utl.c:435`) breaks its 5 s poll and calls `HALJPEG_Display` → `DISP_Display`
+  sets `F0Y=0x40065000/8`, `F0C=0x400B3C00/8`, `STRIPE 0x1A0C`, and
+  `DISP_VIDEO_EN 0x10000000` in `0x80001A4C` (`haljpeg.c:954`).
+* **Scan-out change:** `machine_disp_scanout` must **de-tile** from
+  `F0Y*8`/`F0C*8` (inverse of the above) and composite under the OSD plane
+  (`0x4005F000`, palette index 0 = transparent) once `DISP_VIDEO_EN` is set —
+  the current scanout shortcuts by blitting `m->jpeg_rgb`, not the tiled buffer.
+
+`JPEG_Status` itself is a precompiled **thread variable** (`haljpeg.c:834`), not
+a register — it cannot be poked; the worker must be *allowed to finish* via the
+polls above. This spec is byte-exact against `jupiter/jfb.c` (which already
+implements the same tiling) and the §10.2 formulas.

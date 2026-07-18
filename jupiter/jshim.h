@@ -81,6 +81,12 @@ int16_t *jsnd_scratch(uint32_t *max_samples);
  * polled controllers, buttons arrive as press events. */
 uint32_t jinp_map_key(uint8_t key);
 
+/* Map a USB HID keyboard usage ID (page 0x07, e.g. JHID_USAGE_UP) to a
+ * JBTN_* mask (0 if unmapped). Lets a USB keyboard drive the SDK through
+ * the same button model as the IR remote: the (future) USB key task runs
+ * jhid_kbd_feed() and routes each key-down usage through here. */
+uint32_t jinp_map_hid(uint8_t usage);
+
 /* ---- Time ---- */
 
 /* Milliseconds since boot (from OS_GetSysTimer, ~2 ms granularity). */

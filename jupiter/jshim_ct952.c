@@ -39,6 +39,7 @@ extern void OSD_SetRegion(BYTE bRegion, BYTE bClearRegion,
                           GDI_REGION_INFO *RegionInfo);
 
 #include "jshim.h"
+#include "jusbhid.h"   /* JHID_USAGE_* for jinp_map_hid */
 #include "jrgb2yuv.h"
 
 /* ---- Video ---- */
@@ -152,6 +153,26 @@ uint32_t jinp_map_key(uint8_t key)
     case KEY_PAUSE:     return JBTN_START;
     case KEY_MENU:      return JBTN_SELECT;
     default:            return 0;
+    }
+}
+
+uint32_t jinp_map_hid(uint8_t usage)
+{
+    /* USB keyboard -> the same button model as the IR remote. Arrows are
+     * the d-pad; Enter/Space act, Esc/Backspace cancel, Tab/Return select.
+     * The (future) USB key task feeds reports to jhid_kbd_feed() and calls
+     * this on each key-down usage. */
+    switch (usage) {
+    case JHID_USAGE_UP:        return JBTN_UP;
+    case JHID_USAGE_DOWN:      return JBTN_DOWN;
+    case JHID_USAGE_LEFT:      return JBTN_LEFT;
+    case JHID_USAGE_RIGHT:     return JBTN_RIGHT;
+    case JHID_USAGE_ENTER:
+    case JHID_USAGE_SPACE:     return JBTN_A;
+    case JHID_USAGE_ESC:
+    case JHID_USAGE_BACKSPACE: return JBTN_B;
+    case JHID_USAGE_TAB:       return JBTN_SELECT;
+    default:                   return 0;
     }
 }
 

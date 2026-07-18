@@ -6,6 +6,7 @@ anim_run
 ct952emu
 demo_run
 dram.bin
+jgpu_check
 probe_unzip
 romv_out.bin
 test_sparc

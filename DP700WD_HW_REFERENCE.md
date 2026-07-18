@@ -764,3 +764,64 @@ target for a natural on-panel image.
 map to `dp700wd.bin`** (that address is mid-function in the DP700WD image).
 Useful for names/source cross-ref only; addresses must come from `dp700wd.bin`
 directly.
+
+### 10.8 The JPEG decode handshake — register-exact gap (the display target)
+
+Cross-referencing a source trace with the emulator's live I/O log pinned the
+*exact* hardware the firmware's JPEG worker thread waits on. This build compiles
+**hardware** JPEG decode (not PROC2 microcode): `SUPPORT_JPEGDEC_ON_PROC2` is
+defined only for `CT909R` (`Winav.h:1074`), and this image is `CT909P`
+(`platform.h:27`). So `JPEG_Decode()` (precompiled module) posts to a PROC1
+worker thread that programs the JPU/VLD/MCU-BIU blocks, feeds the bitstream, and
+the caller polls `HALJPEG_Status(HALJPEG_DECODE)==JPEG_STATUS_OK(1)` with a 5 s
+timeout (`utl.c:429`, `UTL_ShowJPEG_Slide`). No OK → `HALJPEG_Display` (which
+sets `DISP_VIDEO_EN`) is never called.
+
+`JPEG_Status` is a **thread-updated software variable**, not a register — so it
+can't be poked; the worker must be *allowed to finish* by satisfying every
+hardware poll it makes. The emulator already answers the VLD and JPU polls:
+
+| poll | addr | value | emu |
+|------|------|-------|-----|
+| VLD entropy done | `0x80002208` `REG_VLD_STATUS` | `VLD_MB_RDY 0x04000000` | ✓ modeled |
+| VLD per-stage | `0x800021C0` `REG_VLD_MBINT` | `0x80B` | ✓ modeled |
+| JPU scale done | `0x80002880` `REG_JPU_CTRL` | `JPU_BUSY 0x1` clears on `JPU_GO` | ✓ modeled |
+| decode progress | `0x80000C10` | bits[20:16] ≥ 7 | ✓ but **opt-in only** (`jpeg_decode_en`, CLI) |
+
+**The unmodeled gap — the BIU bit-stream read channel (MCU block).** Live I/O
+log of a plain boot shows the worker **spinning on the MCU BIU read-channel**:
+`0x80002a28` read **337 926×** (returns 0), `0x80002a34` read 6615×,
+`0x80002a24` written `0x05`. Via the §8.3 effective-base-`0x2000` gotcha these
+are `REG_MCU_BASE`(eff `0x80002880`) + `0x1a0..0x1b4`:
+
+| addr | reg | role |
+|------|-----|------|
+| `0x80002a20` | `REG_MCU_BCR08` | BIU bit-stream read-channel **base address** (points at the staged JPEG in DRAM) |
+| `0x80002a24` | `REG_MCU_BCR09` | read-channel **current read address** |
+| `0x80002a28` | `REG_MCU_BCR0A` | read-channel x/y increment — **polled 337 K×** |
+| `0x80002a30` | `REG_MCU_BCR0C` | read-channel **FIFO status** |
+| `0x80002a34` | `REG_MCU_BCR0D` | `[31:30] bsrdtype, [23:16] bsrdheight` — polled 6615× |
+
+The worker sets up this DMA channel to stream the JPEG bitstream from DRAM into
+the BIU/VLD, then polls it for the stream to drain / the read pointer to
+advance. **The emulator never advances the channel**, so the poll (the
+`JPEG_WAIT_VDREM_TIMEDOUT_COUNT = COUNT_3_SEC` "VDRemainder" wait, `jpegdec.h:31`)
+times out and `JPEG_Status` stays `UNFINISH(2)`.
+
+**Concrete plan for a natural on-panel image** (next implementation):
+1. **Auto-arm** the `0x80000C10` progress gate during boot (not just under
+   `--decode-jpeg`), keyed off the worker actually kicking a decode.
+2. **Model the BIU read-channel drain**: when the worker programs `BCR08`
+   (base = staged JPEG in DRAM) and kicks decode, advance `BCR09` (read addr) to
+   the end and present `BCR0A`/`BCR0C`/`BCR0D` as "drained/ready", so the
+   VDRemainder wait completes.
+3. **Produce the output the DISP scan-out reads**: functionally decode the
+   staged JPEG (already have picojpeg) and write it as **macroblock-tiled YUV
+   4:2:0** into the firmware's video frame buffer (Y `0x40065000`, C
+   `0x400B3C00`, §10.2) — so when `HALJPEG_Display` flips `DISP_VIDEO_EN`, the
+   panel shows the real image, produced through the firmware's own pipeline.
+
+Steps 1–2 unblock `HALJPEG_Decode → JPEG_STATUS_OK → HALJPEG_Display`; step 3 is
+what makes the displayed pixels the actual photo rather than frame-buffer
+garbage. This is the through-line to the user's goal: the firmware's own
+slideshow drawing the built-in butterfly, on the panel, naturally.

@@ -504,9 +504,17 @@ staged to DRAM then jumped: `ROMV→0x40000000`, `TEXT→0x4001D000`,
 `0x40012000`. Compressed sections are inflated by the firmware's own UZIP codec
 (flash `0x2000`).
 
-### 8.7 Built-in demo photos (free test vectors)
+### 8.7 Boot logo & built-in demo photos (free test vectors)
 
-The frame ships **five 640×360 JFIF/EXIF photos** — the Windows sample-picture
+**The power-on splash is a JPEG.** The `LOGO` flash section (section-table entry
+at `0xe8`: run `0x00104DD8`, size `0xB1A8`) is a **480×270 JFIF at flash
+`0x104DE0`** — a blue "bubbles" splash, exactly panel-width. The firmware
+decodes and shows it via `UTL_ShowLogo` (`utl.c:481`); the romcfg text at
+`0xf12b5` tags the section `JPEG`. This is the **cleanest auto-triggered decode
+target** — shown at power-on, no card/USB required — so it's the first thing to
+get rendering when validating a decode path. **[OBS/SRC]**
+
+**Slideshow demos:** the frame also ships **five 640×360 JFIF/EXIF photos** — the Windows sample-picture
 set (zebra-longwing butterfly, Grand Teton barn, chrysanthemum, Golden Gate, …).
 They sit at flash **`0x160000 / 0x170000 / 0x180000 / 0x190000 / 0x1A0000`**, one
 per 64 KiB slot, each followed by two thumbnails (main image + `+0x14C` +

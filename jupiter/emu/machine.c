@@ -494,15 +494,19 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
      * (icount>60M). CT952_POLLTRACE. */
     if (getenv("CT952_POLLTRACE") && addr == 0x4002e328u &&
         m->cpu.icount > 60000000ull) {
-        static int pn;
-        if (pn < 8) {
-            int k; fprintf(stderr, "[POLL] tick-read caller chain:");
-            for (k = 56; k < 64; k++)
+        /* Dedupe by stack pointer so we see EACH thread's poll loop, not just
+         * the hottest one repeated. Each distinct sp is a distinct thread. */
+        static uint32_t seen[32]; static int nseen;
+        uint32_t sp = sparc_get_reg(&m->cpu, 14);
+        int k, dup = 0;
+        for (k = 0; k < nseen; k++) if (seen[k] == sp) { dup = 1; break; }
+        if (!dup && nseen < 32) {
+            seen[nseen++] = sp;
+            fprintf(stderr, "[THREAD sp=%08x i7=%08x] recent PCs:", sp,
+                    sparc_get_reg(&m->cpu, 31));
+            for (k = 52; k < 64; k++)
                 fprintf(stderr, " %08x", m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63]);
-            fprintf(stderr, "  o7=%08x i7=%08x sp=%08x\n",
-                    sparc_get_reg(&m->cpu, 15), sparc_get_reg(&m->cpu, 31),
-                    sparc_get_reg(&m->cpu, 14));
-            pn++;
+            fprintf(stderr, "\n");
         }
     }
 

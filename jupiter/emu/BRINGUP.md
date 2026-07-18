@@ -720,3 +720,42 @@ early-returns when `LOGO_TYPE()==LOGO_DEFAULT`, so step one is confirming the
 firmware takes the decode branch; step two is completing the JPEG-on-PROC2
 datapath so the decoded 480x270 lands in a frame buffer the DISP scans out.
 `tools/extract_photos.py` now also dumps this logo (`logo.png`).
+
+---
+
+## Update: the power-on logo decode traced end-to-end (it's a HARDWARE decode)
+
+Followed the boot-logo path all the way to the decoder input, which pins down
+the decode architecture:
+
+* **The power-on splash is the COBY logo** -- a 480x270 JFIF in the `LOG3`
+  flash section (payload at `0x10ff88`, 40744 bytes; `_bPowerOnFlag` selects
+  `LOG3` over `LOGO` in `UTL_ShowLogo`). Decoded by `tools/extract_photos.py`.
+* **It is staged to DRAM `0x401dc000`.** Boot memcpys the 40744-byte JPEG from
+  flash `0x10ff88` -> DRAM `0x401dc000` (the copy loop at flash `0xd38b4`,
+  captured `o0=dst=0x401dc000, o1=src=0x10ff88, o2=cnt=0x9f28`).
+* **The decode is done by HARDWARE, not software.** Instrumenting reads of the
+  staged buffer `0x401dc000..0x401e6000` shows **zero** CPU reads from either
+  PROC1 or PROC2. Nothing fetches the bytes with load instructions -> the JPEG
+  is consumed by a DMA/decoder block (BIU -> VLD/JPU), which is why PROC2 is
+  never released for the logo. `0x80000c10` is that hardware decoder's
+  progress/state word (bits[20:16], wait-for->=7).
+* **Decoder progress gate, not a data path we can shortcut.** Faking
+  `0x80000c10` ready (`CT952_DECRDY`) makes PROC1 believe the decode finished
+  and move on *without* a real decode -- confirming `0x80000c10` is driven by
+  the hardware decoder consuming `0x401dc000`, and that a faithful result needs
+  the decode modelled, not the status bit faked.
+
+### Concrete next build: a functional hardware-JPEG-decode model
+
+The path to the logo actually on screen is now well-defined:
+1. Detect the decode kick (the register write that starts the BIU/VLD/JPU on the
+   staged buffer) and the output frame buffer (JPU write-start `0x80002888` was
+   seen holding `0x4009e600`, to be confirmed as the decode output vs. a GPU
+   blit target).
+2. On kick, decode the JPEG at the staged source (`0x401dc000`) in-emulator
+   (vendor a small C JPEG decoder), write the result into the output buffer in
+   the hardware's pixel layout.
+3. Advance `0x80000c10` / the BIU-ready bit to signal completion.
+4. Render the output via the DISP path the firmware uses for the logo (OSD blit
+   vs. video plane -- the GPU was blitting to the OSD plane `0x4005F668`).

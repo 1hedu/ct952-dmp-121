@@ -49,6 +49,16 @@ typedef struct machine {
     uint32_t presc_cnt;
     uint64_t t3_value;
 
+    /* display VSYNC generation (secondary PROC1-1st IRQ, LEON line 13) */
+    uint32_t vsync_cnt, vsync_div;
+
+    /* PROC2 vdec stand-in: PROC1 writes a VDEC command to REG_SRAM_PLAYMODE
+     * (0xb0000190); the real decoder microcode acks by overwriting it with a
+     * completion state (comdec.h EN_VDEC_CMD). We deliver that ack after a
+     * short read latency so the firmware's wait loops make progress. */
+    uint8_t proc2_cmd;
+    int proc2_ack_countdown;
+
     /* uart capture */
     FILE *uart_file;         /* optional capture file (may be NULL) */
     int uart_echo;           /* echo UART bytes to stdout */

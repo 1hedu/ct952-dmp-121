@@ -26,6 +26,16 @@
 #define R_INT_PENDING  0x094
 #define R_INT_FORCE    0x098
 #define R_INT_CLEAR    0x09C
+/* Secondary "PROC1 1st" interrupt controller (ctkav_platform.h:58-64):
+ * cascades into LEON interrupt line 13 (INT_NO_PROC1_1ST). Bit0 = VSYNC,
+ * the display-timing tick that drives the firmware's display/slideshow
+ * state machine (interrupt.c: INT_Proc1_1st_isr -> ISR_DISPSaveClearStatus). */
+#define R_P1_1ST_MASK  0x0B0        /* MASK_ENABLE: direct RW enable mask */
+#define R_P1_1ST_PEND  0x0B4        /* PENDING: RW; VSYNC source ORs bit0 */
+#define R_P1_1ST_STCL  0x0B8        /* STATUS(R) / CLEAR(W1C) */
+#define R_P1_1ST_MDIS  0x0BC        /* MASK_DISABLE (W1C into MASK) */
+#define INT_NO_PROC1_1ST 13
+#define IRQ_P1_1ST_VSYNC 0x1u
 #define R_DSU_UART_DATA 0x0C0
 #define R_DSU_UART_STAT 0x0C4
 /* Command block (ctkav_platform.h:474-481): PARAMETER1 = 0x364 */
@@ -127,6 +137,9 @@ static uint32_t io_read(machine_t *m, uint32_t off)
         return m->presc_cnt;
     case R_INT_PENDING:
         return io_get(m, R_INT_PENDING);
+    case R_P1_1ST_STCL:
+        /* STATUS read: the live secondary pending register */
+        return io_get(m, R_P1_1ST_PEND);
     case R_IIC_CMD:
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
@@ -259,6 +272,14 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
         io_set(m, R_INT_PENDING, io_get(m, R_INT_PENDING) & ~v);
         io_set(m, R_INT_FORCE, io_get(m, R_INT_FORCE) & ~v);
         return;
+    case R_P1_1ST_STCL:
+        /* secondary CLEAR: write-1-to-clear pending bits */
+        io_set(m, R_P1_1ST_PEND, io_get(m, R_P1_1ST_PEND) & ~v);
+        return;
+    case R_P1_1ST_MDIS:
+        /* secondary MASK_DISABLE: clear the named enable bits */
+        io_set(m, R_P1_1ST_MASK, io_get(m, R_P1_1ST_MASK) & ~v);
+        return;
     case R_PARAM1:
         /* AM mailbox: PROC1 writes cmd with [31:30]=1 write / 2 read;
          * PROC2 acks by clearing [31:30] (hdecoder.c:1718-1727).
@@ -301,10 +322,29 @@ static void mem_write_raw(uint8_t *p, uint32_t v, int size)
     p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
 }
 
+/* PROC2 vdec command -> completion-state ack (comdec.h EN_VDEC_CMD).
+ * The decoder microcode overwrites REG_SRAM_PLAYMODE with these once it
+ * has consumed the command; PROC1 wait loops poll for them. */
+static uint8_t proc2_ack_of(uint8_t cmd)
+{
+    switch (cmd) {
+    case 0x00: return 0x10;   /* reset/NONE     -> decoder idle=STOP */
+    case 0x10: return 0x11;   /* MODE_STOP      -> MODE_STOPPED      */
+    case 0x40: return 0x12;   /* MODE_SCAN      -> MODE_SCAN_DONE    */
+    case 0x80: return 0x13;   /* MODE_PREDECODE -> MODE_PREDEC_DONE  */
+    default:   return cmd;    /* PLAY/...: state stays as set        */
+    }
+}
+
 static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
 {
     machine_t *m = M(b);
     *fault = 0;
+
+    /* PROC2 vdec stand-in: deliver the command ack after a read latency */
+    if (addr == 0xB0000190u &&
+        m->proc2_ack_countdown > 0 && --m->proc2_ack_countdown == 0)
+        m->bram[0x190] = proc2_ack_of(m->proc2_cmd);
 
     if (addr < MACH_FLASH_MAX) {
         if (addr + (uint32_t)size <= m->flash_size)
@@ -345,6 +385,14 @@ static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
     machine_t *m = M(b);
     *fault = 0;
 
+    /* PROC1 issued a VDEC command via REG_SRAM_PLAYMODE: arm the PROC2 ack
+     * (delivered after a few status polls, mimicking the microcode latency). */
+    if (addr == 0xB0000190u) {
+        m->proc2_cmd = (uint8_t)val;
+        m->proc2_ack_countdown = (proc2_ack_of((uint8_t)val) != (uint8_t)val)
+                                 ? 8 : 0;
+    }
+
     if (addr < MACH_FLASH_MAX)
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
@@ -384,8 +432,12 @@ static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
 static int bus_irq_level(sparc_bus_t *b)
 {
     machine_t *m = M(b);
-    uint32_t eff = (io_get(m, R_INT_PENDING) | io_get(m, R_INT_FORCE)) &
-                   io_get(m, R_INT_MASK);
+    uint32_t pend = io_get(m, R_INT_PENDING) | io_get(m, R_INT_FORCE);
+    /* cascade: the secondary PROC1-1st controller drives LEON line 13
+     * whenever any of its enabled sources is pending (level-triggered). */
+    if (io_get(m, R_P1_1ST_PEND) & io_get(m, R_P1_1ST_MASK))
+        pend |= (1u << INT_NO_PROC1_1ST);
+    uint32_t eff = pend & io_get(m, R_INT_MASK);
     int lvl;
     for (lvl = 15; lvl >= 1; lvl--)
         if (eff & (1u << lvl))
@@ -421,6 +473,15 @@ static void timer_tick_one(machine_t *m, uint32_t cnt_off, uint32_t rld_off,
 static void machine_cycle(machine_t *m)
 {
     m->cycles++;
+    /* Display VSYNC tick: raise the secondary VSYNC-pending bit at the
+     * panel field rate so the firmware's display state machine advances.
+     * Real timing is ~MCLK/50Hz (~2.66M cycles); we use a shorter, env-
+     * tunable divider so many fields elapse within a bring-up run. */
+    if (++m->vsync_cnt >= m->vsync_div) {
+        m->vsync_cnt = 0;
+        io_set(m, R_P1_1ST_PEND,
+               io_get(m, R_P1_1ST_PEND) | IRQ_P1_1ST_VSYNC);
+    }
     if (m->presc_cnt == 0) {
         m->presc_cnt = io_get(m, R_PRESC_RLD);
         m->t3_value++;
@@ -458,6 +519,14 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     memset(m->bram, 0, 0x10000u);
     m->flash_size = flash_size;
     m->uart_echo = 1;
+
+    /* display field-rate divider for the VSYNC IRQ (see machine_cycle) */
+    {
+        const char *e = getenv("CT952_VSYNC_DIV");
+        m->vsync_cnt = 0;
+        m->vsync_div = e ? (uint32_t)strtoul(e, NULL, 0) : 200000u;
+        if (m->vsync_div == 0) m->vsync_div = 200000u;
+    }
 
     /* SYSTEM_CONFIGURATION1 (0x8000031c): hardware strapping the boot code
      * decodes for DRAM/flash type. Bits[4:0] must be 0b11xxx or the AP

@@ -1084,3 +1084,54 @@ Full evidence-backed recipe for when the firmware does kick the decode:
 a register — it cannot be poked; the worker must be *allowed to finish* via the
 polls above. This spec is byte-exact against `jupiter/jfb.c` (which already
 implements the same tiling) and the §10.2 formulas.
+
+### 10.15 BREAKTHROUGH — the firmware boots to its own UI ("Loading" screen)
+
+Three model changes together carry the retail image from "menu never draws"
+(GPU ops = 0) to the firmware **drawing its own UI through its own pipeline**:
+
+1. **Decoder-stop dwell** (§10.12): the halted-decoder stand-in holds
+   `MODE_STOP(0x10)` for `proc2_ack_dwell` cycles before settling to
+   `STOPPED(0x11)`, so the boot thread's stop handshake (`0x61170`,
+   gates `0x33dac`/`0x36ff0`) completes. Default behaviour now.
+2. **Boot-thread stop-poll unblock** (`CT952_TEST_MIRROR10`, sp-gated): the
+   main/boot thread (stack `~0x40036xxx`) hits a *second* decoder-stop poll
+   (`0x612b0`, both stages want mirror==`0x10`) with no fresh stop command; the
+   getter (`0x6f054`) returns the mirror `0x40039cd0` (only ever `0x11`), so it
+   would ride a ~4.5-billion-instruction 2999+30015-tick timeout. Presenting the
+   mirror as `0x10` to *that thread only* unblocks it and the boot advances
+   through a long chain of further decoder-state polls (`0x37004`, `0xa33dc`,
+   `0x34544`, ...). **This is still a hack** — the clean version is to model the
+   decoder producing MODE_STOP per stop command; but it proved the poll is the
+   gate and that the chain terminates.
+3. **Time-compression** (`CT952_TICK_MULT=16`): the eCos system tick is TIMER1
+   (IRQ `0x100`/L8); scaling its reload/count down by N makes the tick advance
+   N× faster, so the many timeout-bound decoder polls (PROC2 in reset ⇒ they
+   never succeed, only time out) fire in 1/N the instructions. Without it the
+   chain would need billions of instructions; with it the boot reaches the UI in
+   ~27M instructions.
+
+**Result (verified):** `CT952_PROC2=1 CT952_TEST_MIRROR10=1 CT952_TICK_MULT=16`
+→ first GPU op at icount≈26.5M, then **45k+ GPU font ops** draw the firmware's
+`"Loading ."` status screen (media-detect indicator, `osdnd.c`
+`SHOW_LOADING_STATUS`) into the OSD plane at `0x4005F000` (8bpp, stride ~480 from
+`AG_OFF 0x80002890`). Rendering the plane via the OSD palette shows the
+`"Loading ."` text (rows 3–18). `machine_disp_scanout` already composites the OSD
+regardless of `DISP_OSD_EN` (which the firmware hasn't flipped yet).
+
+**Next gate — media detection ("Loading").** The boot thread now spins in the
+CC media-detect / loading state machine (poll loops `0x32d50` and `0x4a530`,
+timed via `OS_GetSysTimer`, on a state word in the `0x40039400` arena), scanning
+for a removable source (SD/USB/servo) before the power-on menu / built-in-SPI
+slideshow. Even at 500M instructions (with time-compression = lots of firmware
+time) it stays in "Loading", so it is genuinely waiting for media/servo state the
+emulator doesn't provide (the §9.3 no-media path). Modeling the media-detect
+completion (present "no removable media" so the firmware falls back to the
+built-in photos, or "SPI source present") is the next step toward the power-on
+menu and then the built-in butterfly slideshow (§9.2 / §10.10).
+
+**Config summary to reproduce the boot-to-UI:**
+`CT952_PROC2=1 CT952_TEST_MIRROR10=1 CT952_TICK_MULT=16 ./ct952emu dp700wd.bin
+--instr 250000000 --fb-addr 0x4005f000 --fb-wh 480x234 --fb-out out.ppm`
+(look for `[GPU-FIRST]` in `CT952_TRACE`; the OSD plane at `0x4005F000` holds the
+drawn UI).

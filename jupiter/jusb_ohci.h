@@ -30,9 +30,13 @@
 #include "jup_types.h"
 #include "jusb_ohci_regs.h"   /* OHCI register/descriptor layout (shared) */
 
-/* Set up the periodic interrupt-IN path for a boot keyboard using a
- * 256-byte-aligned DRAM work area (>= JUSB_OHCI_WORKAREA bytes), start
- * the controller, and arm the first transfer. Returns 0. */
+/* Bring up a USB boot keyboard from a 256-byte-aligned DRAM work area
+ * (>= JUSB_OHCI_WORKAREA bytes): start the controller, enumerate the
+ * device over the control list (GET_DESCRIPTOR / SET_ADDRESS /
+ * SET_CONFIGURATION / SET_PROTOCOL=boot), then arm the periodic
+ * interrupt-IN transfer on the endpoint discovered from the device's
+ * configuration descriptor. Returns that endpoint number (>= 1) on
+ * success, or -1 if enumeration failed. */
 int jusb_ohci_init(uint32_t dram_workarea);
 
 /* Poll for a completed report. Returns 1 and fills report[8] if a fresh

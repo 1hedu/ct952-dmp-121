@@ -34,10 +34,15 @@ unsigned testmain(void)
 {
     uint8_t report[8];
     long spins = 0;
-    int gotn = 0, i, j, mism = 0;
+    int gotn = 0, i, j, mism = 0, ep;
 
     jhid_kbd_reset(&kbd);
-    jusb_ohci_init(WORKAREA);
+
+    /* Enumerate; the returned endpoint must be the one advertised in the
+     * device's configuration descriptor (interrupt IN endpoint 1). */
+    ep = jusb_ohci_init(WORKAREA);
+    if (ep != USB_KBD_ENDPOINT)
+        return 0xE0000000u | (unsigned)(ep & 0xFFFF);
 
     /* Poll until every scripted report has arrived (bounded spin). */
     while (gotn < USB_KBD_SCRIPT_N && spins < 5000000L) {

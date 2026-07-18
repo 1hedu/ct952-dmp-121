@@ -37,7 +37,7 @@ line-for-line copy.
 | DE2 mixer, VI0+UI0 ARGB layers | GDI OSD **region 0**, 8bpp indexed, 616×440, buffer at `DS_OSDFRAME_ST_MM` (pitch = width, 1 byte/px — verified against `gdi.c` addressing) |
 | Hardware palette (implicit ARGB) | 256-entry OSD palette in **YUV** via `GDI_ChangePALEntry` (`jrgb2yuv` converts) |
 | Codec + DMA ping-pong @48 kHz | HAL raw-PCM pipe @44.1 kHz (the `HAL_PlayTone` mechanism): copy PCM to `DS_AD0BUF_ST_MM`, `HAL_AM_AUDIO_TYPE=7`, `PLAY_COMMAND=1` |
-| GPIO-bit-banged NES/SNES/Genesis/N64 pads | IR remote / front panel keys → `JBTN_*` masks (`jinp_map_key`); USB HID keyboard → `JBTN_*` via `jusbhid` (decoder) + `jusb_ohci` (OHCI interrupt-IN transport, emulator-verified) + `jinp_map_hid`; enumeration pending — see below |
+| GPIO-bit-banged NES/SNES/Genesis/N64 pads | IR remote / front panel keys → `JBTN_*` masks (`jinp_map_key`); USB HID keyboard → `JBTN_*` via `jusbhid` (decoder) + `jusb_ohci` (OHCI enumeration + interrupt-IN transport, emulator-verified) + `jinp_map_hid` — see below |
 | `while(1)` game loop + vblank | Cooperative superloop: `JUPITER_ProcessKey` in the `FuncArray` dispatch table + `JUPITER_Trigger` per loop iteration (the `osdgame` pattern from `cc.c`), paced by `OS_GetSysTimer()` |
 
 ## Using it
@@ -137,21 +137,28 @@ above). What has NOT been exercised on hardware:
   key routes to the SDK through the same `JBTN_*` model as the IR remote
   via `jinp_map_hid`.
 - `jusb_ohci.c` (USB OHCI boot-keyboard **transport**) supplies the reports
-  the decoder consumes, and its periodic interrupt-IN path is now **verified
-  end-to-end on an emulated CT952 OHCI controller** (`emu: make usbcheck`).
-  ct952emu gained a spec-standard OHCI register block plus HCCA / ED / TD
-  DMA-descriptor processing and a virtual boot keyboard; the real driver
-  programs the controller operational, walks the periodic list, and
-  harvests each 8-byte report byte-exact, which `jusbhid` then decodes —
-  the same closed-loop method used for jgpu/jspr. OHCI's layout is
-  standardised, so only the register **base** is chip-specific
-  (`CT909_OHCI_BASE`, a guarded placeholder — the real value lives in the
-  Jungo stack headers, not in this tree; this frame uses OHCI +
+  the decoder consumes, and the full path — **enumeration + interrupt-IN
+  polling** — is now **verified end-to-end on an emulated CT952 OHCI
+  controller** (`emu: make usbcheck`). ct952emu gained a spec-standard OHCI
+  register block, control- and periodic-list processing over HCCA / ED / TD
+  DMA descriptors, and a descriptor-bearing virtual boot keyboard that
+  answers standard control requests. The real driver starts the controller,
+  **enumerates** the device over the control list (GET_DESCRIPTOR /
+  SET_ADDRESS / SET_CONFIGURATION / SET_PROTOCOL=boot), **discovers the
+  interrupt IN endpoint from the returned configuration descriptor**, then
+  polls it — each 8-byte report lands byte-exact and `jusbhid` decodes it,
+  the same closed-loop method used for jgpu/jspr. The test is meaningful
+  because every enumeration step is load-bearing: the virtual device NAKs
+  the interrupt endpoint until it is *configured* and at its *assigned
+  address*, and the polled endpoint number comes from the parsed descriptor.
+  OHCI's layout is standardised, so only the register **base** is
+  chip-specific (`CT909_OHCI_BASE`, a guarded placeholder — the real value
+  lives in the Jungo stack headers, not in this tree; this frame uses OHCI +
   `INT_PROC1_2ND_USB_OHCI` for mass storage today, with no HID class
-  driver). What remains: **enumeration** over the control list (SET_ADDRESS
-  / SET_CONFIGURATION / SET_PROTOCOL=boot — the device is currently treated
-  as pre-configured on its interrupt endpoint) and interrupt-driven (vs.
-  polled) delivery on real silicon.
+  driver). What remains is silicon-only: interrupt-driven (vs. polled)
+  delivery via `INT_PROC1_2ND_USB_OHCI`, real root-hub port reset/debounce
+  timing, and EP0 packetisation (the model transfers at whole-TD
+  granularity, which is the level the driver programs).
 - All of `jcodec_ct952.c` (canvas binding, MPEG/JPEG decode-from-memory,
   JPEG encode, JPU scale) mirrors the firmware's own call sequences
   (`utl.c` logo paths, `mm_play.c` photo save, `digest.c`) line for

@@ -544,11 +544,15 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
     if (addr >= CT909_OHCI_BASE && addr < CT909_OHCI_BASE + 0x100u) {
         uint32_t off = (addr - CT909_OHCI_BASE) & ~3u;
         if (off == OHCI_HcCommandStatus && (val & OHCI_CMD_HCR)) {
-            /* HostControllerReset: return to UsbReset, clear pointers/status */
+            /* HostControllerReset: return to UsbReset, clear pointers/status
+             * and the attached device's enumeration state. */
             m->ohci[OHCI_HcControl / 4] = 0;
             m->ohci[OHCI_HcInterruptStatus / 4] = 0;
             m->ohci[OHCI_HcDoneHead / 4] = 0;
             m->ohci[OHCI_HcFmNumber / 4] = 0;
+            m->usb_addr = m->usb_pending_addr = 0;
+            m->usb_configured = m->usb_protocol = 0;
+            m->usb_in_ptr = NULL; m->usb_in_len = 0;
             m->usb_kbd_pos = 0;
             return;
         }
@@ -624,27 +628,168 @@ static void timer_tick_one(machine_t *m, uint32_t cnt_off, uint32_t rld_off,
     }
 }
 
-/* ---- USB OHCI host controller (periodic interrupt-IN path) ---- */
+/* ---- USB OHCI host controller + a descriptor-bearing virtual keyboard ---- */
 
-/* Virtual boot keyboard: deliver the next scripted 8-byte report for an
- * IN poll on its endpoint, or NULL (NAK) when the endpoint doesn't match
- * or the script is exhausted. One report is consumed per successful poll. */
-static const uint8_t *usb_kbd_poll(machine_t *m, uint32_t en)
+/* The virtual device's descriptor ROM: a low-speed HID boot keyboard on
+ * interrupt IN endpoint 1. These are the bytes the driver reads during
+ * enumeration; the endpoint number the driver ends up polling comes from
+ * the endpoint descriptor here, not from a shared constant. */
+static const uint8_t USBDEV_DEVDESC[18] = {
+    0x12, 0x01, 0x10, 0x01, 0x00, 0x00, 0x00, 0x08,   /* ..bMaxPacketSize0=8 */
+    0x34, 0x12, 0x78, 0x56, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01
+};
+static const uint8_t USBDEV_CFGDESC[34] = {
+    /* configuration */
+    0x09, 0x02, 0x22, 0x00, 0x01, 0x01, 0x00, 0xA0, 0x32,
+    /* interface: class 3 (HID), subclass 1 (boot), protocol 1 (keyboard) */
+    0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x00,
+    /* HID descriptor: one report descriptor, length 0x3F */
+    0x09, 0x21, 0x10, 0x01, 0x00, 0x01, 0x22, 0x3F, 0x00,
+    /* endpoint: 0x81 = IN endpoint 1, interrupt, 8-byte, bInterval=10 */
+    0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0A
+};
+
+/* Decode a SETUP packet and set up the device's response for the data /
+ * status stages that follow on the control ED. */
+static void usbdev_setup(machine_t *m, const uint8_t *s)
 {
-    if (en != (uint32_t)USB_KBD_ENDPOINT) return NULL;
-    if (m->usb_kbd_pos >= m->usb_kbd_n)   return NULL;
+    uint8_t  bmr = s[0], req = s[1];
+    uint16_t wval = (uint16_t)(s[2] | (s[3] << 8));
+    uint16_t wlen = (uint16_t)(s[6] | (s[7] << 8));
+
+    m->usb_in_ptr = NULL;
+    m->usb_in_len = 0;
+
+    if (bmr == 0x80 && req == 0x06) {           /* GET_DESCRIPTOR (standard) */
+        const uint8_t *d = NULL; uint32_t dl = 0;
+        switch (wval >> 8) {
+        case 0x01: d = USBDEV_DEVDESC; dl = sizeof(USBDEV_DEVDESC); break;
+        case 0x02: d = USBDEV_CFGDESC; dl = sizeof(USBDEV_CFGDESC); break;
+        default: break;                          /* string/report: unhandled */
+        }
+        if (d) {
+            m->usb_in_ptr = d;
+            m->usb_in_len = (wlen < dl) ? wlen : dl;
+        }
+    } else if (bmr == 0x00 && req == 0x05) {     /* SET_ADDRESS */
+        m->usb_pending_addr = (uint8_t)wval;     /* committed at status stage */
+    } else if (bmr == 0x00 && req == 0x09) {     /* SET_CONFIGURATION */
+        m->usb_configured = (uint8_t)wval;
+    } else if (bmr == 0x21 && req == 0x0B) {     /* HID SET_PROTOCOL */
+        m->usb_protocol = (uint8_t)wval;         /* 0 = boot */
+    }
+    /* SET_IDLE (0x21/0x0A) and anything else: accepted, no data. */
+}
+
+/* Process one control-list ED: drain its SETUP/DATA/STATUS TD chain, having
+ * the device answer each stage. Returns the (updated) frame done-queue head. */
+static uint32_t ohci_service_control_ed(machine_t *m, uint32_t ed, uint32_t done)
+{
+    uint32_t fa = dram_r32(m, ed + 0) & 0x7Fu;
+    for (;;) {
+        uint32_t tailp = dram_r32(m, ed + 4) & ~0xFu;
+        uint32_t headw = dram_r32(m, ed + 8);
+        uint32_t headp = headw & ~0xFu;
+        uint32_t tdc, cbp, nexttd, be, dp, buflen;
+
+        if ((headw & OHCI_ED_HEAD_HALT) || !headp || headp == tailp) break;
+        if (fa != m->usb_addr) break;            /* not our address: NAK */
+
+        tdc    = dram_r32(m, headp + 0);
+        cbp    = dram_r32(m, headp + 4);
+        nexttd = dram_r32(m, headp + 8) & ~0xFu;
+        be     = dram_r32(m, headp + 12);
+        dp     = (tdc >> OHCI_TD_DP_SHIFT) & 3u;
+        buflen = (cbp && be >= cbp) ? (be - cbp + 1u) : 0u;
+
+        if (dp == 0u) {                          /* SETUP */
+            uint8_t *sp = dram_rw(m, cbp, 8);
+            if (sp) usbdev_setup(m, sp);
+        } else if (dp == OHCI_TD_DP_IN) {        /* IN: data or status-in */
+            if (buflen && m->usb_in_len) {       /* data stage */
+                uint32_t n = buflen < m->usb_in_len ? buflen : m->usb_in_len;
+                uint8_t *dst = dram_rw(m, cbp, n);
+                uint32_t i;
+                if (dst) for (i = 0; i < n; i++) dst[i] = m->usb_in_ptr[i];
+                m->usb_in_ptr += n;
+                m->usb_in_len -= n;
+            } else {                             /* status stage (no-data/OUT) */
+                m->usb_addr = m->usb_pending_addr;  /* commit SET_ADDRESS */
+            }
+        } /* dp == OUT: data-out unused; status-out completes a control-IN */
+
+        dram_w32(m, headp + 0, tdc & 0x0FFFFFFFu);   /* CC = NoError */
+        dram_w32(m, headp + 4, 0);
+        dram_w32(m, ed + 8, nexttd | (headw & OHCI_ED_HEAD_CARRY));
+        dram_w32(m, headp + 8, done);
+        done = headp;
+    }
+    return done;
+}
+
+/* Virtual boot keyboard on the interrupt endpoint: deliver the next scripted
+ * report if addressed and configured, else NULL (NAK). */
+static const uint8_t *usbdev_int_in(machine_t *m, uint32_t fa, uint32_t en)
+{
+    if (!m->usb_configured || fa != m->usb_addr) return NULL;
+    if (en != (uint32_t)USB_KBD_ENDPOINT)        return NULL;
+    if (m->usb_kbd_pos >= m->usb_kbd_n)          return NULL;
     return m->usb_kbd_script + (uint32_t)m->usb_kbd_pos * 8u;
 }
 
-/* Service the periodic list for one frame: walk the interrupt-table chain
- * for this frame number, and for each active ED transfer the head TD's IN
- * data from the virtual device, retire it onto the done queue, and raise
- * WritebackDoneHead. Throttled to one outstanding done list (the WDH/ack
- * handshake) so a polled driver drains deterministically. */
+/* Service the periodic (interrupt) list for this frame: one transfer per
+ * active ED. Returns the updated frame done-queue head. */
+static uint32_t ohci_service_periodic(machine_t *m, uint32_t hcca, uint32_t done)
+{
+    uint32_t idx = m->ohci[OHCI_HcFmNumber / 4] & 31u;
+    uint32_t ed  = dram_r32(m, hcca + OHCI_HCCA_INTTABLE + idx * 4u) & ~0xFu;
+
+    while (ed) {
+        uint32_t edc   = dram_r32(m, ed + 0);
+        uint32_t tailp = dram_r32(m, ed + 4) & ~0xFu;
+        uint32_t headw = dram_r32(m, ed + 8);
+        uint32_t headp = headw & ~0xFu;
+        uint32_t nexted = dram_r32(m, ed + 12) & ~0xFu;
+
+        if (!(edc & OHCI_ED_SKIP) && !(headw & OHCI_ED_HEAD_HALT) &&
+            headp && headp != tailp) {
+            uint32_t tdc    = dram_r32(m, headp + 0);
+            uint32_t cbp    = dram_r32(m, headp + 4);
+            uint32_t nexttd = dram_r32(m, headp + 8) & ~0xFu;
+            uint32_t be     = dram_r32(m, headp + 12);
+            uint32_t dp     = (tdc >> OHCI_TD_DP_SHIFT) & 3u;
+            uint32_t fa     = edc & 0x7Fu;
+            uint32_t en     = (edc >> OHCI_ED_EN_SHIFT) & 0xFu;
+
+            if (dp == OHCI_TD_DP_IN) {
+                const uint8_t *rep = usbdev_int_in(m, fa, en);
+                if (rep) {
+                    uint32_t cap = (cbp && be >= cbp) ? (be - cbp + 1u) : 0u;
+                    uint32_t n = cap < 8u ? cap : 8u;
+                    uint8_t *dst = dram_rw(m, cbp, n);
+                    uint32_t i;
+                    if (dst) for (i = 0; i < n; i++) dst[i] = rep[i];
+                    m->usb_kbd_pos++;
+                    dram_w32(m, headp + 0, tdc & 0x0FFFFFFFu);
+                    dram_w32(m, headp + 4, 0);
+                    dram_w32(m, ed + 8, nexttd | (headw & OHCI_ED_HEAD_CARRY));
+                    dram_w32(m, headp + 8, done);
+                    done = headp;
+                }
+            }
+        }
+        ed = nexted;
+    }
+    return done;
+}
+
+/* One controller frame: advance the frame number, then (if the prior done
+ * list is acked) service the control list and the periodic list, retiring
+ * completed TDs onto a single done queue and raising WritebackDoneHead. */
 static void ohci_frame(machine_t *m)
 {
     uint32_t ctrl = m->ohci[OHCI_HcControl / 4];
-    uint32_t hcca, idx, ed, done = 0;
+    uint32_t hcca, done = 0;
 
     if (((ctrl >> OHCI_CTRL_HCFS_SHIFT) & 3u) != OHCI_HCFS_OPERATIONAL)
         return;                                   /* not operational */
@@ -655,52 +800,18 @@ static void ohci_frame(machine_t *m)
         dram_w16(m, hcca + OHCI_HCCA_FRAMENO,
                  m->ohci[OHCI_HcFmNumber / 4] & 0xFFFFu);
 
-    if (!(ctrl & OHCI_CTRL_PLE) || !hcca)         return;
     if (m->ohci[OHCI_HcInterruptStatus / 4] & OHCI_INT_WDH)
         return;                                   /* prior done list unacked */
 
-    idx = m->ohci[OHCI_HcFmNumber / 4] & 31u;
-    ed  = dram_r32(m, hcca + OHCI_HCCA_INTTABLE + idx * 4u) & ~0xFu;
-
-    while (ed) {
-        uint32_t edc   = dram_r32(m, ed + 0);
-        uint32_t tailp = dram_r32(m, ed + 4) & ~0xFu;
-        uint32_t headw = dram_r32(m, ed + 8);
-        uint32_t headp = headw & ~0xFu;
-        uint32_t nexted = dram_r32(m, ed + 12) & ~0xFu;
-        int skip = (edc & OHCI_ED_SKIP) != 0;
-        int halt = (headw & OHCI_ED_HEAD_HALT) != 0;
-
-        if (!skip && !halt && headp && headp != tailp) {
-            uint32_t tdc    = dram_r32(m, headp + 0);
-            uint32_t cbp    = dram_r32(m, headp + 4);
-            uint32_t nexttd = dram_r32(m, headp + 8) & ~0xFu;
-            uint32_t be     = dram_r32(m, headp + 12);
-            uint32_t dp     = (tdc >> OHCI_TD_DP_SHIFT) & 3u;
-            uint32_t en     = (edc >> OHCI_ED_EN_SHIFT) & 0xFu;
-
-            if (dp == OHCI_TD_DP_IN) {
-                const uint8_t *rep = usb_kbd_poll(m, en);
-                if (rep) {
-                    uint32_t cap = (cbp && be >= cbp) ? (be - cbp + 1u) : 0u;
-                    uint32_t n = cap < 8u ? cap : 8u;
-                    uint8_t *dst = dram_rw(m, cbp, n);
-                    uint32_t i;
-                    if (dst) for (i = 0; i < n; i++) dst[i] = rep[i];
-                    m->usb_kbd_pos++;
-                    /* completion: CC=NoError(0), CBP=0 (all transferred) */
-                    dram_w32(m, headp + 0, tdc & 0x0FFFFFFFu);
-                    dram_w32(m, headp + 4, 0);
-                    /* advance ED head to NextTD, preserving toggle carry */
-                    dram_w32(m, ed + 8, nexttd | (headw & OHCI_ED_HEAD_CARRY));
-                    /* push the retired TD onto this frame's done queue */
-                    dram_w32(m, headp + 8, done);
-                    done = headp;
-                }
-            }
+    if (ctrl & OHCI_CTRL_CLE) {
+        uint32_t ed = m->ohci[OHCI_HcControlHeadED / 4] & ~0xFu;
+        while (ed) {
+            done = ohci_service_control_ed(m, ed, done);
+            ed = dram_r32(m, ed + 12) & ~0xFu;
         }
-        ed = nexted;
     }
+    if ((ctrl & OHCI_CTRL_PLE) && hcca)
+        done = ohci_service_periodic(m, hcca, done);
 
     if (done) {
         m->ohci[OHCI_HcDoneHead / 4] = done;

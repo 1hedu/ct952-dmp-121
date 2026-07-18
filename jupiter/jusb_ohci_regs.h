@@ -69,9 +69,10 @@
 #define OHCI_HCCA_DONEHEAD       132         /* u32 done queue head     */
 #define OHCI_HCCA_SIZE           256
 
-/* Bytes of DRAM work area jusb_ohci_init needs (HCCA + ED + 2 TD + buf),
- * from a 256-byte-aligned base. */
-#define JUSB_OHCI_WORKAREA       0x140u
+/* Bytes of DRAM work area jusb_ohci_init needs (HCCA + periodic ED/TDs +
+ * report buffer + control ED/TDs + setup & data buffers), from a 256-byte-
+ * aligned base. */
+#define JUSB_OHCI_WORKAREA       0x200u
 
 /* Boot keyboard's interrupt IN endpoint. Enumeration (stubbed here) would
  * discover this from the interface descriptor; the driver and the model's

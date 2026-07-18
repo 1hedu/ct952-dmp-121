@@ -572,8 +572,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         if (m->cycles < m->vdec_stop_until && addr == 0x40039cd0u)
             return 0x10u;
         if (addr == 0x40039cd0u && getenv("CT952_TEST_MIRROR10") &&
-            m->cpu.icount > 45000000ull)
-            return 0x10u;   /* DIAGNOSTIC: is the 0x612b0 poll the block? */
+            m->cpu.icount > 45000000ull) {
+            uint32_t sp = sparc_get_reg(&m->cpu, 14);
+            if (sp >= 0x40036e00u && sp < 0x40037100u)
+                return 0x10u;   /* DIAGNOSTIC: only the 0x612b0-poll thread */
+        }
         /* EXPERIMENT (CT952_VDEC_IDLE): present the boot thread's decoder-init
          * handshake flags as "decoder idle/ready" so INITIAL_PowerONStatus's
          * chain of MODE_STOP-style waits (0x61170 -> next gate 0x40039f24==1 ...)
@@ -606,8 +609,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
              * the getter (0x6f054) adds no busy bit and returns the mirror's
              * MODE_STOP(0x10) cleanly. */
             if (m->cycles < m->vdec_stop_until) return 0x11u;
-            if (getenv("CT952_TEST_MIRROR10") && m->cpu.icount > 45000000ull)
-                return 0x11u;   /* DIAGNOSTIC: no busy bit so getter=mirror(0x10) */
+            if (getenv("CT952_TEST_MIRROR10") && m->cpu.icount > 45000000ull) {
+                uint32_t sp = sparc_get_reg(&m->cpu, 14);
+                if (sp >= 0x40036e00u && sp < 0x40037100u)
+                    return 0x11u;   /* DIAGNOSTIC: only the 0x612b0-poll thread */
+            }
             static int fp = -1;
             if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
                           fp = e ? (int)strtoul(e, NULL, 0) : -2; }

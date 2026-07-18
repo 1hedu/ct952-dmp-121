@@ -239,3 +239,25 @@ spr_check: spr_check.c sparc.c machine.c sparc.h machine.h
 	$(CC) $(CFLAGS) -I. -o $@ spr_check.c sparc.c machine.c
 sprcheck: spr_check tests/jspr_hw_test.bin
 	./spr_check tests/jspr_hw_test.bin
+
+# ---- USB OHCI boot-keyboard transport: driver vs the controller model ----
+tests/jusbhid_s.o: ../jusbhid.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+tests/jusb_ohci_s.o: ../jusb_ohci.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+tests/usb_kbd_test.o: tests/usb_kbd_test.c
+	$(XCC) $(XCFLAGS) -I. -c -o $@ $<
+tests/usb_kbd_test.elf: tests/start.o tests/usb_kbd_test.o tests/jusb_ohci_s.o \
+                        tests/jusbhid_s.o tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/usb_kbd_test.o tests/jusb_ohci_s.o \
+	    tests/jusbhid_s.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/usb_kbd_test.o tests/jusb_ohci_s.o \
+	    tests/jusbhid_s.o
+tests/usb_kbd_test.bin: tests/usb_kbd_test.elf
+	$(XOBJCOPY) -O binary $< $@
+usb_check: usb_check.c sparc.c machine.c sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ usb_check.c sparc.c machine.c
+usbcheck: usb_check tests/usb_kbd_test.bin
+	./usb_check tests/usb_kbd_test.bin

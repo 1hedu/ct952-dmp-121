@@ -37,7 +37,7 @@ line-for-line copy.
 | DE2 mixer, VI0+UI0 ARGB layers | GDI OSD **region 0**, 8bpp indexed, 616×440, buffer at `DS_OSDFRAME_ST_MM` (pitch = width, 1 byte/px — verified against `gdi.c` addressing) |
 | Hardware palette (implicit ARGB) | 256-entry OSD palette in **YUV** via `GDI_ChangePALEntry` (`jrgb2yuv` converts) |
 | Codec + DMA ping-pong @48 kHz | HAL raw-PCM pipe @44.1 kHz (the `HAL_PlayTone` mechanism): copy PCM to `DS_AD0BUF_ST_MM`, `HAL_AM_AUDIO_TYPE=7`, `PLAY_COMMAND=1` |
-| GPIO-bit-banged NES/SNES/Genesis/N64 pads | IR remote / front panel keys → `JBTN_*` masks (`jinp_map_key`); USB HID keyboard → `JBTN_*` via `jusbhid` + `jinp_map_hid` (decoder done, OHCI transport pending — see below) |
+| GPIO-bit-banged NES/SNES/Genesis/N64 pads | IR remote / front panel keys → `JBTN_*` masks (`jinp_map_key`); USB HID keyboard → `JBTN_*` via `jusbhid` (decoder) + `jusb_ohci` (OHCI interrupt-IN transport, emulator-verified) + `jinp_map_hid`; enumeration pending — see below |
 | `while(1)` game loop + vblank | Cooperative superloop: `JUPITER_ProcessKey` in the `FuncArray` dispatch table + `JUPITER_Trigger` per loop iteration (the `osdgame` pattern from `cc.c`), paced by `OS_GetSysTimer()` |
 
 ## Using it
@@ -135,14 +135,23 @@ above). What has NOT been exercised on hardware:
   (Shift+A → Shift-down, A-down; release reversed), N-key rollover, and
   ErrorRollOver phantom suppression, plus US-layout ASCII mapping. A USB
   key routes to the SDK through the same `JBTN_*` model as the IR remote
-  via `jinp_map_hid`. What's **not** done is the transport: the report
-  has to arrive from the OHCI host controller's interrupt-IN endpoint
-  (this frame uses OHCI + the Jungo stack — `interrupt.c`'s
-  `INT_PROC1_2ND_USB_OHCI` — for mass storage today, with no HID class
-  driver). Enumeration (SET_PROTOCOL=boot) and periodic endpoint polling
-  are the chip-side piece, and modelling OHCI in the emulator is the way
-  to verify them the same way the GPU path was. The decoder is
-  deliberately ahead of that so it's ready when the transport lands.
+  via `jinp_map_hid`.
+- `jusb_ohci.c` (USB OHCI boot-keyboard **transport**) supplies the reports
+  the decoder consumes, and its periodic interrupt-IN path is now **verified
+  end-to-end on an emulated CT952 OHCI controller** (`emu: make usbcheck`).
+  ct952emu gained a spec-standard OHCI register block plus HCCA / ED / TD
+  DMA-descriptor processing and a virtual boot keyboard; the real driver
+  programs the controller operational, walks the periodic list, and
+  harvests each 8-byte report byte-exact, which `jusbhid` then decodes —
+  the same closed-loop method used for jgpu/jspr. OHCI's layout is
+  standardised, so only the register **base** is chip-specific
+  (`CT909_OHCI_BASE`, a guarded placeholder — the real value lives in the
+  Jungo stack headers, not in this tree; this frame uses OHCI +
+  `INT_PROC1_2ND_USB_OHCI` for mass storage today, with no HID class
+  driver). What remains: **enumeration** over the control list (SET_ADDRESS
+  / SET_CONFIGURATION / SET_PROTOCOL=boot — the device is currently treated
+  as pre-configured on its interrupt endpoint) and interrupt-driven (vs.
+  polled) delivery on real silicon.
 - All of `jcodec_ct952.c` (canvas binding, MPEG/JPEG decode-from-memory,
   JPEG encode, JPU scale) mirrors the firmware's own call sequences
   (`utl.c` logo paths, `mm_play.c` photo save, `digest.c`) line for

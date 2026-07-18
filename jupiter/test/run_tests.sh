@@ -98,7 +98,7 @@ echo "=== 4. firmware compile-check (SPARC V8 ILP32, real headers) ==="
 FWCC="sparc64-linux-gnu-gcc -m32 -mcpu=v8 -msoft-float -Wall -Wno-comment \
       -Wno-endif-labels -fsigned-char -c -I$REPO -I$JUP -Iecos_stub"
 mkdir -p build/fw
-for f in jnes jgb jsnes jgen jaudio jrgb2yuv jfb jcodec_ct952 jgpu jgpu_ct952 jspr jlayer_ct952 jusbhid jshim_ct952 japp; do
+for f in jnes jgb jsnes jgen jaudio jrgb2yuv jfb jcodec_ct952 jgpu jgpu_ct952 jspr jlayer_ct952 jusbhid jusb_ohci jshim_ct952 japp; do
     if $FWCC "$JUP/$f.c" -o "build/fw/$f.o" 2> "build/fw/$f.err"; then
         echo "  OK   $f.c"
     else

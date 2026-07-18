@@ -95,6 +95,15 @@ typedef struct machine {
     uint16_t gpu_fontq[1024];
     int gpu_fontn;
 
+    /* USB OHCI host controller (periodic interrupt-IN path) + a virtual
+     * boot keyboard. Inert until a driver programs the register block
+     * operational (stock firmware never touches CT909_OHCI_BASE). The
+     * device delivers one scripted report per successful IN poll. */
+    uint32_t ohci[0x20];            /* register file, offsets 0x00..0x7C /4 */
+    uint32_t usb_frame_cnt, usb_frame_div;
+    const uint8_t *usb_kbd_script;  /* flat N*8 report bytes */
+    int usb_kbd_n, usb_kbd_pos;
+
     /* io access inventory */
     mach_logent_t log[MACH_LOG_MAX];
     int log_n;

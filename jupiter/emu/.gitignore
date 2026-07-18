@@ -9,6 +9,7 @@ dram.bin
 jgpu_check
 pal_check
 spr_check
+usb_check
 probe_unzip
 romv_out.bin
 test_sparc

@@ -388,6 +388,135 @@ UART, not the OTG connector.
 
 ---
 
-*All facts above are from static reading of this SDK. On-hardware specifics —
-whether the retail DP700WD image muxes the UART pins, and the exact 480×234 TCON
-timing — must be confirmed on the bench.*
+## 8. SoC internals — verified by *running the retail ROM* in an emulator
+
+Sections 1–7 are static source reads. The sections below were established by
+booting the **actual retail `dp700wd.bin`** (2 MB SPI image, in
+`jupiter/emu/dp700wd.bin`) in a from-scratch SPARC V8 emulator (`jupiter/emu/`)
+and watching it execute. Facts tagged **[OBS]** were confirmed by observing the
+real firmware run; **[SRC]** are from the SDK source. This is the ground truth a
+porter needs and the fastest way to validate any future bring-up.
+
+### 8.1 The two CPUs are BOTH SPARC V8 — the decoder is *software*
+
+- **PROC1** (main) and **PROC2** are both LEON2-class SPARC V8 integer units,
+  no FPU (`-msoft-float`). **[SRC** `sparc.h`; `hsystem.c` pokes SPARC opcodes
+  `0x91d02000`=`ta 0`, `0x01000000`=`nop` into PROC2's entry**]**
+- **JPEG/video decoding runs as *microcode on PROC2***, not fixed-function
+  hardware (`SUPPORT_JPEGDEC_ON_PROC2`). PROC1 loads a decoder blob to
+  `0x40002000` and releases PROC2 to run it. **This is the key porting fact:**
+  to decode a photo you either run PROC2's real microcode or reimplement it.
+- **Chip ID: PSR reports impl=0xA, ver=0** (`PSR[31:24]==0xA0`). The stock boot
+  ROM branches on this (full boot vs. trampoline). An emulator/model that
+  reports any other impl/ver takes the wrong boot path. **[OBS** — this single
+  fact was what made the retail firmware boot itself**]**
+- **Reset vector `0x81c02310`** (`jmpl` to boot code at flash `0x310`), which
+  checks `PSR[31:24]==0xa0`. **[OBS]**
+
+### 8.2 PROC2 boot / reset / debug control (for driving the decoder)
+
+- Entry + stack are staged in the **AIU GR bank**: `GR22` = `0x800007D8`
+  (`PROC2_STARTADR`, set to `DS_PROC2_STARTADDR = 0x40002000`), `GR21` =
+  `0x800007D4` (`PROC2_SP`). **[SRC** `hsystem.c:136-137`**]**
+- **Release from reset:** `REG_PLAT_RESET_CONTROL_DISABLE` (`0x80000304`) bit0
+  `PLAT_RESET_PROC2_DISABLE`. **Hold in reset:** `REG_PLAT_RESET_CONTROL_ENABLE`
+  (`0x80000324`) bit0. Also releasable via **DSU2 control** `REG_PLAT_DSU2_CONTROL`
+  (`0x98000000`, bit `PLAT_DSU_CTL_RE = 0x00080000`); halt = `BN|BW` bits.
+  **[SRC** `ctkav_platform.h:250/259/622`, `hsystem.c:251-254`,
+  `hdecoder.c:700/719`**]**
+- **PROC2 has its own SPARC debug unit (DSU2) at `0x98000000`**, full register
+  file + `REG_PLAT_DSU2_PC` (`0x98080010`). PROC1's watchdog reads PROC2's live
+  PC here to detect a hung decoder (`monitor.c`).
+- **Gotcha:** this DMP build holds PROC2 in reset for *audio* (the `NO_PROC2`
+  path fires `RESET_CONTROL_ENABLE=1` and clears the audio-cmd word) and only
+  loads+releases it for JPEG via `HAL_ReloadAudioDecoder`. So PROC2 is idle for
+  most of boot; it comes alive only at photo-decode time. **[OBS]**
+
+### 8.3 The I/O base-address gotcha (WILL bite you)
+
+The headers use **two different `CT909_IO_START` conventions**, and mixing them
+up mis-decodes every AV register:
+
+| Block group | Effective base | Examples |
+|---|---|---|
+| Platform / LEON core | **`0x80000000`** | INT ctrl `0x80000090`, timers `0x80000040`, UART1 `0x80000070`, reset/clock `0x80000300`, AIU GR bank `0x800007xx` |
+| AV decode blocks | **`0x80002000`** | BIU `0x80002800`, MCU `0x80002880`, GPU/JPU `0x80002880`, VLD `0x80002080`, DEQ `0x80002280` |
+
+So `REG_MCU_BASE = CT909_IO_START+0x880` only lands at `0x80002880` if you read
+`CT909_IO_START` as `0x80002000` — but `REG_PLATFORM_ON_CHIP_BASE = IO_START` is
+`0x80000000`. **[OBS** — reconciled against where the running firmware actually
+pokes registers**]**
+
+### 8.4 Interrupt architecture
+
+- **Primary LEON controller** at `0x80000090` (mask) / `0x94` (pending) / `0x98`
+  (force) / `0x9C` (clear). **[SRC** `ctkav_platform.h:53-56` **/ OBS]**
+- **Secondary "PROC1-1st" controller** at `0x800000B0` (mask-enable, direct RW) /
+  `0xB4` (pending) / `0xB8` (status R / clear W1C) / `0xBC` (mask-disable). It
+  **cascades into LEON interrupt line 13** (`INT_NO_PROC1_1ST`). Bit0 = **VSYNC**
+  — the display field tick that drives the whole display/slideshow state machine
+  (`interrupt.c: INT_Proc1_1st_isr → ISR_DISPSaveClearStatus`). **Without a
+  periodic VSYNC the UI never advances past its first frame.** **[OBS** — supplying
+  this interrupt is what moved the firmware off its loading screen**]**
+- Sibling secondary controllers: **PROC1-2nd** `0x800000D0` (BIU / MCU-BSRD / USB
+  / servo / buffer over/underflow), **PROC2-1st** `0x800001B0`. Interrupt numbers:
+  UART1=3, TIMER1=8, TIMER2=9, PROC1-2nd=10, **PROC1-1st=13**. **[SRC** `:129-168`**]**
+
+### 8.5 The photo-decode datapath (PROC1 ↔ PROC2 ↔ decode hardware)
+
+The pipeline a photo flows through, and the handshakes that gate it:
+
+1. **vdec shared SRAM at `0xB0000000`** (`REG_SRAM_BASE`, 2 KB) is the PROC1↔PROC2
+   mailbox. `REG_SRAM_PLAYMODE` = `0xB0000190` (byte), `REG_SRAM_WATCHDOG` =
+   `0xB0000194`. **[SRC** `ctkav_vdec.h:350-369`**]**
+2. **The vdec command protocol** (`comdec.h` `EN_VDEC_CMD`): PROC1 writes a
+   command byte to `PLAYMODE`; the PROC2 microcode overwrites it with a completion
+   state that PROC1 polls for. Commands/states seen from the running firmware:
+   `MODE_STOP=0x10`→ack `MODE_STOPPED=0x11`, `MODE_SCAN=0x40`→`SCAN_DONE=0x12`,
+   `MODE_PREDECODE=0x80`→`PREDEC_DONE=0x13`, `MODE_RELEASE_MODE=0x86`,
+   `MODE_NONE=0x00`. `_Wait_Decoder_Stop_CMD_ACK` spins for `MODE_STOPPED`.
+   **[SRC** `comdec.h:25-53`, `hal.c:1021`, `hdecoder.c:1477` **/ OBS** the byte
+   sequence**]**
+3. **Bitstream feed = MCU BIU read channel** `BCR08..0E` at `0x80002A20..A38`
+   (base `0x80002880 + 0x1A0`). The firmware DMA-feeds JPEG bytes and polls the
+   read-channel FIFO status `0x80002A28` for **`BIU_STATUS_BIURDDRDY` (bit
+   `0x1000`)**. **[SRC** `ctkav_mcu.h:84-95`, `ctkav_biu.h:82` **/ OBS** the poll**]**
+4. **Undocumented decoder-state register `0x80000C10`** — the firmware waits for
+   bits[20:16] to reach ≥7 (and/or `PLAYMODE==0x10`) before proceeding. Not in the
+   headers; behaves as a decoder/PROC2-written state word. **[OBS]**
+5. **2-D GPU engine at `0x80002880`** (shares the block with the JPU; `JPU_CTRL[28]
+   JPU_GPU_OP` selects the register interpretation). Does fills + 1-bit font
+   expansion into the 8bpp OSD plane — this is how the UI text ("Loading …") is
+   drawn. Font glyphs: 64-byte 1-bit, MSB-first. **[SRC** `ctkav_gpu.h`,
+   `ctkav_jpu.h` **/ OBS** the font path renders UI text**]**
+6. **Display output planes:** OSD 8bpp palette-indexed plane at `0x4005F000`
+   (palette `GAM_OSD` at `0x80001C00`, entries are BT.601 `0x00YYUUVV`); the video
+   plane frame buffers are `REG_DISP_F0Y/F0C_ADDR` at `0x80001AC0/AC4`
+   (`REG_DISP_BASE=0x80001A00`). Panel stride from `REG_DISP_STRIPE`. **[SRC**
+   `ctkav_disp.h:71-80` **/ OBS** OSD scan-out**]**
+
+### 8.6 Boot log & memory staging (retail image)
+
+Observed boot sequence from the real ROM **[OBS]**: `DRAM_Config=0108011b`
+(16 Mbit), `MCLK=133MHz`, `PROM_Config=20541010`, `Code_Protect=3`. Sections are
+staged to DRAM then jumped: `ROMV→0x40000000`, `TEXT→0x4001D000`,
+`DATA→0x40020878`, `ENGL→0x40049900`, then `Jump Sec[ROMV]:40000000`. Boot SP =
+`0x40012000`. Compressed sections are inflated by the firmware's own UZIP codec
+(flash `0x2000`).
+
+### 8.7 Built-in demo photos (free test vectors)
+
+The frame ships **five 640×360 JFIF/EXIF photos** — the Windows sample-picture
+set (zebra-longwing butterfly, Grand Teton barn, chrysanthemum, Golden Gate, …).
+They sit at flash **`0x160000 / 0x170000 / 0x180000 / 0x190000 / 0x1A0000`**, one
+per 64 KiB slot, each followed by two thumbnails (main image + `+0x14C` +
+`~+0x1A74`). `jupiter/emu/tools/extract_photos.py` pulls and renders them.
+Handy as known-good JPEG decode inputs for any decoder port. **[OBS]**
+
+---
+
+*Sections 1–7 are from static reading of this SDK; §8 adds facts confirmed by
+running the retail image in an emulator (`jupiter/emu/`, see its `BRINGUP.md` for
+the blow-by-blow). On-hardware specifics — whether the retail DP700WD image muxes
+the UART pins, and the exact 480×234 TCON timing — must still be confirmed on the
+bench.*

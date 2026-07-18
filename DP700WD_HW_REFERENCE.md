@@ -938,6 +938,58 @@ real window to latch — matching how the real decoder holds the stop state unti
 acknowledged. Experiment hooks added: `CT952_VDEC_IDLE` (gate-2 flag
 `0x40039f24==1`), composed with `CT952_FORCE_PLAYMODE`.
 
+### 10.12 The full gate chain resolved — gate 3 is MODE_STOPPED, not a new flag
+
+Thread-isolated PC capture (boot stack `sp=0x40036f58`, icount>40M) with both
+prior gates forced pinned the third block **precisely** — and it is the **same
+playmode datapath as gate 1, one state further along**:
+
+* First, `0x59850` (`OS_DelayTime`) is a **red herring**: it's called exactly
+  twice all boot (`OS_DelayTime(25)`@`0x401ac`, `OS_DelayTime(150)`@`0x33c94`),
+  both plain sequential init delays that **complete** (~icount 33M). The eCos
+  tick (level-8 IRQ, `0x4002e328`) advances normally (1068@150M, 1441@200M), so
+  time is not frozen.
+* The real block: after the delays the boot thread enters the VDEC-stop /
+  display-init code (`0x33xxx`–`0x34xxx`) and spins in decoder-state waits for
+  **MODE_STOPPED (`0x11`)**:
+  - `0x33dac`: `getstate(16)==0x11 ?` (`0x33dec: subcc state,17; bne 0x33dc0`),
+    149-tick timeout; issues `MODE_STOP` first via `0x6f2b0(id,16,0)`.
+  - `0x36ff0`: `0x375a0(id,3)==1 ?` (returns 1 for state ∈ {0x10,0x11,0x12}),
+    2499-tick timeout — **22 call sites**, 3 of `0x33dac`.
+* The getter `0x6f054` returns `mirror(0x40039cd0)` **OR'd with a busy bit
+  `0x1000`** whenever the live `0xB0000190 ∉ {0, 0x11}`. Under the forces:
+  live `0xB0000190`=`0x10` (pinned), mirror `0x40039cd0`=`0x00` (never set to
+  STOPPED) → getter returns `0x1000` → `≠0x11` and classifies to 2, never 1 →
+  every wait rides its full timeout. At ~7 ticks/M-instr a single 2499-tick wait
+  is ~350M instr; the cascade of 22 keeps `GPU ops=0` well past 1.5B. **Death by
+  timeout cascade, not one hard hang.**
+
+**Why no constant force can ever clear it (verified):** gate 1 needs `0x10`,
+gate 3 needs `0x11`; `CT952_FORCE_PLAYMODE=0x11` breaks gate 1, `=0x10` breaks
+gate 3, and neither sets the mirror `0x40039cd0`. The state **must transition
+`MODE_STOP(0x10) → MODE_STOPPED(0x11)`** *and* the firmware's own STOP-command
+path must then write `0x11` into the mirror `0x40039cd0`. `proc2_ack_of`
+(`machine.c:461`) already maps `0x10→0x11`; the fix is to give the halted-decoder
+stand-in **realistic dwell** — hold `0x10` long enough for the gate-1 poll to
+latch, then advance to `0x11` for the gate-3 poll — *without* a static override
+racing or pinning it. The `FORCE_*`/`VDEC_IDLE` hooks are diagnostic dead-ends
+for the real fix (they proved the chain; they cannot clear gate 3).
+
+**Confirmed gate order (INITIAL_PowerONStatus → menu), PROC2 in reset:**
+1. `0x61170`/`0x375a0` — decoder-stop ack, wants playmode `0x10` (MODE_STOP).
+2. `0x70240` — wants `*(uint16*)0x40039f24 == 1`.
+3. two sequential `OS_DelayTime` (complete normally).
+4. `0x33dac` (`==0x11`) + `0x36ff0` (`0x375a0(id,3)==1`) ×22 — want **MODE_STOPPED
+   `0x11`** at both `0xB0000190` and mirror `0x40039cd0`.
+
+**Net:** the boot-thread block is one coherent problem — the halted decoder's
+STOP→STOPPED handshake never plays out in emulation because the stand-in has no
+dwell and the software mirror never follows. Implementing a small decoder-stop
+state machine in the stand-in (command MODE_STOP → dwell at 0x10 → 0x11, live +
+mirror) should clear gates 1, 3, and likely 2 together, letting the boot thread
+reach `POWERONMENU_Initial` and draw the menu on its own. That is the single
+remaining piece before the §10.10 JPEG-display path opens.
+
 ### 10.10 JPEG datapath implementation spec (ready to apply once §10.9 is cleared)
 
 Full evidence-backed recipe for when the firmware does kick the decode:

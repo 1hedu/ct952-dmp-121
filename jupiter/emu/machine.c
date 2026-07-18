@@ -303,6 +303,10 @@ static void gpu_exec(machine_t *m, uint32_t ctl0)
     uint32_t dest = io_get(m, R_GPU_DEST);
     uint32_t opmode = (ctl0 >> 2) & 0x7;
 
+    if (m->gpu_ops == 0 && getenv("CT952_TRACE"))
+        fprintf(stderr, "[GPU-FIRST] first GPU op at icount=%llu pc=%08x "
+                "(UI drawing started -> menu reached)\n",
+                (unsigned long long)m->cpu.icount, m->cpu.pc);
     m->gpu_ops++;
     if (ctl0 & GPU_FONT_1BIT) m->gpu_font_ops++; else m->gpu_mode_ops[opmode]++;
 
@@ -484,6 +488,24 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         return 0;
     }
 
+    /* Capture the boot-thread poll loop stuck after the logo times out:
+     * whenever OS_GetSysTimer reads the eCos tick backing store (0x4002e328),
+     * dump the recent PC ring (the caller chain) once we're past the logo
+     * (icount>60M). CT952_POLLTRACE. */
+    if (getenv("CT952_POLLTRACE") && addr == 0x4002e328u &&
+        m->cpu.icount > 60000000ull) {
+        static int pn;
+        if (pn < 8) {
+            int k; fprintf(stderr, "[POLL] tick-read caller chain:");
+            for (k = 56; k < 64; k++)
+                fprintf(stderr, " %08x", m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63]);
+            fprintf(stderr, "  o7=%08x i7=%08x sp=%08x\n",
+                    sparc_get_reg(&m->cpu, 15), sparc_get_reg(&m->cpu, 31),
+                    sparc_get_reg(&m->cpu, 14));
+            pn++;
+        }
+    }
+
     /* Capture the PC that polls the BIU bit-stream read channel (0x80002a28
      * / 0x80002a34), so we can disassemble the poll loop and learn the exact
      * "drained/ready" value the JPEG worker wants. CT952_BIUTRACE. */
@@ -649,12 +671,30 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
     /* PROC1 issued a VDEC command via REG_SRAM_PLAYMODE: arm the PROC2 ack
      * (delivered after a few status polls, mimicking the microcode latency). */
     if (addr == 0xB0000190u) {
-        m->proc2_cmd = (uint8_t)val;
-        /* Arm the dwell only when the ack differs from the commanded value
-         * (e.g. STOP 0x10 -> STOPPED 0x11). Hold the commanded state for
-         * proc2_ack_dwell cycles so the boot poll can latch it first. */
-        m->proc2_ack_cycle = (proc2_ack_of((uint8_t)val) != (uint8_t)val)
-                             ? m->cycles + m->proc2_ack_dwell : 0;
+        uint8_t cmd = (uint8_t)val;
+        /* Model a real decoder: a STOP command always transitions through
+         * MODE_STOP(0x10) before settling at STOPPED(0x11). The firmware writes
+         * 0x10 on a fresh stop, but on an *idempotent* repeat-stop (decoder
+         * already stopped) the COMDEC issuer (flash 0x6f2b0..0x6f400) writes
+         * 0x11 directly -- yet the boot thread's decoder-stop poll (0x61170,
+         * from INITIAL_PowerONStatus and POWERONMENU_Initial's
+         * CC_KeyCommand(KEY_STOP)) still waits for the 0x10 window. So when the
+         * ISSUER commands STOPPED(0x11), present MODE_STOP(0x10) now and deliver
+         * the 0x11 ack after the dwell -- giving the poll its 0x10 window on
+         * every stop. PC-gated to the issuer so the decoder dispatcher's own
+         * 0x11 state echoes (flash 0x70xxx) don't re-trigger and oscillate. */
+        if (cmd == 0x11u && m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f400u) {
+            val = 0x10u;                              /* store MODE_STOP now */
+            m->proc2_cmd = 0x11u;                     /* ack -> STOPPED */
+            m->proc2_ack_cycle = m->cycles + m->proc2_ack_dwell;
+        } else {
+            m->proc2_cmd = cmd;
+            /* Arm the dwell when the ack differs from the commanded value
+             * (e.g. STOP 0x10 -> STOPPED 0x11); hold the commanded state for
+             * proc2_ack_dwell cycles so the boot poll can latch it first. */
+            m->proc2_ack_cycle = (proc2_ack_of(cmd) != cmd)
+                                 ? m->cycles + m->proc2_ack_dwell : 0;
+        }
     }
 
     /* Trace who writes the vdec playmode + its software mirrors (the state the

@@ -74,6 +74,33 @@ scans out through the DE instead of reading a side-channel palette. The
 same path will render the *firmware's* screen the moment it reaches its
 own OSD init -- no demo-specific assumptions.
 
+## BREAKTHROUGH: correct chip ID -> the firmware self-boots
+
+The stock first-stage boot (flash `0x310`) reads **`PSR[31:24]`** and only
+runs its real clock/DRAM/PROM/section-load path when it sees **`0xA0`**
+(the CT952 chip ID); any other value drops it to a debugger-style path.
+The emulator had been reporting a LEON-ish `0xF3...`, so the true boot
+never ran -- which is *why* `--rom-load` was needed and why the config
+tables at `0x40042000`/`0x40046800` were always empty (the descriptor
+builder is part of the real boot). This root cause was found by the
+parallel `coby-dp722` effort; independently reproduced here.
+
+Setting `sparc_reset` PSR to `0xA0000000` (impl=0xA, ver=0) makes the
+firmware **boot itself with no `--rom-load`**: it programs the PROM
+controller, decompresses every section, builds the config descriptors,
+and runs the eCos app -- now programming the **DISP** timing/OSD
+registers (`0x80001A38..A64`), the **Vipor scaler/TCON** panel block
+(`0x80003xxx`), the **2-D GPU** (`0x80002880`, dest `0x4009E600`), and
+reading **SAR-ADC** keys (`0x8000407C`). Backing `0xB0000000` as real
+VDEC/USB scratch SRAM (not a 0/FF stub) lets the working-memory writes
+there stick. CPU stays bit-exact.
+
+The OSD plane stays blank for now only because the on-screen "Loading ."
+is drawn by the **2-D GPU font path**, which this emulator does not model
+yet (the parallel branch does) -- the pixels are issued, they just have
+no engine to land in. Next: model the GPU blit/font engine so those ops
+render into the OSD plane, then the modelled DISP scan-out shows them.
+
 ## Stock-firmware boot frontier
 
 `./ct952emu dp700wd.bin --rom-load` now boots far past the old

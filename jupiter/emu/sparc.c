@@ -46,8 +46,11 @@ void sparc_reset(sparc_t *c, sparc_bus_t *bus)
     c->bus = bus;
     c->pc = 0;
     c->npc = 4;
-    /* impl=0xF ver=3 (LEON-ish), S=1, ET=0, CWP=0 */
-    c->psr = 0xF3000000u | PSR_S;
+    /* impl=0xA ver=0 -- the real CT952 chip ID. The stock first-stage
+     * boot at flash 0x310 reads PSR[31:24] and only runs its true
+     * clock/DRAM/section-load path when it sees 0xA0; any other value
+     * drops it to a debugger-style path. S=1, ET=0, CWP=0. */
+    c->psr = 0xA0000000u | PSR_S;
     c->wim = 0;
     c->tbr = 0;
 }

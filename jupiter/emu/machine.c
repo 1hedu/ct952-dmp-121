@@ -260,10 +260,8 @@ static uint32_t bus_read(sparc_bus_t *b, uint32_t addr, int size, int *fault)
          * active-low), instead of reading as all-zeros. */
         return m->absent_ff ? 0xFFFFFFFFu : 0;
     }
-    if (addr >= 0xB0000000u && addr < 0xB0010000u) {
-        log_access(m, addr & ~3u, 0, 0);
-        return m->absent_ff ? 0xFFFFFFFFu : 0;   /* USB core stub */
-    }
+    if (addr >= 0xB0000000u && addr < 0xB0010000u)
+        return mem_read_raw(m->sram + (addr - 0xB0000000u), size);
     m->unmapped_reads++;
     log_access(m, addr & ~3u, 0, 0);   /* record so it names the blocker */
     return 0;
@@ -307,6 +305,10 @@ static void bus_write(sparc_bus_t *b, uint32_t addr, uint32_t val,
         return;
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 1, val);
+        return;
+    }
+    if (addr >= 0xB0000000u && addr < 0xB0010000u) {
+        mem_write_raw(m->sram + (addr - 0xB0000000u), val, size);
         return;
     }
     m->unmapped_writes++;
@@ -380,11 +382,13 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
         return -1;
     m->flash = (uint8_t *)malloc(MACH_FLASH_MAX);
     m->dram = (uint8_t *)malloc(MACH_DRAM_SIZE);
-    if (!m->flash || !m->dram)
+    m->sram = (uint8_t *)malloc(0x10000);   /* 0xB0000000 scratch SRAM */
+    if (!m->flash || !m->dram || !m->sram)
         return -1;
     memset(m->flash, 0xFF, MACH_FLASH_MAX);
     memcpy(m->flash, flash, flash_size);
     memset(m->dram, 0, MACH_DRAM_SIZE);
+    memset(m->sram, 0, 0x10000);
     m->flash_size = flash_size;
     m->uart_echo = 1;
 
@@ -406,8 +410,10 @@ void machine_free(machine_t *m)
 {
     free(m->flash);
     free(m->dram);
+    free(m->sram);
     m->flash = NULL;
     m->dram = NULL;
+    m->sram = NULL;
 }
 
 uint64_t machine_run(machine_t *m, uint64_t n)

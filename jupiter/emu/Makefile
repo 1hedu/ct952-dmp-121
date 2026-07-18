@@ -185,3 +185,20 @@ tests/demo_anim.bin: tests/demo_anim.elf
 anim: anim_run tests/demo_anim.bin
 	./anim_run tests/demo_anim.bin anim.bin
 	python3 tools/mkgif.py anim.bin demo_mode7.gif
+
+# ---- jgpu on the emulated GPU: driver register programming vs its model ----
+tests/jgpu_s.o: ../jgpu.c
+	$(XCC) $(XCFLAGS) -c -o $@ $<
+tests/jgpu_hw_test.o: tests/jgpu_hw_test.c
+	$(XCC) $(XCFLAGS) -I. -c -o $@ $<
+tests/jgpu_hw_test.elf: tests/start.o tests/jgpu_hw_test.o tests/jgpu_s.o tests/link.ld
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/jgpu_hw_test.o tests/jgpu_s.o -lgcc 2>/dev/null || \
+	$(XCC) -m32 -nostdlib -static -Wl,-T,tests/link.ld -o $@ \
+	    tests/start.o tests/jgpu_hw_test.o tests/jgpu_s.o
+tests/jgpu_hw_test.bin: tests/jgpu_hw_test.elf
+	$(XOBJCOPY) -O binary $< $@
+jgpu_check: jgpu_check.c sparc.c machine.c sparc.h machine.h
+	$(CC) $(CFLAGS) -I. -o $@ jgpu_check.c sparc.c machine.c
+gpucheck: jgpu_check tests/jgpu_hw_test.bin
+	./jgpu_check tests/jgpu_hw_test.bin

@@ -108,9 +108,14 @@ above). What has NOT been exercised on hardware:
   (leftmost = high bits) is inferred from the GDI conventions and
   test-pinned so a hardware session can correct it in one place.
 - `jgpu_ct952.c` (blitter submit/sync) mirrors gdi.c's GXA programming
-  exactly, and the op math is model-verified, but the hardware has not
-  executed it in this effort. `JAPP_USE_GPU 0` in japp.c falls back to
-  CPU drawing.
+  exactly. The op math is model-verified, and the register programming is
+  now **verified end-to-end on the emulated CT952 GPU** (`emu: make
+  gpucheck`): the Jupiter driver's own fill ops, fed through the real
+  register block, drive the emulator's 2-D engine and produce pixels
+  byte-identical to `jgpu_model_exec` across full- and partial-width
+  rects. (This surfaced and fixed an `ag_off`->pitch bug in the
+  emulator's fill model.) On real silicon, `JAPP_USE_GPU 0` in japp.c
+  still falls back to CPU drawing until a bench session confirms it.
 - All of `jcodec_ct952.c` (canvas binding, MPEG/JPEG decode-from-memory,
   JPEG encode, JPU scale) mirrors the firmware's own call sequences
   (`utl.c` logo paths, `mm_play.c` photo save, `digest.c`) line for

@@ -235,12 +235,21 @@ static void gpu_exec(machine_t *m, uint32_t ctl0)
         uint8_t color = (io_get(m, R_GPU_CTL1) >> 24) & 0xFF;
         uint8_t *fb;
         uint32_t r, c;
+        /* Reconstruct the destination pitch from AG_OFF exactly as the
+         * GXA does (gdi.c:1296-1297): the 16-bit dst gap encodes
+         * pitch_DW - ag_width + 1, so pitch = (gap + ag_width - 1)*4,
+         * ag_width = (w + (addr&3) + 3)>>2. (The generic `stride` above,
+         * tuned for the firmware's full-width font rows, is wrong for
+         * arbitrary fill rects.) */
+        uint32_t gap = io_get(m, R_GPU_AG_OFF) >> 16;
+        uint32_t agw = (w + (dest & 3) + 3) >> 2;
+        uint32_t fstride = (gap + agw >= 1) ? (gap + agw - 1) * 4u : w;
         if (!w || !h) return;
-        fb = dram_rw(m, dest, (h - 1) * stride + w);
+        fb = dram_rw(m, dest, (h - 1) * fstride + w);
         if (!fb) return;
         for (r = 0; r < h; r++)
             for (c = 0; c < w; c++)
-                fb[r * stride + c] = color;
+                fb[r * fstride + c] = color;
     }
     m->gpu_fontn = 0;   /* consume the font-index queue */
 }

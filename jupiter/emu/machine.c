@@ -144,6 +144,14 @@ static uint32_t io_read(machine_t *m, uint32_t off)
     case R_IIC_CMD:
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
+    case 0xc10:
+        /* EXPERIMENT(CT952_DECRDY): decoder-state word. PROC1 wait loops poll
+         * bits[20:16] for >=7 ("decode advanced"). Report ready so we can see
+         * where the firmware goes next. */
+        if (getenv("CT952_DECRDY"))
+            return (io_get(m, 0xc10) & ~0x001f0000u) | 0x00070000u;
+        log_access(m, 0x80000c10u, 0, 0);
+        return io_get(m, 0xc10);
     default:
         log_access(m, 0x80000000u + off, 0, 0);
         return io_get(m, off);

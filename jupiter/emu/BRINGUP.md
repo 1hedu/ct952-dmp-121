@@ -685,3 +685,38 @@ To reach a firmware-decoded photo: model the MCU BIU bitstream-read channel
 `0x80000c10` decoder-state, far enough that PROC1 loads the JPEG microcode and
 releases PROC2 -- then the real microcode decodes into the frame buffer and the
 DISP video-plane scan-out (still to add) shows it.
+
+---
+
+## Update: cracking the 0x80000c10 gate, and finding the auto-decode target
+
+Continuing the faithful-decode push (PROC2 enabled, stand-in acks off):
+
+* **`0x80000c10` is the real gate.** With the acks off, PROC1 spins ~37M times
+  in a wait loop at flash `0x72810` that exits when this register's bits[20:16]
+  reach >=7 **or** `PLAYMODE==0x10` -- both decoder/PROC2-driven. Modeling it as
+  "decode advanced" (report >=7, `CT952_DECRDY` gate in `io_read`) clears that
+  poll and the firmware runs on.
+  - Caller chain: the wait is invoked from a decode-kick at flash `0x72018` ->
+    `0x744bc` -> `0x73dc0`, a generic callback dispatcher (`call %i0`/`%i1` with
+    two function pointers). The decode path is a deep, callback-driven state
+    machine -- not worth tracing further register-by-register.
+* **The BIU feed loop (`0x80002a28`) is a soft block** -- it polls the MCU
+  bitstream-read FIFO for `BIU_STATUS_BIURDDRDY` (bit 0x1000) with a 50-try
+  timeout, then continues. It spins a lot but does not deadlock.
+* **Past both gates, the firmware renders UI to the OSD plane** (173K GPU ops to
+  `0x4005F668`), *not* an auto photo decode -- the DISP video-plane frame
+  buffers stay unset and PROC2 is never released. So the remaining work is a
+  **higher layer** (what the firmware chooses to display), not these low gates.
+
+### The auto-decode target: the boot LOGO is a JPEG
+
+The `LOGO` flash section (table entry at `0xe8`: run `0x00104DD8`, size
+`0xB1A8`) is a **480x270 JFIF at flash `0x104DE0`** -- a blue splash the firmware
+decodes and shows at power-on via `UTL_ShowLogo` (`utl.c:481`; romcfg text at
+`0xf12b5` tags it `JPEG`). This is the cleanest "firmware decodes a JPEG to
+screen" target: auto-triggered at boot, no media required. `UTL_ShowLogo`
+early-returns when `LOGO_TYPE()==LOGO_DEFAULT`, so step one is confirming the
+firmware takes the decode branch; step two is completing the JPEG-on-PROC2
+datapath so the decoded 480x270 lands in a frame buffer the DISP scans out.
+`tools/extract_photos.py` now also dumps this logo (`logo.png`).

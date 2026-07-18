@@ -25,6 +25,11 @@ import sys
 SLOT_OFFSETS = [0x160000, 0x170000, 0x180000, 0x190000, 0x1A0000]
 SLOT_SPAN = 0x10000            # one 64 KiB flash sector per slide
 
+# The boot LOGO: the "LOGO" flash section (table entry at 0xe8) is a 480x270
+# JFIF that the firmware decodes and shows at power-on (UTL_ShowLogo). The JPEG
+# starts a few bytes into the section payload.
+LOGO_OFFSET = 0x104DE0
+
 PANEL_W, PANEL_H = 480, 234    # DP700WD 7" LCD
 
 
@@ -65,6 +70,16 @@ def main():
 
     rom = open(args.rom, "rb").read()
     os.makedirs(args.outdir, exist_ok=True)
+
+    # boot logo first
+    logo = decode_slot(rom, LOGO_OFFSET)
+    if logo is not None:
+        p = os.path.join(args.outdir, "logo.png")
+        logo.save(p)
+        print("LOGO  @ %#08x  %dx%d  -> %s" % (LOGO_OFFSET, logo.width,
+                                               logo.height, p))
+        if args.panel:
+            to_panel(logo).save(os.path.join(args.outdir, "logo_panel.png"))
 
     n = 0
     for i, off in enumerate(SLOT_OFFSETS):

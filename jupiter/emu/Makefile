@@ -14,11 +14,11 @@ CFLAGS   ?= -O2 -Wall
 
 all: ct952emu test_sparc tests/testprog.bin
 
-ct952emu: main.c sparc.c machine.c emujpeg.c picojpeg.c sparc.h machine.h \
+ct952emu: main.c sparc.c machine.c emujpeg.c picojpeg.c gdbstub.c sparc.h machine.h \
           emujpeg.h picojpeg.h
-	$(CC) $(CFLAGS) -o $@ main.c sparc.c machine.c emujpeg.c picojpeg.c
+	$(CC) $(CFLAGS) -o $@ main.c sparc.c machine.c emujpeg.c picojpeg.c gdbstub.c
 
-EMU_SRC = sparc.c machine.c emujpeg.c picojpeg.c
+EMU_SRC = sparc.c machine.c emujpeg.c picojpeg.c gdbstub.c
 
 test_sparc: test_sparc.c $(EMU_SRC) tests/testprog.c \
             sparc.h machine.h emujpeg.h picojpeg.h tests/testapi.h

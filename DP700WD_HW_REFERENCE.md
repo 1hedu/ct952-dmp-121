@@ -2438,3 +2438,28 @@ asleep (§10.46). The one concrete unblock is still H2 — drive the CC loop's e
 dispatch (inject its periodic non-user wake) so it selects the POWERONMENU-entry
 handler; the flag flips, and with the fast tick pushed past 57952 ticks the monitor
 then fires `OSDSS_Entry` on its own. All addresses retail-empirical via `dis.sh`.
+
+### 10.48 TOOLING — a GDB remote stub in the emulator (interactive firmware debug)
+
+Built a GDB remote-serial-protocol stub into `ct952emu` (`jupiter/emu/gdbstub.c`)
+so a real SPARC gdb can breakpoint / step / inspect the live firmware instead of
+env-var-driven `printf` archaeology. Run `./ct952emu --rom-load --gdb <port>
+--quiet dp700wd.bin`, then from a SPARC gdb: `set architecture sparc; target remote
+:<port>`. Machine-side primitives (`machine.c`): `machine_step_bp()` runs the tight
+step-and-check loop (full per-instruction timer/IRQ/PROC2 tick preserved, so the
+RTOS keeps live time while stopped-then-continued) and `machine_dbg_read/write()`
+hit the flash/DRAM/BRAM backing stores with no I/O side effects. Breakpoints are
+stub-managed (address list, no code patching) so they work in XIP flash too.
+
+Implemented RSP: `qSupported/?/g/G/p/P/m/M/c/s/Z0/z0/H/D/k`; SPARC 72-reg `g`-packet
+order (32 int + 32 f0-f31=0 + y/psr/wim/tbr/pc/npc/fsr/csr); Ctrl-C interrupt via a
+non-blocking `MSG_DONTWAIT` poll between continue-batches.
+
+**Verified over the wire** (Python RSP client, no gdb needed for the test): reset
+regs read (pc=0/npc=4), `Z0,eb90` + `c` single-stepped ~4.9M instrs in the C loop
+and **stopped exactly at INITIAL_System 0x0000eb90** (~1.3M steps/s ⇒ ~55s to reach
+POWERONMENU @75.5M — fine for interactive use), and the `m0xeb90` memory read
+returned `808c2040 3080000d 02800008 808c2040`, **byte-identical** to `dis.sh`'s
+`btst 0x40,%l0 / b,a / be / btst`. This is the tool for the H2 next step: breakpoint
+the handler-dispatch site, watch which event slot the CC loop selects, and pin the
+exact wake it's starved of.

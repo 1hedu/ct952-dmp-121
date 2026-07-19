@@ -29,6 +29,7 @@ int main(int argc, char **argv)
     int m_jpeg_en = 0;
     uint32_t m_jpeg_src = 0x401dc000u;
     const char *jpeg_out_path = NULL;
+    int gdb_port = 0;
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -74,6 +75,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--jpeg-out") && i + 1 < argc) {
             jpeg_out_path = argv[++i]; m_jpeg_en = 1;
         }
+        else if (!strcmp(argv[i], "--gdb") && i + 1 < argc)
+            gdb_port = (int)strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -152,9 +155,15 @@ int main(int argc, char **argv)
                 seed_entry, seed_sp);
     }
 
+    if (gdb_port) {
+        fprintf(stderr, "[ct952emu] flash %ld bytes, gdb stub mode\n", sz);
+        gdb_serve(m, gdb_port);
+        ran = m->cpu.icount;
+    } else {
     fprintf(stderr, "[ct952emu] flash %ld bytes, running %llu instrs\n",
             sz, (unsigned long long)max_instr);
     ran = machine_run(m, max_instr);
+    }
     fprintf(stderr,
             "\n[ct952emu] stopped after %llu instrs: %s\n"
             "[ct952emu] pc=0x%08x npc=0x%08x psr=0x%08x tbr=0x%08x "

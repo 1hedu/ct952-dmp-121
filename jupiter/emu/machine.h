@@ -187,6 +187,17 @@ int machine_call(machine_t *m, uint32_t entry,
                  uint32_t a0, uint32_t a1, uint32_t a2,
                  uint32_t sp, uint64_t budget);
 
+/* gdb-stub support (gdbstub.c): step-with-breakpoints + side-effect-free
+ * debug memory access. See the definitions in machine.c. */
+int machine_step_bp(machine_t *m, const uint32_t *bps, int nbp,
+                    uint64_t maxsteps, uint64_t *out_steps);
+uint32_t machine_dbg_read(machine_t *m, uint32_t addr, int size);
+void machine_dbg_write(machine_t *m, uint32_t addr, uint32_t val, int size);
+
+/* Serve the GDB remote protocol on TCP `port`, driving this machine, until
+ * the client detaches/kills. Returns 0 on a clean session, -1 on setup error. */
+int gdb_serve(machine_t *m, int port);
+
 /* Direct DRAM helpers (addr in 0x40000000 space). */
 uint32_t machine_dram_rd(machine_t *m, uint32_t addr, int size);
 uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr);

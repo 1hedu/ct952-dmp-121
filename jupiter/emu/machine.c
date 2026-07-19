@@ -1556,6 +1556,62 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     return done;
 }
 
+/* --- gdb-stub support (see gdbstub.c) ------------------------------------ *
+ * Run up to `maxsteps` instructions with the full per-instruction device
+ * tick (timers/IRQ/PROC2), stopping the instant the PROC1 PC lands on any of
+ * `bps`. Returns 1 if a breakpoint was hit (pc now sits ON it, unexecuted),
+ * 0 if maxsteps ran out, -1 if the CPU halted/watchdog-fired. `*out_steps`
+ * gets the instruction count actually run. The tight loop lives here (not in
+ * the stub) so a "continue" batch stays fast between socket polls. */
+int machine_step_bp(machine_t *m, const uint32_t *bps, int nbp,
+                    uint64_t maxsteps, uint64_t *out_steps)
+{
+    uint64_t s = 0;
+    int rc = 0, i;
+    m->cpu.brk_pc = 0;   /* the stub manages breakpoints itself */
+    while (s < maxsteps) {
+        if (m->cpu.halted || m->watchdog_fired) { rc = -1; break; }
+        if (sparc_run(&m->cpu, 1) == 0) { rc = -1; break; }
+        machine_cycle(m);
+        if (m->proc2_on && !m->cpu2.halted)
+            sparc_run(&m->cpu2, 1);
+        s++;
+        for (i = 0; i < nbp; i++)
+            if (m->cpu.pc == bps[i]) { rc = 1; goto done; }
+    }
+done:
+    if (out_steps) *out_steps = s;
+    return rc;
+}
+
+/* Debug memory access for the stub: hit the backing stores directly (no I/O
+ * side effects). Covers flash (XIP low), DRAM (+ 0xC0000000 alias) and the
+ * 0xB0000000 scratch SRAM; other regions read 0 / ignore writes. size=1/2/4. */
+uint32_t machine_dbg_read(machine_t *m, uint32_t addr, int size)
+{
+    if (addr + (uint32_t)size <= m->flash_size)
+        return mem_read_raw(m->flash + addr, size);
+    if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE)
+        return mem_read_raw(m->dram + (addr - 0x40000000u), size);
+    if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)
+        return mem_read_raw(m->dram + (addr - 0xC0000000u), size);
+    if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u)
+        return mem_read_raw(m->bram + (addr - 0xB0000000u), size);
+    return 0;
+}
+
+void machine_dbg_write(machine_t *m, uint32_t addr, uint32_t val, int size)
+{
+    if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE)
+        mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
+    else if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)
+        mem_write_raw(m->dram + (addr - 0xC0000000u), val, size);
+    else if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u)
+        mem_write_raw(m->bram + (addr - 0xB0000000u), val, size);
+    else if (addr + (uint32_t)size <= m->flash_size)
+        mem_write_raw(m->flash + addr, val, size);   /* allow XIP code patch */
+}
+
 #define CALL_SENTINEL 0xE0000000u
 
 int machine_call(machine_t *m, uint32_t entry,

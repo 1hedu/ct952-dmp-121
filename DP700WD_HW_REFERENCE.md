@@ -1871,3 +1871,29 @@ under the OSD, so a full-panel render shows the logo behind the "Loading" OSD.
 DONE and verified (the COBY logo). The decoder bring-up now produces real pixels
 through the firmware's own tiling; the same path carries the built-in photos.
 Env: `CT952_LOGODECODE`. Retail anchors as §10.33.
+
+### 10.35 The decode-done signal is a JPU interrupt (faithful-VIDEO_EN anchor)
+
+JPU register map (`ctkav_jpu.h`) clarifies the decode ops seen at §10.32:
+`JPU_CTRL[6:4]` op mode — `JPU_SC 0x10` (scale), `JPU_FC_Y/U/V 0x40/0x50/0x60`
+(fill-color per plane), with `JPU_UV_IDX 0x8`. So the ~26-op burst is the JPU
+**scaling + fill** of the VLD-decoded image (the VLD does entropy decode; the JPU
+post-processes). Output goes to `REG_JPU_ADDR_W_ST 0x2888` (dest addr [26:2]);
+source `REG_JPU_ADDR_R_ST 0x2884`; stride `0x288C`; src/dst dims `0x2890/0x2894`.
+
+Crucially: **`JPU_INT_CLR = JPU_CTRL[31]` "signal to reset JPU's interrupt"** — the
+JPU raises a **completion interrupt**, and the firmware clears it via bit 31. The
+emulator only clears `JPU_BUSY` (bit 0) on a kick; it never raises the JPU
+done-interrupt. So the firmware's `JPEG_Decode` (which waits on the JPU/VLD
+completion IRQ before setting `JPEG_Status=OK`) never sees "done" → no
+`HALJPEG_Display` → `VIDEO_EN` stays 0. Producing the output + `0xC10`/BIU polls
+didn't flip it precisely because the missing signal is the IRQ, not a poll.
+
+**Faithful-VIDEO_EN next build:** on the JPU decode kick (or when the fill/scale
+op sequence completes), raise the JPU completion interrupt on its LEON IRQ line
+(and honor `JPU_INT_CLR` writes), so the firmware's decode driver runs to
+`JPEG_Status=OK` → `HALJPEG_Display` sets `F0Y/F0C/VIDEO_EN` itself. Anchors:
+`JPU_CTRL 0x80002880` (INT_CLR bit 31), `ADDR_W_ST 0x2888` (real output dest to
+write the tiled YUV into, instead of the hardcoded 0x40065000), the LEON IRQ
+controller (`0x80000000` block). With that, the CT952_LOGODECODE output + the IRQ
+completes the fully-hands-off natural display.

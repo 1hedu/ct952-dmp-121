@@ -961,6 +961,15 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
+        /* Video-plane-enable trace (CT952_VENTRACE): log writes to the software
+         * video-enable flag *0x40023fc0 (compositor 0xa683c copies it to VIDEO_EN)
+         * and the gate *0x40040e70, to find where the JPEG display enables video. */
+        if (getenv("CT952_VENTRACE") &&
+            ((addr & ~3u) == 0x40023fc0u || (addr & ~3u) == 0x40040e70u)) {
+            static int ve; if (ve < 80) {
+                fprintf(stderr, "[VENwr] %08x=%08x pc=%08x icount=%llu\n",
+                        addr & ~3u, val, m->cpu.pc, (unsigned long long)m->cpu.icount); ve++; }
+        }
         /* IR-key propagation trace (CT952_KEYTRACE): after the IR injection, log
          * small DRAM byte writes so we can locate __bISRKey and see whether the
          * key reaches the "Loading" event queue / input struct (10.38). */

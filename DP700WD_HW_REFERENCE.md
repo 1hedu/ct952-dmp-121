@@ -2679,3 +2679,25 @@ demo hooks (not boot-progress crutches). The real remaining wall is unchanged: p
 POWERONMENU the CC thread blocks on mailbox `0x40033830` with nothing posting to it
 (§10.50) — the event-starvation, which needs a *hardware event source* modeled, not a
 faked flag. That is the next gate, and it is the hard one.
+
+### 11.4 Alarm hypothesis DISPROVEN — the clock/alarms work; it's a missing event post
+
+Tested whether eCos alarms fire (candidate single root for the whole starvation).
+Result: **they do.** On the crutch-free POWERONMENU snapshot, the eCos clock counter
+(retail `0x4002e32c`) advances `0x213 → 0x222` (+15) over ~3 s of `continue`. Since
+that counter is incremented *inside* `Cyg_Counter::tick` — the same routine that walks
+the alarm list — the tick + alarm processing are running. Alarms are not broken.
+
+Corollary (stronger): a prior fast-tick run reached ~30 000 ticks (~30 s virtual) with
+`OSDSS_Monitor` still never called. With working alarms, any *alarm-driven* periodic
+screensaver check would have fired in 30 virtual seconds. It didn't → **the screensaver
+monitor is not alarm-driven**; it is gated purely on the CC event loop being alive.
+
+Also confirmed the DVD909 sym's DRAM globals do NOT match retail (current_thread
+@0x400498dc reads 0, impossible; 0x4001f458 disassembles to non-code) — retail eCos
+data/text addresses must stay empirically derived, per the standing warning.
+
+**Net:** the root is not a timer/alarm defect. The CC thread (`0x400371f8`) runs all
+its init, enters the event loop, and blocks *indefinitely* (no timeout) on mailbox
+`0x40033830` for a message that nothing posts. The remaining gate is a **missing
+hardware-event source** feeding that mailbox — not an alarm, and not a fakeable flag.

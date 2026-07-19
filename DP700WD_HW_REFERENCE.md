@@ -1445,3 +1445,47 @@ decoder/servo predicate it evaluates (likely reads playmode `0xB0000190` / mirro
 `0x40039cd0`), and satisfy it — extending the existing decoder-state model
 (`CT952_TEST_MIRROR10`, the stop-dwell) rather than faking the event.
 Tools added: `CT952_CCEVENT`, `CT952_PONSREADY` (both env-gated probes).
+
+### 10.23 GATE FOUND — the "Loading" state is an event pump waiting for a key/event message
+
+Decoded the state-8 handler end to end (all retail flash addresses). The full
+chain and its advance condition:
+
+```
+state-8 handler  0x25ef4
+  reads gate byte [0x40022F97] (=1 -> Loading path)
+  -> 0x26e44  "draw Loading + wait"
+       0x49944(2,0,0xFF)          ; OSD_Output(MSG_WAITING) = draw "Loading"
+       0x24d0c -> modal-wait 0x11fb0(mode0, cb=0x25234)   ; pulse on CC evt 0x1000
+       -> 0x254a4  POST-WAIT CHECK  (returns 0 => advance)
+            0x12cac(0x401D0C00, 0x401DC000)   ; 0x401DC000 = staged power-on LOGO jpeg (10.7)
+            -> 0x25d58  EVENT GETTER
+                 0x6b660(queue @0x400329FC)   ; pending-event count
+                 if none -> outputs [fp-0x10]=0, [fp-0xc]=0
+                 else     -> 0x12e18 fetches the event (code clamped to 0x64)
+            [fp-0x10] != 0  (event pending)  => 0x254a4 returns 0
+       0x254a4==0  => 0x26e44 returns 1  => handler latches/advances (0x2605c returns 1)
+```
+
+**Advance condition (ground truth):** the power-on logo/status state advances
+**only when a message is pending in the key/event queue at `0x400329FC`** (read
+via `0x6b660`; events look like key/IR codes, `< 0x64`). With no key/IR input, the
+decoder (PROC2) held in reset (so no decode-done event), and no media, the queue
+stays empty and the state re-draws "Loading" forever. This is why every attempt
+to fake the *downstream* CC event (`0x1000`) or the countdown byte failed —
+they're re-evaluation pulses; the actual advance needs a real **event message**.
+
+**This reframes the whole "Loading" stall:** it is not a busy decoder poll, it is
+an **event-driven wait for input / a decode-done / a media event**. The natural
+unlocks, in order of faithfulness:
+1. **Post a key event** to queue `0x400329FC` (e.g. inject an IR/keyboard code) —
+   ties directly to the sibling branch's USB-keyboard groundwork. Simplest test:
+   make `0x6b660` report one pending event and have `0x12e18` yield a benign key.
+2. **Model the logo decode-done event** (PROC2/JPEG datapath, §10.9-10.10) so the
+   firmware posts its own advance event — the faithful path.
+3. **A timeout event**, if the logo state has one (check for a timer that posts to
+   the queue).
+
+Key retail addresses: event queue `0x400329FC`; getter `0x6b660`; fetch `0x12e18`;
+state-8 handler `0x25ef4`; draw+wait `0x26e44`; post-wait check `0x254a4`; advance
+`0x2605c`; logo jpeg `0x401DC000`. All execution-verified (symbol-free).

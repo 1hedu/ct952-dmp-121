@@ -53,6 +53,10 @@ static void machine_maybe_jpeg_decode(machine_t *m)
         return;
     m->jpeg_sig = sig;
     m->jpeg_count++;
+    /* Faithful decode-completion: the decoder has produced a frame and settled
+     * to MODE_STOP(0x10). The decode-status getter (0x6f054 action 0) maps that
+     * to JPEG_STATUS_OK, so HALJPEG_Status(DECODE)=OK -> HALJPEG_Display (10.40). */
+    m->vdec_frame_done = 1;
     if (m->jpeg_out) {
         /* first frame -> jpeg_out as given; later frames -> name.NN.ppm */
         char path[512];
@@ -437,6 +441,13 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
              * decoder thread's `while (REG_JPU_CTRL & 1)` exits. */
             io_set(m, off, v & ~JPU_BUSY_BIT);
             m->jpu_active_until = m->cycles + 300000u;   /* decode-active window */
+            /* Faithful decode-completion: a JPU decode op means the hardware
+             * decoder is processing/finishing a frame -> it reaches MODE_STOP(0x10)
+             * = frame-done. The decode-status getter (0x375a0 action 0) maps 0x10
+             * to JPEG_STATUS_OK. Set after the boot stop gates (JPU decode runs
+             * only once the firmware is decoding), so gate-3's 0x11 is unaffected.
+             * Effective only under CT952_VDEC_DONE (mirror read gate) (10.40). */
+            m->vdec_frame_done = 1;
             /* P1: on the JPU decode kick, functionally decode the staged JPEG
              * and emit the tiled-YUV frame the real hardware would produce
              * (CT952_LOGODECODE). Guarded by jpeg_sig so it decodes once/frame. */
@@ -705,11 +716,14 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
          * getter 0x6f054) as MODE_STOP(0x10) so the boot stop-poll latches it
          * before the state settles to STOPPED(0x11). See machine.h. */
         if (addr == 0x40039cd0u) {
-            if (getenv("CT952_MIRTRACE") && m->cpu.icount > 10300000ull &&
-                m->cpu.icount < 13000000ull) {
+            if (getenv("CT952_MIRTRACE")) {
+                uint32_t rv = (m->cycles < m->vdec_stop_until) ? 0x10u :
+                    (m->vdec_frame_done && getenv("CT952_VDEC_DONE")) ? 0x10u :
+                    m->vdec_stopped ? 0x11u : mem_read_raw(m->dram + 0x39cd0u, size);
                 static int mt; if (mt < 60) {
-                    fprintf(stderr, "[MIRrd] 40039cd0 pc=%08x icount=%llu\n",
-                            m->cpu.pc, (unsigned long long)m->cpu.icount); mt++; }
+                    fprintf(stderr, "[MIRrd] ->%02x fdone=%d pc=%08x icount=%llu\n",
+                            rv, m->vdec_frame_done, m->cpu.pc,
+                            (unsigned long long)m->cpu.icount); mt++; }
             }
             /* Faithful software-mirror model: MODE_STOP(0x10) during the ack
              * dwell, then MODE_STOPPED(0x11) once stopped -- standing in for the
@@ -718,6 +732,12 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
              * (0x11) decoder-stop polls naturally -- retired the sp-gated
              * CT952_TEST_MIRROR10 read-hack this replaced. */
             if (m->cycles < m->vdec_stop_until) return 0x10u;
+            /* Once a JPEG frame has been functionally decoded, the decoder sits at
+             * MODE_STOP(0x10)=frame-done: the decode-status getter (0x375a0 action 0)
+             * maps 0x10 -> JPEG_STATUS_OK. This fires only after the boot's stop
+             * gates (which run before any decode), so gate-3's 0x11 is unaffected.
+             * Opt-in via CT952_VDEC_DONE for clean A/B (10.40). */
+            if (m->vdec_frame_done && getenv("CT952_VDEC_DONE")) return 0x10u;
             if (m->vdec_stopped) return 0x11u;
         }
         /* EXPERIMENT (CT952_VDEC_IDLE): present the boot thread's decoder-init
@@ -1407,7 +1427,7 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                 {0x0001186cu,"MEDIA_MonitorStatus(F)"}, {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"},
                 {0x4000eb90u,"INITIAL_System(D)"}, {0x4004b808u,"POWERONMENU_Initial(D)"},
                 {0x00012f10u,"PostEvent->list(F)"}, {0x00006eecu,"EvtDispatch_bit80(F)"},
-                {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"}, {0x0001186cu,"MEDIA_MonitorStatus2(F)"},
+                {0x00061170u,"UTL_ShowJPEG_Slide(F)"}, {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"},
             };
             static uint8_t hit[14];
             int wi;

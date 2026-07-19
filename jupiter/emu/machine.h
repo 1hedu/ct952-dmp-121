@@ -111,6 +111,12 @@ typedef struct machine {
                                  * software mirror 0x40039cd0 holds STOPPED(0x11), so
                                  * the boot's gate-3 poll passes without the MIRROR10
                                  * read-hack (faithful decoder-stop bookkeeping) */
+    int vdec_frame_done;        /* a JPEG frame has been functionally decoded: the
+                                 * decoder is now at MODE_STOP(0x10)=frame-done, so the
+                                 * decode-status getter (0x375a0->0x6f054, action 0)
+                                 * maps the mirror 0x40039cd0 to JPEG_STATUS_OK. Set
+                                 * after the stop gates, so gate-3's 0x11 is unaffected
+                                 * (DP700WD_HW_REFERENCE.md 10.40). */
 
     /* uart capture */
     FILE *uart_file;         /* optional capture file (may be NULL) */

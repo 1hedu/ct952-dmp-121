@@ -2120,3 +2120,58 @@ event via `0x6eec`/`0x12f10` → boot advances. New retail anchors: `PostEvent 0
 event dispatcher `0x6df8`/`0x6eec`; decode sub-orchestrator `0x6d4c0`; video
 compositor `0xac120` (state byte `+310`, displayed byte `0x40040ee4`);
 `MEDIA_Management 0x1152c`. Diagnostics: `CT952_DSTRACE`, `CT952_KEYTRACE`, `CT952_REACH` (+PostEvent/dispatch watches).
+
+### 10.40 Parallel-agent decode dig — the decode-status gate is REAL but INERT (the logo decode never runs)
+
+Fanned out three read-only agents on independent threads; here is the synthesis.
+
+**Decode-status mechanism — fully pinned (Agents 1+2, cross-verified static+empirical).**
+`UTL_ShowJPEG_Slide` (flash `0x61170`) polls `HALJPEG_Status(HALJPEG_DECODE)`
+→ `JPEG_Status` mapper **`0x375a0`** (action 0) → decoder-state getter **`0x6f054`**.
+The getter's action-0 handler (`0x6f098`) reads HW `0xB0000190`; when HW ∈ {0, 0x11}
+it returns the **SW mirror `0x40039cd0`**, else `mirror | 0x1000` (busy). The mapper
+`0x375a0`: **state `0x10` → OK(1)**, `0x11` → FAIL(0), `0x00` → UNFINISH(2). Enum
+(haljpeg.h): OK=1, UNFINISH=2, FAIL=0, UNSUPPORT=3. Bail on non-OK at `0x61338`→
+`0x6139c` (return FALSE, no `HALJPEG_Display`). So **DECODE OK ⇔ getter returns
+`0x10`**, which needs **mirror==0x10 AND HW∈{0,0x11}**. (Agent 1 first reversed a
+*different* copy `0x70808/0x70890` that keys on HW==0 — the wrong path; Agent 2
+traced the copy actually wired to `UTL_ShowJPEG_Slide`.) Forcing HW `0xB0000190=0x10`
+FAILS — it sets the busy bit; only the *mirror* must read 0x10.
+
+**Fix built (`CT952_VDEC_DONE`, verified-correct):** `vdec_frame_done` is set on the
+JPU decode burst (the decoder reaching MODE_STOP(0x10)=frame-done); the `0x40039cd0`
+read handler then returns `0x10` (after the boot stop gates, so gate-3's `0x11` is
+untouched). Confirmed the getter's action-0 handler (`0x6f0c0`) then reads `0x10`.
+
+**BUT — the gate is INERT in this boot (decisive empirical finding).**
+`UTL_ShowJPEG_Slide` (`0x61170`) is **never reached** (checked flash *and* DRAM
+`0x40061170`), and its decode poll never runs. Reason: `UTL_ShowLogo` (utl.c:481)
+returns early at **utl.c:512** because `LOGO_TYPE()==LOGO_DEFAULT` (utl.c:615/872
+set `__bLOGO |= LOGO_DEFAULT`). Corroboration: **no JPEG SOI (`ff d8 ff`) exists
+anywhere in DRAM** at 12M or 45M — the logo JPEG is never staged, so
+`CT952_LOGODECODE`'s functional decode has also been a no-op in this config. So
+there is **no logo/photo JPEG decode during boot**, the decode-status poll never
+fires, and the `CT952_VDEC_DONE` fix — though mechanically correct — cannot advance
+Loading. **The "Loading" stall is NOT a logo-decode-done gate.**
+
+**Media path (Agent 3).** The sole Loading advance-event poster `0x12f10` (via CC
+dispatcher `0x6eec`, bit `0x80`) never fires. The media thread never runs the scan:
+Gate A — the USBSRC worker is parked in unmodeled `usb.a`/`card.a` HW init, so
+`__fThreadInit` USB_DONE (`0x4003e590`, bit `0x80000`) is 0; Gate B (source-level,
+no HW needed) — `_MEDIA_MonitorMediaStatus` **early-returns at media.c:1479** when
+`__bChooseMedia==MEDIA_SELECT_DVD`, and it is initialised to DVD at media.c:616
+(the `MEDIA_SELECT_USB` line is commented out).
+
+**Reconciliation + redirect.** Prior sections (§10.23/10.39, Agent 3) said "the
+Loading advance is the JPEG decode-done event" — but that decode **never runs** in
+this power-on path, so it cannot be the trigger. With no logo decode, no media scan,
+and no consumed input, **nothing generates the advance event** — the boot is a true
+multi-source event-starvation stall. The `CT952_VDEC_DONE` decode-completion model
+is verified-correct and stays ready for the *slideshow* decode that runs only AFTER
+Loading advances. **Sharpest next lever:** Agent 3's Gate B — set
+`__bChooseMedia = MEDIA_SELECT_USB` (+ the `__fThreadInit` USB_DONE override) so the
+media scan runs → no-media verdict → `POWERONMENU_Initial`/`MM_PlayPhotoInFlash`,
+which is the retail path to the built-in slideshow. New anchors: getter action-0
+`0x6f098`/`0x6f0c0`; mapper `0x375a0`; `UTL_ShowJPEG_Slide 0x61170` (unreached);
+`UTL_ShowLogo` early-return utl.c:512; media Gate B media.c:1479/616. Diagnostics:
+`CT952_VDEC_DONE`, `CT952_MIRTRACE` (now logs returned state + fdone).

@@ -133,6 +133,8 @@ typedef struct machine {
      * list would have run before the apply callback. */
     int build_panelcfg, panelcfg_built;
 
+    uint64_t jpu_active_until;   /* cycles: JPU decode recently kicked (diag gating) */
+
     /* No-media model: stand in for the USBSRC worker thread so the firmware's
      * media-detect loop resolves to "no removable media" (env CT952_NOMEDIA). */
     int nomedia;

@@ -384,6 +384,7 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
              * functional JPEG decode; here just complete the handshake so the
              * decoder thread's `while (REG_JPU_CTRL & 1)` exits. */
             io_set(m, off, v & ~JPU_BUSY_BIT);
+            m->jpu_active_until = m->cycles + 300000u;   /* decode-active window */
         }
         return;
     case R_GPU_FONT_IDX:
@@ -494,6 +495,37 @@ static uint8_t proc2_ack_of(uint8_t cmd)
 static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
 {
     *fault = 0;
+
+    /* DRAM data-region read-frequency histogram (CT952_DRAMHIST=<icount>):
+     * counts reads to the BSS/data window past a threshold and dumps the
+     * hottest addresses at exit -- pinpoints hot status vars like JPEG_Status
+     * that a busy-poll hammers (item 3, find the decode-completion variable). */
+    {
+        static uint32_t *hc = 0; static uint32_t *ha = 0; static int on = -1;
+        static uint64_t thr = 0;
+        if (on < 0) { const char *e = getenv("CT952_DRAMHIST");
+            on = e ? 1 : 0; if (e) { thr = strtoull(e, NULL, 0);
+                hc = calloc(4096, 4); ha = calloc(4096, 4); } }
+        if (on && hc && addr >= 0x40028000u && addr < 0x40100000u &&
+            m->cpu.icount > thr && m->cycles < m->jpu_active_until) {
+            uint32_t k = ((addr >> 2) * 2654435761u) & 4095u, i;
+            for (i = 0; i < 4096; i++) {
+                uint32_t s = (k + i) & 4095u;
+                if (!hc[s]) { ha[s] = addr; hc[s] = 1; break; }
+                if (ha[s] == addr) { hc[s]++; break; }
+            }
+            static uint64_t last = 0;
+            if (m->cpu.icount - last > 60000000ull) {
+                last = m->cpu.icount; int j, t;
+                fprintf(stderr, "[DRAMHIST @%lluM] top reads:\n",
+                        (unsigned long long)(m->cpu.icount/1000000));
+                for (t = 0; t < 8; t++) { int b=-1; uint32_t bc=0;
+                    for (j=0;j<4096;j++) if (hc[j]>bc){bc=hc[j];b=j;}
+                    if (b<0||!bc) break;
+                    fprintf(stderr, "   %08x  %u\n", ha[b], bc); hc[b]=0; }
+            }
+        }
+    }
 
     /* DSU2 block (0x98000000): PROC1 reads PROC2's live PC here to monitor
      * it (REG_PLAT_DSU2_PC = 0x98080010). Back the PC/nPC; rest reads 0. */
@@ -821,7 +853,7 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         if (getenv("CT952_LOGOTRACE") &&
             (off == 0x1a48u || off == 0x1a4cu || off == 0x1ac0u || off == 0x1ac4u ||
              off == 0x2880u || off == 0x2a20u)) {
-            static int lt; if (lt < 30) {
+            static int lt; if (lt < 60) {
                 fprintf(stderr, "[LOGOwr] %08x=%08x pc=%08x sp=%08x icount=%llu\n",
                         addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 14),
                         (unsigned long long)m->cpu.icount); lt++; }

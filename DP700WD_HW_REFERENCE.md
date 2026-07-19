@@ -1772,3 +1772,41 @@ logo-display event posts → boot advances. The completion signal the JPU op
 sequence waits on (the `0x80000e00`/`0x8000031c` predicate + a valid decoded
 frame) remains the one piece to model; it just fires per-retry, not in a tight
 loop. Every retail anchor is recorded (§10.28-30).
+
+### 10.32 CORRECTION — the logo decode runs ONCE and aborts; it is separate from "Loading"
+
+Filtering the `CT952_LOGOTRACE` writes by register overturns §10.31's "periodic
+retry": the JPU **decode** ops (`0x80002880` = `0x40/0x42/0x58/0x5a/0x68/0x6a`,
+JPU_GPU_OP bit clear) occur in **one early burst** (~26 writes, icount 10.4M-11M)
+and then STOP. The 142 ongoing `0x80002880` writes are `0x10440423` — GPU **font
+ops** (JPU_GPU_OP bit SET), i.e. the OSD "Loading" redraw sharing the register.
+So the earlier "JPU_CTRL keeps growing" (§10.30) was the GPU redraw, not the
+decode.
+
+**What the burst is:** ~26 ops (a setup mix `op0/1/3/4/5/6`) — far fewer than the
+480×270 image's ~510 macroblocks. So the decode does its setup + a few ops, then
+**aborts/returns without decoding the full image** (`UTL_ShowLogo` → FALSE). It is
+NOT a busy-poll stall (a DRAM read-frequency histogram gated to the decode window
+found nothing), so `JPEG_Decode` returns fast with a non-OK status — the emulator
+produces no valid decoded pixels / never advances the decode DMA
+(`0x80000e00`/`0x8000031c`), so the driver gives up after setup.
+
+**Two concerns are now cleanly separated:**
+- **(P1) Logo decode:** make `JPEG_Decode` complete a real frame — model the decode
+  DMA/completion (`0x80000e00` RMW + `0x8000031c` poll) advancing to terminal +
+  functional picojpeg output, so the burst runs to all macroblocks and returns OK.
+- **(P2) The stuck "Loading" state machine (§10.21-24):** the boot sits here
+  *after* the logo attempt; it may or may not depend on the logo displaying. Its
+  advance event (§10.23-24) must be traced independently — the logo failing at 11M
+  and "Loading" persisting suggests they are **separate gates**, not one.
+
+**Cross-ref (user note):** the sibling MIPS Coby frame uses **two framebuffers**;
+this CT9xx logo path is `JPG_SINGLE_FRAME_BUFFER` (F0=F1, single buffer). If P1's
+completion turns out to gate on a page-flip/VSYNC handshake, the double-buffer
+variant's frame-toggle is the reference for what the single-buffer path collapses.
+
+**Diagnostics this session (all env-gated):** `CT952_LOGOTRACE` (DISP/JPU display
+reg writes + PC), `CT952_DRAMHIST=<icount>` (DRAM data read-frequency, gated to the
+JPU-active window via `machine.h jpu_active_until`), `sparc_t.brk_pc` fast
+breakpoint. Retail anchors: JPU decode burst code `0x6bb00`/`0x6bbb4`, decode DMA
+regs `0x80000e00`/`0x8000031c`, BIU `0x4001fe90`.

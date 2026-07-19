@@ -1714,3 +1714,40 @@ assumed; it drives the read channel through `0x80002a24`/`0x80002a28` commands.
 
 Retail anchors: JPU-op wait `0x6bb00` (abort check `0x6bb84`), op dispatcher
 `0x6bbb4`, BIU poll (§10.8 `0x4001fe90`), BIU regs `0x80002a24`/`0x80002a28`.
+
+### 10.30 Item 3 refined — decode runs, BIU phase COMPLETES, stalls in a JPU-op loop
+
+Churn-vs-terminate check (iolog at 90M vs 220M, faithful config):
+
+| reg | 90M | 220M | verdict |
+|-----|-----|------|---------|
+| `0x80002a28` BIU read-channel status | 338130 | **338130** | **PLATEAUED** — BIU phase done |
+| `0x80002880` JPU_CTRL | 13026 | 39562 | growing — infinite loop |
+| `0x80000e00` (RMW, val `0x1d`) | 19115 | 39527 | growing |
+| `0x8000031c` SYSCFG1 (val `0x106040bb`) | ~27K | 51885 | growing |
+| `0x80002884` JPU CTL1 | 9556 | 19762 | growing |
+| `0x80001a4c` VIDEO_EN | — | 0 | never set |
+
+So the earlier "BIU stall" framing is superseded: **the BIU bitstream phase runs to
+completion (poll count plateaus), then the decode gets stuck in an infinite
+JPU-op loop** that reads `0x80000e00` (a system reg, read-modify-written each pass
+with `0x1d`), polls `0x8000031c` (SYSCFG1-region, `0x106040bb`), and re-kicks the
+JPU (`0x80002880`/`0x80002884`) — forever. `HALJPEG_Display`/`VIDEO_EN` never
+reached. OSD stays "Loading".
+
+**Refined item-3 target:** the JPU-op loop needs a completion signal the emulator
+doesn't produce. The loop re-issues JPU ops and re-checks `0x80000e00`/`0x8000031c`
+each pass; one of those (most likely `0x80000e00`, the per-pass RMW) is a
+decode-progress / block-counter / DMA-status word the real JPU hardware advances
+as it consumes macroblocks, and the driver loops until it reaches a terminal
+value. **Next dig:** disassemble the JPU-op loop body (retail, around the
+`0x6bbb4` dispatcher + the `0x6be40`/`0x6bb38` kickers) to find the exact
+`0x80000e00`/`0x8000031c` predicate that exits the loop, then model it advancing
+to terminal (plus the functional picojpeg decode writing tiled YUV so the frame
+is valid) → `JPEG_Status(DECODE)=OK` → `HALJPEG_Display` → `VIDEO_EN`.
+
+**Decoder-bring-up scoreboard:** item 1 DONE (faithful mirror, MIRROR10 retired,
+boot reaches Loading naturally). item 2 DONE (logo-decode gate located; faithful
+mirror proven to unlock the decode kick — the JPU now genuinely runs). item 3 IN
+PROGRESS (BIU phase completes; the JPU-op loop's terminal condition + functional
+output is the remaining piece; all retail anchors recorded).

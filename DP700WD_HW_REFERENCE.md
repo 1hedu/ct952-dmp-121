@@ -2812,3 +2812,28 @@ The "event-starvation / routing" walls (§10.24–11.7) are the crutches' own fa
 **Next faithful target:** the display/GDI pipeline — find what the menu-setup draw is
 waiting on (a DISP/GPU/VSYNC completion the model doesn't faithfully raise), model it,
 and watch the menu draw on its own. That is the concrete door in the wall.
+
+### 12.1 Display path IS running — but menu bring-up stalls before OSD-enable
+
+Behavior-driven trace of the crutch-free boot (I/O log, not memory): the display
+pipeline is genuinely active. `0x80002a24` (GPU op) written **6626 times**, `0x80002a28`
+polled 337926x (the busy-wait) -- the GPU 2-D engine draws. OSD region geometry is
+configured (`0x80001a44/a50/a54` = 0x00f002d0 etc.), DISP OSD base at `0x4005c000`
+(`0x80000e1c`). Rendered index data sits in DRAM. So "black panel / menu doesn't render"
+was a scanout limitation -- my scanout reads one hardcoded region `0x4005f000`; the
+CT952 OSD is multi-region and the real base is `0x4005c000`.
+
+BUT the bring-up does not finish:
+- **GAM_OSD palette `0x80001c00` is NEVER written** (no palette loaded).
+- **`R_DISP_OSD_SIZE` (0x80001a54) bit 28 = DISP_OSD_EN is NEVER set** (OSD never enabled).
+
+The firmware draws + configures OSD geometry, then STALLS before loading the palette
+and enabling the OSD -- matching the UI-thread block traced during menu-setup (a
+synchronous display/GDI op that never gets its completion). An un-enabled OSD shows
+nothing even on real silicon, so the black panel is faithful to the stalled state, not a
+scanout bug alone.
+
+**Faithful target (sharpened):** the display/GDI completion event the menu-setup op waits
+on. Model it -> menu-setup finishes -> palette loads + OSD enables -> menu displays on
+its own -> UI is alive -> screensaver becomes reachable. (Also: teach machine_disp_scanout
+the real OSD base `0x4005c000` + multi-region so we can SEE the menu once it enables.)

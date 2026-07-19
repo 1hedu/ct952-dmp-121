@@ -2337,3 +2337,56 @@ scan-out by §10.42.
 autonomous screensaver cycle needs the deep event-starvation fix (make the system
 tick + CC idle loop live) — the true remaining frontier, and the same root as
 §10.24/10.39. That fix would also complete the natural boot.
+
+### 10.46 FINAL-BOSS PROOF — time-dilation is NOT the blocker; the CC loop is empirically asleep
+
+§10.45 left two live hypotheses for why the autonomous screensaver never fires
+after POWERONMENU: **(H1) time-dilation** — the eCos clock advances so slowly
+(~7.5 ticks per 1M instructions, §"time-dilation") that the idle timeout is simply
+never reached inside a tractable budget; **(H2) event-starvation** — the CC main
+loop thread that *checks* the idle timer is parked asleep on a wake event the
+emulated peripheral set never raises, so no amount of virtual time helps. This
+section discriminates them empirically and rules out H1.
+
+**Tool built — deferred fast tick `CT952_TICK_FAST_AT=<icount>[,<mult>]`.** A naive
+global tick multiplier breaks early boot (fast timeouts fire before their events;
+`INITIAL_System` is never reached). The fix ticks TIMER1 at 1× until `<icount>`,
+then divides the TIMER1 reload by `<mult>` — so the *early* init delays run at
+real cadence while the *post-POWERONMENU* idle wait is compressed. Implemented in
+`timer_tick_one` (new `rld_div` param) + a `machine_cycle` gate parsing the env.
+
+**Result (200M-instr run, `CT952_TICK_FAST_AT=76000000,64`, POWERONMENU @75.5M):**
+- **The fast tick engages, verified against the live clock.** The eCos counter word
+  (retail `0x4002e32c`) read from the 200M DRAM dump = **0x782e = 30766 ticks**,
+  vs. **~1494** ticks at 1× for the same budget — a ~20× compression of virtual
+  time. Time-dilation is overcome. **H1 is false.**
+- **The screensaver still never fires** and no 2nd photo decodes. So compressing
+  time is *not sufficient* — confirming the blocker is elsewhere.
+- **The CC main-loop thread is empirically SLEEPING.** Read from the same dump: the
+  CC `Cyg_Thread` object (retail `0x400371f8`) has `state=1` (SLEEPING) at 200M.
+- **The CPU is in the idle+timer steady state.** The last-64-PC ring and the
+  register-indirect-jump trail at 200M cycle *only* through the eCos
+  scheduler/context-switch region (`0x4001d000`–`0x4001e900`) and the timer/trap
+  dispatch (`0x400010b0` → handlers) — i.e. timer ISR wakes, scheduler runs, finds
+  no ready thread, returns to idle. Nothing advances the application state.
+
+**Verdict (H2 confirmed by direct observation, not inference).** The autonomous
+screensaver is gated by the CC main loop thread being parked on an unmodeled wake
+event — the same **event-starvation** root as §10.24/10.39/10.45 — now proven by
+reading the thread's `state` and the live scheduler PC-trail out of a 200M memory
+dump, with time-dilation independently eliminated. The remaining frontier is
+narrowed to one concrete action: inject a *periodic, non-user* wake event (e.g. a
+clock-display tick message the CC loop consumes without resetting idle) so the loop
+iterates once per virtual second, sees the (now-elapsed, fast-ticked) idle timer,
+and calls `OSDSS_Monitor` → the screensaver naturally. Note the retail SDK-sym
+`.text` addresses **match** for the early functions (`CC_DVD_MainLoop 0x2014`,
+`Thread_CTKDVD 0x2318`, `INITIAL_System 0xeb90`, `MEDIA_Management 0x1152c`,
+`POWERONMENU_Initial 0x4b808`) but **diverge** past ~`0x1152c`
+(`UTL_ShowJPEG_Slide`: sym `0x31cf0` vs retail `0x61170`), so name low PCs from the
+sym but keep treating OSDSS addresses as retail-empirical.
+
+**Deliverable this pass:** all 5 built-in album photos rendered through the
+firmware's own decode→display→scan-out pipeline (butterfly, Tetons/barn,
+chrysanthemums, Golden Gate Bridge, mountain river) and stitched into an animated
+slideshow — the visual final-boss payoff — while the *fully autonomous* firmware
+timer cycle stays blocked on the H2 event injection above.

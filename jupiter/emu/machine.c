@@ -1120,15 +1120,18 @@ static void bus_irq_ack(sparc_bus_t *b, int level)
 /* ---- timers: 1 cycle per instruction ---- */
 
 static void timer_tick_one(machine_t *m, uint32_t cnt_off, uint32_t rld_off,
-                           uint32_t ctl_off, uint32_t irq_bit)
+                           uint32_t ctl_off, uint32_t irq_bit, uint32_t rld_div)
 {
     uint32_t ctl = io_get(m, ctl_off);
     uint32_t cnt;
     if (!(ctl & TIMER_ENABLE)) return;
     cnt = io_get(m, cnt_off);
     if (cnt == 0) {
-        if (ctl & TIMER_RELOAD)
-            io_set(m, cnt_off, io_get(m, rld_off));
+        if (ctl & TIMER_RELOAD) {
+            uint32_t rld = io_get(m, rld_off);
+            if (rld_div > 1) { rld /= rld_div; if (!rld) rld = 1; }
+            io_set(m, cnt_off, rld);
+        }
         io_set(m, R_INT_PENDING, io_get(m, R_INT_PENDING) | irq_bit);
     } else {
         io_set(m, cnt_off, cnt - 1);
@@ -1150,10 +1153,26 @@ static void machine_cycle(machine_t *m)
     if (m->presc_cnt == 0) {
         m->presc_cnt = io_get(m, R_PRESC_RLD);
         m->t3_value++;
+        /* Deferred eCos-clock speedup (CT952_TICK_FAST_AT=<icount>[,<mult>]): the
+         * early boot needs the 1x tick so its event-bound waits resolve before
+         * their timeouts fire (a fast tick early derails the boot). Once past the
+         * early gates, shrink the TIMER1 reload so the eCos clock (advanced once
+         * per TIMER1 IRQ) ticks <mult>x faster -- late init OS_DelayTime()s and the
+         * screensaver idle timeout then complete in a runnable budget (10.46). */
+        uint32_t t1div = 1;
+        {
+            static long fat = -2; static int fmul = 64;
+            if (fat == -2) { const char *e = getenv("CT952_TICK_FAST_AT");
+                             fat = -1;
+                             if (e) { char *c = NULL; fat = atol(e);
+                                      if ((c = strchr((char*)e, ',')) ) fmul = atoi(c + 1); }
+                             if (fmul < 1) fmul = 1; }
+            if (fat >= 0 && (long)m->cpu.icount >= fat) t1div = (uint32_t)fmul;
+        }
         timer_tick_one(m, R_TIMER1_CNT, R_TIMER1_RLD, R_TIMER1_CTL,
-                       0x100u);   /* INT_TIMER1 */
+                       0x100u, t1div);   /* INT_TIMER1 (eCos clock) */
         timer_tick_one(m, R_TIMER2_CNT, R_TIMER2_RLD, R_TIMER2_CTL,
-                       0x200u);   /* INT_TIMER2 */
+                       0x200u, 1);   /* INT_TIMER2 */
         /* watchdog counts on the same tick; 0 means untouched/disabled
          * here (real hw needs SYSCFG enable; we only fire if armed) */
         {
@@ -1471,10 +1490,10 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                 {0x0001186cu,"MEDIA_MonitorStatus(F)"}, {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"},
                 {0x4000eb90u,"INITIAL_System(D)"}, {0x4004b808u,"POWERONMENU_Initial(D)"},
                 {0x00012f10u,"PostEvent->list(F)"}, {0x00006eecu,"EvtDispatch_bit80(F)"},
-                {0x00061170u,"UTL_ShowJPEG_Slide(F)"}, {0x00061344u,"ShowJPEG_DECODE_OK_path(F)"},
-                {0x00039f38u,"JPEG_Display_call(F)"},
+                {0x00061170u,"UTL_ShowJPEG_Slide(F)"}, {0x000591b4u,"OSDSS_Monitor(F)"},
+                {0x00059108u,"OSDSS_Entry(F)"}, {0x00059004u,"_OSDSS_PictureUpdate(F)"},
             };
-            static uint8_t hit[15];
+            static uint8_t hit[16];
             int wi;
             for (wi = 0; wi < (int)(sizeof(wl)/sizeof(wl[0])); wi++)
                 if (!hit[wi] && m->cpu.pc == wl[wi].pc) {

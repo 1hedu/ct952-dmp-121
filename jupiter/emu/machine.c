@@ -1556,6 +1556,57 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     return done;
 }
 
+/* --- snapshot / restore (fast re-attach for the gdb stub) ---------------- *
+ * Dump the whole machine (registers + I/O + DRAM/BRAM/flash) so a boot to an
+ * interesting point can be reached once and re-loaded instantly. Function
+ * pointers are NOT trusted across processes (PIE/ASLR) -- the bus vtable and
+ * cpu.bus links are re-established on restore. Heap pointers not needed for
+ * debugging (rx_buf, jpeg_rgb, jpeg_out, uart_file) are reset. */
+#define MACH_SNAP_MAGIC 0x43543935u   /* "CT95" */
+
+int machine_snapshot(machine_t *m, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    uint32_t magic = MACH_SNAP_MAGIC;
+    if (!f) return -1;
+    fwrite(&magic, 4, 1, f);
+    fwrite(m, sizeof(*m), 1, f);              /* struct (pointers ignored on load) */
+    fwrite(m->flash, MACH_FLASH_MAX, 1, f);
+    fwrite(m->dram, MACH_DRAM_SIZE, 1, f);
+    fwrite(m->bram, 0x10000u, 1, f);
+    fclose(f);
+    return 0;
+}
+
+int machine_restore(machine_t *m, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    uint32_t magic = 0;
+    uint8_t *flash = m->flash, *dram = m->dram, *bram = m->bram;
+    FILE *uf = m->uart_file;
+    int echo = m->uart_echo;
+    if (!f) return -1;
+    if (fread(&magic, 4, 1, f) != 1 || magic != MACH_SNAP_MAGIC) { fclose(f); return -1; }
+    if (fread(m, sizeof(*m), 1, f) != 1) { fclose(f); return -1; }
+    /* restore the live heap buffers + their contents */
+    m->flash = flash; m->dram = dram; m->bram = bram;
+    if (fread(m->flash, MACH_FLASH_MAX, 1, f) != 1 ||
+        fread(m->dram, MACH_DRAM_SIZE, 1, f) != 1 ||
+        fread(m->bram, 0x10000u, 1, f) != 1) { fclose(f); return -1; }
+    fclose(f);
+    /* reset host-only pointers that the snapshot's stale values would corrupt */
+    m->uart_file = uf; m->uart_echo = echo;
+    m->rx_buf = NULL; m->rx_len = m->rx_pos = 0;
+    m->jpeg_rgb = NULL; m->jpeg_out = NULL;
+    /* re-establish the bus vtable + cpu links in THIS process */
+    m->bus.read = bus_read;   m->bus.write = bus_write;
+    m->bus.irq_level = bus_irq_level; m->bus.irq_ack = bus_irq_ack;
+    m->bus2.read = bus2_read; m->bus2.write = bus2_write;
+    m->bus2.irq_level = bus2_irq_level; m->bus2.irq_ack = bus2_irq_ack;
+    m->cpu.bus = &m->bus; m->cpu2.bus = &m->bus2;
+    return 0;
+}
+
 /* --- gdb-stub support (see gdbstub.c) ------------------------------------ *
  * Run up to `maxsteps` instructions with the full per-instruction device
  * tick (timers/IRQ/PROC2), stopping the instant the PROC1 PC lands on any of

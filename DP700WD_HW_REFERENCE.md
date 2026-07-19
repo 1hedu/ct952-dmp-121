@@ -2491,3 +2491,48 @@ eCos flag/semaphore-wait primitive (in the decompressed kernel TEXT at ~`0x4001x
 and read the CC thread's wait object when it sleeps — rather than watching polls that
 never run. (Harness note: a timeout-continue must send a `0x03` interrupt before
 issuing the next RSP command, else the target keeps running and ignores packets.)
+
+### 10.50 ROOT FOUND — the CC thread blocks in mbox-get on queue 0x40033830 (never posted)
+
+Two tooling upgrades made this tractable: (a) **snapshot/restore** (`--run-to N
+--snapshot f` / `--restore f`, `machine_snapshot/restore`) — the 100 s boot to
+POWERONMENU is captured once (`/tmp/pom.snap`, 12.7 MB) and re-loaded in <1 s, so
+every probe starts at icount≈78M; (b) a **multi-connect** stub (re-accepts on
+detach/EOF, keeps machine state) — verified: detach + reconnect preserved
+`pc=0x4000103c`. Reusable client: `jupiter/emu/rsp.py`.
+
+**The blocked call stack, read live from the CC thread's saved context** (thread
+`0x400371f8`, `state=1`, `stack_ptr=0x40036b90`): the saved frames carry a firmware
+return `0x000596a8` on top of the eCos chain `0x4001de58→0x4001e708→0x4001e6a8→
+0x4001e524`. Disassembling each (kernel TEXT read from live DRAM via the stub, since
+it's decompressed at boot):
+
+- **`0x5969c`** — tiny firmware wrapper `save; call 0x4001de40; ret` (called from
+  ~105 sites → the generic "wait for a message" OS call).
+- **`0x4001de40`** — OS-layer: `%o0 = *(0x400423a8) = 0x40033830`; `call 0x4001e498`
+  with `%o0 = obj+0x1c`. So it waits on the fixed global object **`0x40033830`**.
+- **`0x4001e498`** — eCos `Cyg_Thread::sleep`: bumps the scheduler-lock counter
+  (`*0x40024974`), enqueues the thread on the object's wait-list if `obj+0x3c==0`,
+  then `call 0x4001e66c` (unlock+reschedule) — the context switch away. Its return
+  `0x4001e524` is exactly what sits in the saved stack. **This is the park.**
+
+**The object `0x40033830` is a message queue / mailbox** (read live): head
+`[+0x00]=[+0x08]=0x40033930`, ring buffer `[+0x0c]=0x40033f98` size `[+0x04]=0xa00`,
+wait-list `[+0x20]=0x40037214` (**= CC thread + 0x1c → the CC thread is enqueued on
+it**), and the signaled/count field **`[+0x3c]=0` → empty/unsignaled**. So the CC
+thread is blocked in **mbox-get, waiting for a message that never arrives**.
+
+**The poster side** (counterpart put primitive `0x4001de5c`, which stores into the
+same `*(0x400423a8)` queue): its 3 flash wrappers live at `0xad4f8`/`0xad568` (both
+in func **`0xad4cc`**) and `0xaf984`; `0xad4cc` is called from the OS post-wrappers
+`0x6430`/`0x6798`/`0x75d0`. So the wake the whole final boss hinges on is **a
+`0xad4cc` post to mbox `0x40033830`**, driven ultimately by whatever event source
+feeds `0x6430/0x6798/0x75d0` — and that source never fires in the emulated boot.
+
+**Net (final-boss root, fully localized).** screensaver → OSDSS never called → CC
+loop asleep → **blocked in `Cyg_Thread::sleep` (0x4001e498) on mailbox `0x40033830`,
+which receives no message**. The H2 injection is now exact: post one message to
+`0x40033830` (via `0xad4cc`, or by nudging its `+0x3c`/wait-list and waking the
+enqueued CC thread) and the loop iterates. Remaining thread to pull: trace the
+callers of `0x6430/0x6798/0x75d0` to name the dead event source (timer/VSYNC/media
+ISR) that *should* post it — the last layer of the same event-starvation onion.

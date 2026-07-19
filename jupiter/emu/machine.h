@@ -198,6 +198,12 @@ void machine_dbg_write(machine_t *m, uint32_t addr, uint32_t val, int size);
  * the client detaches/kills. Returns 0 on a clean session, -1 on setup error. */
 int gdb_serve(machine_t *m, int port);
 
+/* Snapshot / restore the whole machine (registers + I/O + DRAM/BRAM/flash) to
+ * `path`, so a boot to an interesting point is reached once and re-loaded
+ * instantly. Returns 0 on success, -1 on I/O or format error. */
+int machine_snapshot(machine_t *m, const char *path);
+int machine_restore(machine_t *m, const char *path);
+
 /* Direct DRAM helpers (addr in 0x40000000 space). */
 uint32_t machine_dram_rd(machine_t *m, uint32_t addr, int size);
 uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr);

@@ -30,6 +30,8 @@ int main(int argc, char **argv)
     uint32_t m_jpeg_src = 0x401dc000u;
     const char *jpeg_out_path = NULL;
     int gdb_port = 0;
+    uint64_t run_to = 0;
+    const char *snap_out = NULL, *snap_in = NULL;
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -77,6 +79,12 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--gdb") && i + 1 < argc)
             gdb_port = (int)strtol(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--run-to") && i + 1 < argc)
+            run_to = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc)
+            snap_out = argv[++i];
+        else if (!strcmp(argv[i], "--restore") && i + 1 < argc)
+            snap_in = argv[++i];
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -135,24 +143,51 @@ int main(int argc, char **argv)
                 m->rx_len, uartin_path);
     }
 
-    if (rom_load) {
-        uint32_t entry = machine_rom_load(m, stderr);
-        if (!entry) {
-            fprintf(stderr, "[ct952emu] rom-load FAILED\n");
+    if (snap_in) {
+        /* fast re-attach: skip rom-load/boot, load a prior machine snapshot */
+        if (machine_restore(m, snap_in) != 0) {
+            fprintf(stderr, "[ct952emu] restore FAILED from %s\n", snap_in);
             return 1;
         }
-        /* Stage the boot trampoline the way the mask ROM does: entry =
-         * decompressed ROMV reset vector, sp = top of DRAM. */
-        if (!seed_entry) seed_entry = entry;
-        if (!seed_sp)    seed_sp = 0x40780000u;
-        fprintf(stderr, "[ct952emu] rom-load OK, reset vector @ 0x%08x\n",
-                entry);
+        fprintf(stderr, "[ct952emu] restored snapshot %s (icount=%llu pc=0x%08x)\n",
+                snap_in, (unsigned long long)m->cpu.icount, m->cpu.pc);
+    } else {
+        if (rom_load) {
+            uint32_t entry = machine_rom_load(m, stderr);
+            if (!entry) {
+                fprintf(stderr, "[ct952emu] rom-load FAILED\n");
+                return 1;
+            }
+            /* Stage the boot trampoline the way the mask ROM does: entry =
+             * decompressed ROMV reset vector, sp = top of DRAM. */
+            if (!seed_entry) seed_entry = entry;
+            if (!seed_sp)    seed_sp = 0x40780000u;
+            fprintf(stderr, "[ct952emu] rom-load OK, reset vector @ 0x%08x\n",
+                    entry);
+        }
+
+        if (seed_entry || seed_sp) {
+            machine_seed_boot(m, seed_entry, seed_sp);
+            fprintf(stderr, "[ct952emu] seeded boot entry=0x%08x sp=0x%08x\n",
+                    seed_entry, seed_sp);
+        }
     }
 
-    if (seed_entry || seed_sp) {
-        machine_seed_boot(m, seed_entry, seed_sp);
-        fprintf(stderr, "[ct952emu] seeded boot entry=0x%08x sp=0x%08x\n",
-                seed_entry, seed_sp);
+    /* Optional: fast-forward to an icount, then snapshot -- reach an interesting
+     * boot point once and re-load it instantly for later --restore --gdb runs. */
+    if (run_to) {
+        fprintf(stderr, "[ct952emu] fast-forwarding to icount %llu ...\n",
+                (unsigned long long)run_to);
+        machine_run(m, run_to);
+        fprintf(stderr, "[ct952emu] reached icount=%llu pc=0x%08x\n",
+                (unsigned long long)m->cpu.icount, m->cpu.pc);
+    }
+    if (snap_out) {
+        if (machine_snapshot(m, snap_out) != 0)
+            fprintf(stderr, "[ct952emu] snapshot FAILED to %s\n", snap_out);
+        else
+            fprintf(stderr, "[ct952emu] snapshot written to %s\n", snap_out);
+        if (!gdb_port) { machine_free(m); free(m); return 0; }
     }
 
     if (gdb_port) {

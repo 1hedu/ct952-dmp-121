@@ -153,12 +153,15 @@ static uint32_t get_hex32_be(const char *p)
 
 static void send_stop(int fd, int sig) { char r[8]; sprintf(r, "S%02x", sig & 0xff); send_packet(fd, r); }
 
-/* Poll the socket (non-blocking) for a pending Ctrl-C during a continue. */
+/* Poll the socket (non-blocking) during a continue. Returns 1 to stop: on a
+ * pending Ctrl-C (0x03) OR on client EOF (recv==0) -- so a dead client aborts a
+ * running target instead of leaving it spinning to the next breakpoint. */
 static int check_interrupt(int fd)
 {
     unsigned char c;
     ssize_t r = recv(fd, &c, 1, MSG_DONTWAIT);
-    if (r == 1 && c == 0x03) return 1;
+    if (r == 0) return 1;                 /* client closed the connection */
+    if (r == 1 && c == 0x03) return 1;    /* interrupt request */
     return 0;
 }
 
@@ -185,15 +188,19 @@ int gdb_serve(machine_t *m, int port)
     fprintf(stderr, "[gdb] listening on 127.0.0.1:%d -- connect gdb with "
                     "'target remote :%d'\n", port, port);
 
-    fd = accept(ls, NULL, NULL);
-    close(ls);
-    if (fd < 0) { perror("accept"); return -1; }
+reaccept:
+    fd = accept(ls, NULL, NULL);          /* listener stays open for reconnects */
+    if (fd < 0) { perror("accept"); close(ls); return -1; }
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    fprintf(stderr, "[gdb] client connected\n");
+    fprintf(stderr, "[gdb] client connected (icount=%llu pc=0x%08x)\n",
+            (unsigned long long)m->cpu.icount, m->cpu.pc);
 
     for (;;) {
         int n = recv_packet(fd, pkt, sizeof(pkt));
-        if (n < 0) break;                 /* EOF */
+        if (n < 0) {                      /* client vanished -- keep state, re-accept */
+            fprintf(stderr, "[gdb] client disconnected; awaiting reconnect\n");
+            close(fd); goto reaccept;
+        }
         if (n == 0) { send_stop(fd, 2); continue; }   /* stray Ctrl-C -> SIGINT */
 
         char cmd = pkt[0];
@@ -325,8 +332,11 @@ int gdb_serve(machine_t *m, int port)
 
         case 'H':  send_packet(fd, "OK"); break;   /* set thread -> ok */
         case '!':  send_packet(fd, "OK"); break;   /* extended mode */
-        case 'D':  send_packet(fd, "OK"); goto done;   /* detach */
-        case 'k':  goto done;                          /* kill */
+        case 'D':                                  /* detach: keep state, re-accept */
+            send_packet(fd, "OK");
+            fprintf(stderr, "[gdb] client detached; awaiting reconnect\n");
+            close(fd); goto reaccept;
+        case 'k':  goto done;                          /* kill -> exit stub */
 
         default:
             send_packet(fd, "");           /* unsupported -> empty */
@@ -334,8 +344,9 @@ int gdb_serve(machine_t *m, int port)
         }
     }
 done:
-    fprintf(stderr, "[gdb] session ended (icount=%llu pc=0x%08x)\n",
+    fprintf(stderr, "[gdb] stub killed (icount=%llu pc=0x%08x)\n",
             (unsigned long long)m->cpu.icount, m->cpu.pc);
     close(fd);
+    close(ls);
     return 0;
 }

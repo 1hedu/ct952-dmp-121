@@ -2536,3 +2536,30 @@ which receives no message**. The H2 injection is now exact: post one message to
 enqueued CC thread) and the loop iterates. Remaining thread to pull: trace the
 callers of `0x6430/0x6798/0x75d0` to name the dead event source (timer/VSYNC/media
 ISR) that *should* post it — the last layer of the same event-starvation onion.
+
+### 10.51 H2 PROVEN — a single injected mbox post revives the dead CC loop
+
+Ran the injection experiment on the POWERONMENU snapshot via the gdb stub
+(`/tmp/inject.py`): saved the idle-thread regs, set up a call to the eCos mbox-put
+primitive **`0x4001de5c(1,1)`** (keeping the current stack), `pc→0x4001de5c`, and
+continued. Result, live:
+
+- **Before:** CC thread `0x400371f8` `state=1` (SLEEPING), mbox `+0x3c=0` (empty).
+- **After the single post:** the CC thread **woke and hit its mbox-get `0x5969c`**;
+  mbox `+0x3c` flipped `0→1`. Continuing, it keeps hitting mbox-get — the **dead loop
+  is now cycling**. Thread-tagging the hits (by `%sp`): they alternate between the
+  **CC thread** (`sp=0x40036db0`, mbox-get caller `0x2ee40`) and a **worker thread**
+  (`sp=0x40038ba0`, caller `0x4001ea60`). So feeding the missing event brought the CC
+  event loop *and* a second thread back to life — direct proof that the whole boot is
+  event-starved, not broken (§10.24/10.39/10.46/10.50 confirmed by construction).
+
+**But OSDSS still isn't reached:** with the loop cycling, `OSDSS_Monitor 0x591b4` was
+not hit in 30 s. So a *generic* wake revives the loop but does not by itself run the
+screensaver monitor — `OSDSS_Monitor` sits behind a further-specific dispatch (a
+particular message type / a periodic "monitor tick"), reached via the message module
+(`0x2ee40`→`0xa33d8`/`0xa48a8`), not on every loop turn. That is the final layer:
+identify the exact message the CC dispatch maps to the OSDSS/monitor path (or the
+periodic timer message that a live system posts), and post *that* — then the
+screensaver fires on its own. The mechanism is now not just diagnosed but
+**experimentally validated**: the pathway from a dead boot to a live, cycling event
+loop is intact and revivable with one poke.

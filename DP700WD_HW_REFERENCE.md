@@ -2463,3 +2463,31 @@ returned `808c2040 3080000d 02800008 808c2040`, **byte-identical** to `dis.sh`'s
 `btst 0x40,%l0 / b,a / be / btst`. This is the tool for the H2 next step: breakpoint
 the handler-dispatch site, watch which event slot the CC loop selects, and pin the
 exact wake it's starved of.
+
+### 10.49 LIVE DEBUG — the park is a blocking wait, not a poll (and the POWERONMENU call chain)
+
+First real gdb-stub session against the running firmware (Python RSP driver;
+`CT952_CHOOSEMEDIA/VDEC_DONE/NOMEDIA` as usual). Continue-to-breakpoint reached
+`0x4b808` at ~75.5M in ~95 s (single-step C loop). Findings, all live:
+
+- **`0x4b808` is a LOOP TOP inside POWERONMENU_Initial, not the entry.** Live regs at
+  the stop: `%i7=0x4a5ac` (the real caller's return), `%i6/fp=0x40036fd0`,
+  `%sp=0x40036f68`. The true entry is **`POWERONMENU_Initial 0x4b7c8`**, `call`ed
+  from an init routine at **`0x4a588`**: `call 0x2ebb8; 0x55e88(0x65); 0x55e88(0x66);
+  0x4b7c8 (POWERONMENU_Initial); 0x2edb0` — a one-shot boot-init sequence (it posts
+  msg IDs 0x65/0x66 via `0x55e88`), **not** the steady event loop. So the park is
+  downstream of this.
+- **The CC thread is BLOCKED, not spin-polling.** Set a breakpoint on the modal-wait
+  peek `PeekEvent 0x66a0` (lock → `btst mask,[0x40026ea4]` → clear-and-return-1 /
+  else 0) and continued: **not hit in ~25 s (~32M instructions)** after POWERONMENU.
+  So the CC loop is not running its known event-flag poll at all here — it is parked
+  in a true eCos *blocking* wait (a flag/semaphore sleep), consistent with the 200M
+  dump's thread `state=1` and the scheduler-only PC-trail (§10.46). This rules out
+  the "busy-poll starved of a bit" shape at this stage: nothing is polling.
+
+**Net.** The starved wake is a **blocking** eCos wait-object post, not a flag bit a
+poll loop is missing. The next step is to catch the block itself — breakpoint the
+eCos flag/semaphore-wait primitive (in the decompressed kernel TEXT at ~`0x4001xxxx`)
+and read the CC thread's wait object when it sleeps — rather than watching polls that
+never run. (Harness note: a timeout-continue must send a `0x03` interrupt before
+issuing the next RSP command, else the target keeps running and ignores packets.)

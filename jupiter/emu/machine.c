@@ -712,6 +712,22 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         }
         if (m->skip_panelcfg && addr == 0x4002f770u)
             return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
+        /* Media-select override (CT952_CHOOSEMEDIA="<hexaddr>[:<val>]"): present the
+         * __bChooseMedia byte as MEDIA_SELECT_USB (default 1) so _MEDIA_MonitorMedia-
+         * Status doesn't early-return on MEDIA_SELECT_DVD(0) (media.c:1479) and the
+         * removable-media scan runs -> no-media -> POWERONMENU/MM_PlayPhotoInFlash
+         * (Agent 3 Gate B, 10.40). Read-override so every reader sees USB. */
+        {
+            static int cm_init = -1; static uint32_t cm_addr = 0; static uint32_t cm_val = 1;
+            if (cm_init < 0) {
+                const char *e = getenv("CT952_CHOOSEMEDIA");
+                cm_init = e ? 1 : 0;
+                if (e) { char *c = NULL; cm_addr = (uint32_t)strtoul(e, &c, 0);
+                         if (c && *c == ':') cm_val = (uint32_t)strtoul(c + 1, NULL, 0); }
+            }
+            if (cm_init && cm_addr && addr == cm_addr && size == 1)
+                return cm_val;
+        }
         /* Decoder-STOP window: present the state mirror (0x40039cd0, read by
          * getter 0x6f054) as MODE_STOP(0x10) so the boot stop-poll latches it
          * before the state settles to STOPPED(0x11). See machine.h. */

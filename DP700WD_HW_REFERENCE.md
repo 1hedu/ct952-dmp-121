@@ -2837,3 +2837,28 @@ scanout bug alone.
 on. Model it -> menu-setup finishes -> palette loads + OSD enables -> menu displays on
 its own -> UI is alive -> screensaver becomes reachable. (Also: teach machine_disp_scanout
 the real OSD base `0x4005c000` + multi-region so we can SEE the menu once it enables.)
+
+### 12.2 The OSD stays off by a STATE GATE — localized (compositor + 0x40024050)
+
+Traced why the OSD never enables (CT952_DISPTRACE, added to io_write). Findings, live
+on the crutch-free boot:
+- OSD geometry is configured early (~12.6M, `0x1a54`=0x00f002d0, regions on `0x1a48/50`).
+- **`R_DISP_OSD_SIZE` bit 28 (OSD_EN) is never set; GAM_OSD palette `0x1c00` is never
+  written.** The bring-up stops before enable + palette.
+- The display **compositor is alive** -- pc `0xa685c` runs every ~200K instr (per frame)
+  and at `0xa6850-0xa6858` does `andn <reg>, 0x10000000` -- it **actively clears OSD_EN
+  each frame** unless a state gate says otherwise.
+- That gate is `*(0x40024050)`, read at `0xa6860`. It is **0**.
+- `0x40024050` has exactly ONE writer, `0xa3fcc`: `if ((region_arg & 0x300)==0x200)
+  0x40024050 = 0x200`. So the OSD activates only when an OSD region is applied with type
+  field `(t & 0x300)==0x200`. It never happens -> OSD stays off -> black panel.
+
+So the black panel is a **specific state gate**, not a vague stall: the menu's OSD region
+is never applied with the activating type, so the compositor (correctly, per its logic)
+never turns the OSD on. This is the sharpest the display gate has been.
+
+**Next:** determine whether `0xa3f90` (the region-apply fn) is even CALLED during boot --
+if called with the wrong type, the region descriptor's type field is the bug; if never
+called, the menu-setup stall (§11.4) blocks before region-apply. That distinguishes a
+data/descriptor problem from a control-flow (event) problem. Live breakpoint on `0xa3f90`
++ read `%i0`.

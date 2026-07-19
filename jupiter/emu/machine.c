@@ -442,6 +442,21 @@ static void gpu_exec(machine_t *m, uint32_t ctl0)
 
 static void io_write(machine_t *m, uint32_t off, uint32_t v)
 {
+    /* Display bring-up trace (CT952_DISPTRACE): log writes to the OSD
+     * size/enable register (0x1a54, bit28=OSD_EN), the OSD region regs
+     * (0x1a40..0x1a5c), and the GAM_OSD palette (0x1c00..0x1cff) with PC +
+     * icount + value -- shows whether the firmware ever ATTEMPTS OSD-enable /
+     * palette-load and where the display bring-up stalls (§12.1). */
+    if (getenv("CT952_DISPTRACE") &&
+        ((off >= 0x1a40u && off <= 0x1a5cu) || (off >= 0x1c00u && off <= 0x1cffu))) {
+        static int dt; if (dt < 120) {
+            fprintf(stderr, "[DISP] +%03x <- %08x  %s pc=%08x icount=%llu\n",
+                    off, v, (off == 0x1a54u && (v & 0x10000000u)) ? "OSD_EN!" :
+                            (off >= 0x1c00u ? "pal" : ""),
+                    m->cpu.pc, (unsigned long long)m->cpu.icount);
+            dt++;
+        }
+    }
     switch (off) {
     case R_GPU_CTL0:
         if (v & JPU_GPU_OP) {

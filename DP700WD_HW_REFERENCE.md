@@ -1680,3 +1680,37 @@ polls done) plugs in here so the running JPU decode completes → `HALJPEG_Displ
 MIRROR10 retired); item 2 done (logo-decode gate located, and the faithful mirror
 proven to advance the boot from "never kicks" to actively running the JPU decode);
 item 3 (model the JPEG-datapath completion) is next, with every address known.
+
+### 10.29 Item 3 groundwork — the JPU decode-op protocol (retail-disassembled)
+
+`HALJPEG_Decode` → `JPEG_Decode(&_HALJPEGDecode)` (haljpeg.c:416, precompiled).
+Disassembled its JPU op engine:
+
+- **JPU-op wait `0x6bb00`:** `%o2 = REG_JPU_CTRL (0x80002880)`; `ctrl |= JPU_GO(0x2)`;
+  then poll `ctrl & 1` (`JPU_BUSY`) until clear (emulator clears on GO → each op
+  succeeds), with a ~499-tick timeout. **Abort path:** if `[0xB0000190]
+  (PLAYMODE) == 0x10 (MODE_STOP)` it returns 0 (decode aborted). The §10.26
+  faithful mirror keeps PLAYMODE at `0x11 (STOPPED)` after the stop, so it does
+  NOT abort — the ops run. (Had the old MIRROR10 left PLAYMODE at `0x10`, the
+  decode would have aborted here — another reason the faithful mirror matters.)
+- **JPU-op dispatcher `0x6bbb4`:** `jmp`-table on op type 0-7 (`sethi 0x1af | 0x1c8`
+  base) — the driver issues a real sequence of decode/scale ops.
+
+**State:** the driver actively runs the op sequence (~13026 `JPU_CTRL` accesses +
+338130 `0x80002a28` BIU-status polls by icount 90M) but never sets
+`JPEG_Status(DECODE)=OK`, so `HALJPEG_Display` (F0Y/F0C/`VIDEO_EN`) is never
+reached. `REG_MCU_BCR08` (bitstream base 0x80002a20) is still never written, and
+`0x80002a24` is written repeatedly with a small command byte (0x05) — so the
+driver's BIU bitstream-feed protocol here is NOT the plain BCR08-base model §10.10
+assumed; it drives the read channel through `0x80002a24`/`0x80002a28` commands.
+
+**Open item-3 questions (the concrete next dig):**
+1. Does the op loop TERMINATE (finish the image, then stall on a final display
+   handshake) or churn forever? (Compare `JPU_CTRL` access count at 90M vs 200M.)
+2. What single signal sets `JPEG_Status(DECODE)=OK`? Candidates: the `0x80002a28`
+   BIU status reaching a drained/EOI value, or a decode-done bit. That is the
+   value to model — together with a functional picojpeg decode writing the tiled
+   YUV output (§10.10 step 3) so the produced frame is valid.
+
+Retail anchors: JPU-op wait `0x6bb00` (abort check `0x6bb84`), op dispatcher
+`0x6bbb4`, BIU poll (§10.8 `0x4001fe90`), BIU regs `0x80002a24`/`0x80002a28`.

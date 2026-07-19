@@ -142,7 +142,8 @@ typedef struct machine {
     uint64_t jpu_active_until;   /* cycles: JPU decode recently kicked (diag gating) */
 
     /* No-media model: stand in for the USBSRC worker thread so the firmware's
-     * media-detect loop resolves to "no removable media" (env CT952_NOMEDIA). */
+     * media-detect loop resolves to "no removable media". (Crutch removed §11.3;
+     * field retained for ABI/layout stability of snapshots.) */
     int nomedia;
 
     /* GPU 2-D engine op accounting + font-index queue */

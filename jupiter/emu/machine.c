@@ -725,22 +725,9 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         }
         if (m->skip_panelcfg && addr == 0x4002f770u)
             return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
-        /* Media-select override (CT952_CHOOSEMEDIA="<hexaddr>[:<val>]"): present the
-         * __bChooseMedia byte as MEDIA_SELECT_USB (default 1) so _MEDIA_MonitorMedia-
-         * Status doesn't early-return on MEDIA_SELECT_DVD(0) (media.c:1479) and the
-         * removable-media scan runs -> no-media -> POWERONMENU/MM_PlayPhotoInFlash
-         * (Agent 3 Gate B, 10.40). Read-override so every reader sees USB. */
-        {
-            static int cm_init = -1; static uint32_t cm_addr = 0; static uint32_t cm_val = 1;
-            if (cm_init < 0) {
-                const char *e = getenv("CT952_CHOOSEMEDIA");
-                cm_init = e ? 1 : 0;
-                if (e) { char *c = NULL; cm_addr = (uint32_t)strtoul(e, &c, 0);
-                         if (c && *c == ':') cm_val = (uint32_t)strtoul(c + 1, NULL, 0); }
-            }
-            if (cm_init && cm_addr && addr == cm_addr && size == 1)
-                return cm_val;
-        }
+        /* (CT952_CHOOSEMEDIA crutch removed §11.3: proven inert once decode is
+         * faithful -- the raw boot reaches POWERONMENU without forcing the
+         * __bChooseMedia byte.) */
         /* Decoder-STOP window: present the state mirror (0x40039cd0, read by
          * getter 0x6f054) as MODE_STOP(0x10) so the boot stop-poll latches it
          * before the state settles to STOPPED(0x11). See machine.h. */
@@ -793,17 +780,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             if (pr && addr == 0x40022F5Eu && size == 1 && m->cpu.icount > 30000000ull)
                 return 2;
         }
-        /* No-media model (CT952_NOMEDIA): stand in for the USBSRC worker
-         * thread, which never runs in the emulator (it would block in the
-         * opaque usb.a/card.a HW init). The firmware's media-detect loop
-         * (_MEDIA_MonitorMediaStatus, media.c:1489) gates on the USB source
-         * thread having initialised: USBSRC_TriggerCmd requires
-         * __fThreadInit & INIT_SRC_THREAD_USB_DONE (0x80000). Present that bit
-         * as set on every read of __fThreadInit (0x4003e590) so the trigger
-         * path runs; the CHECK_DEVICE handshake completion is modelled on the
-         * write side. See DP700WD_HW_REFERENCE.md 10.17. */
-        if (m->nomedia && addr == 0x4003e590u && size == 4)
-            return mem_read_raw(m->dram + (addr - 0x40000000u), 4) | 0x00080000u;
+        /* (CT952_NOMEDIA crutch removed §11.3: proven inert past POWERONMENU --
+         * it faked the USBSRC worker's CHECK_DEVICE->NO_MEDIA result without
+         * waking the real (asleep) USB source thread, so it changed nothing.
+         * The faithful fix is to model the USB/card host controller, not fake
+         * the flags -- deferred to the event-starvation work.) */
         return mem_read_raw(m->dram + (addr - 0x40000000u), size);
     }
     if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)
@@ -1005,23 +986,7 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
                 fprintf(stderr, "[JSTAT] %08x=%u pc=%08x icount=%llu\n",
                         addr, val, m->cpu.pc, (unsigned long long)m->cpu.icount); js++; }
         }
-        /* No-media model (CT952_NOMEDIA): emulate the USBSRC worker completing
-         * a CHECK_DEVICE command with a "no removable media" verdict. The
-         * firmware sets bit CHECK_DEVICE(0x1) in _fUSBSRCCmdd (0x4003f540) via
-         * OS_SetFlag; the real worker thread would then run USB_CheckConnect,
-         * set _bUSBSRCState, post the status flag and clear the command. We do
-         * that here so the media-detect loop sees SRCFTR_USB_STATE_NO_MEDIA and
-         * falls through to POWERONMENU_Initial / MM_PlayPhotoInFlash. */
-        if (m->nomedia && addr == 0x4003f540u &&
-            (mem_read_raw(m->dram + 0x3f540u, 4) & 0x1u)) {
-            mem_write_raw(m->dram + 0x3f510u, 1, 1);       /* _bUSBSRCState = NO_MEDIA */
-            mem_write_raw(m->dram + 0x3f514u,              /* _fUSBSRCCmddStatus |= CHECK_DEVICE */
-                          mem_read_raw(m->dram + 0x3f514u, 4) | 0x1u, 4);
-            mem_write_raw(m->dram + 0x3f540u,              /* _fUSBSRCCmdd &= ~CHECK_DEVICE */
-                          mem_read_raw(m->dram + 0x3f540u, 4) & ~0x1u, 4);
-            mem_write_raw(m->dram + 0x3f524u,              /* _fUSBSRCCmddRunning &= ~CHECK_DEVICE */
-                          mem_read_raw(m->dram + 0x3f524u, 4) & ~0x1u, 4);
-        }
+        /* (CT952_NOMEDIA write-side crutch removed §11.3 -- see the read side.) */
         return;
     }
     if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE) {
@@ -1238,7 +1203,6 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     m->bus2.irq_ack = bus2_irq_ack;
     m->proc2_enable = getenv("CT952_PROC2") ? 1 : 0;
     m->proc2_on = 0;
-    m->nomedia = getenv("CT952_NOMEDIA") ? 1 : 0;
     /* Decoder-stop dwell (cycles). Default sized to span a boot-thread poll
      * interval (~2 eCos ticks) so the MODE_STOP(0x10) window is visible before
      * the ack to STOPPED(0x11); tunable for bring-up. */

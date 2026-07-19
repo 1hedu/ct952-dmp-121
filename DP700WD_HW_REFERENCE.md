@@ -2655,3 +2655,27 @@ This also retires `CHOOSEMEDIA`/`NOMEDIA` as dead weight *for reaching POWERONME
 (they may still matter past it). Honest new ceiling: **crutch-free boot reaches
 POWERONMENU; the RTOS is still not alive** (CC loop blocks on mbox `0x40033830`,
 §10.50) — the next gate to make faithful, not fake.
+
+### 11.3 Gates 2 & 3 REMOVED — CHOOSEMEDIA / NOMEDIA were dead weight
+
+Measured (REACH, 150M) whether the media crutches buy anything now that decode is
+faithful (§11.2): **raw and full (+CHOOSEMEDIA +NOMEDIA) reach identical milestones —
+POWERONMENU @75.5M and no further; the media-monitor functions (`MEDIA_MonitorStatus`
+0x1186c, `_MEDIA_MonitorMediaStatus` 0x118b8) are unreached in both.** So they buy
+nothing: they faked a *result* (`__bChooseMedia`=USB; USBSRC CHECK_DEVICE→NO_MEDIA)
+without waking the real (asleep) USB source thread, which is why the boot is unchanged.
+
+Deleted all three crutch blocks from `machine.c` (the CHOOSEMEDIA read-override, both
+NOMEDIA handlers, the `nomedia` getenv init). Verified: the boot still reaches
+`POWERONMENU_Initial` @75.5M with the code gone. The `nomedia` struct field is retained
+(unused) so existing `--snapshot` files stay layout-compatible.
+
+**Scoreboard: the boot to POWERONMENU is now 100% crutch-free.** Three crutches gone
+(`VDEC_DONE` made faithful; `CHOOSEMEDIA`/`NOMEDIA` deleted as inert). Remaining
+scaffolding is all *past* the current ceiling: `CT952_TICK_FAST_AT` (a clock-rate
+calibration, only relevant once the RTOS idles — the faithful version is a proper
+cycles/instruction × MHz clock model, not an env threshold) and the display/inject
+demo hooks (not boot-progress crutches). The real remaining wall is unchanged: past
+POWERONMENU the CC thread blocks on mailbox `0x40033830` with nothing posting to it
+(§10.50) — the event-starvation, which needs a *hardware event source* modeled, not a
+faked flag. That is the next gate, and it is the hard one.

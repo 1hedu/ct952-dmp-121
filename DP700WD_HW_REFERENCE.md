@@ -1247,3 +1247,99 @@ sampling only running threads, and resolve the ROMV symbol→run mapping.
 `CT952_PCSAMP_SP=<base>` to isolate one thread and `CT952_PCSAMP_O7=1` to sample
 the memcpy caller), and `CT952_REACH=1` (single-steps and prints the first hit of
 each watched boot function). `CT952_NOMEDIA=1` is the no-media model above.
+
+### 10.18 CRITICAL — `DVD909.sym` is the SDK build, NOT the retail ROM (VERIFIED)
+
+While trying to trap the init gate by name (§10.17), the symbol addresses would
+not line up with execution. Three independent checks confirm **`DVD909.sym` does
+not describe the retail `dp700wd.bin` code layout** — it is the SDK/reference
+build's map. Do **not** trust its code addresses for the retail image.
+
+1. **ROMV DRAM is ~90% zero.** After boot, the ROMV window
+   `0x40000000..0x4001d000` has only 2930/29696 non-zero words (last at
+   `0x40011f24`); TEXT `0x4001d000..0x40020878` is 100% populated. The SDK's
+   ROMV symbols (`INITIAL_System@0xeb90`, `MEDIA_MonitorStatus@0x1186c`,
+   `_MEDIA_MonitorMediaStatus@0x118b8`, `CC_DVD_MainLoop@0x2014`, all `<0x1d000`)
+   point into that mostly-zero region — reading those run addresses gives `0`.
+2. **`memcpy` address mismatch.** The retail image's real unrolled word-copy
+   `memcpy` runs at flash `0xd38b4` (disassembled: `ld [%o1]→st [%g3]`, ptr+=4,
+   count-=16/iter). `DVD909.sym` places `memcpy` at `0xa78d4` (→`0x400a78d4`).
+   No clean relationship.
+3. **No constant delta aligns sym entries to `save` prologues.** Of 65 sym `T`
+   entries in the TEXT range, only 3 land on an actual `save %sp,…` prologue in
+   the loaded DRAM at `sym+0x40000000`; the best offset over ±256 bytes still
+   hits only 7/65 (a real match would align ~50+/65). The retail TEXT has 125
+   `save` prologues where the sym expects 65 functions — different code.
+
+**What is still reliable:** the section *memory map* (boot-log section bases
+TEXT `0x4001d000` / DATA `0x40020878` / ENGL `0x40049900` match the sym's section
+starts), and anything derived from **actual execution** — real PCs from the
+sampler/traces, flash disassembly at executed addresses, and hardware-register
+behaviour (the §10.16 GPU fix, the §10.15 boot mechanisms, which key on executed
+flash PCs, all stand). The SDK **source** (`cc.c`/`media.c`/`usbsrc.c`/…) remains
+valid as the *algorithm/logic map*, but every address must be re-derived from the
+retail ROM.
+
+**Consequence for §10.17:** the no-media model watches SDK-sym DATA addresses
+(`_fUSBSRCCmdd@0x4003f540`, …) which are **not** trustworthy for retail, so its
+non-engagement is inconclusive about the media path. Retail-native methods are
+required next: (a) locate boot-log / OSD strings in the ROM and work outward from
+their references; (b) find eCos thread objects in the RAM dump by structural
+pattern (see the eCos `Cyg_Thread`/HAL-context layout research) to read the
+blocked CC thread's saved PC directly — both symbol-independent.
+
+### 10.19 The retail source IS in-tree (`950_Files/`), and the built-in photos
+
+The retail DP700WD is a **952-based** DMP photo frame; `DVD909.sym` (§10.18) is a
+909 SDK build. The matching source is the in-tree **`950_Files/`** folder, whose
+`950_make.txt` gives the exact retail build config:
+`CT950_STYLE` + `CT951_PLATFORM` + `SUPPORT_950=1`, `DRAM_SIZE_16`,
+`DECODER_SYSTEM=DVD909R_EVAL`, `CPU_146M`, serial 8M PROM. It ships
+`poweronmenu.c` / `mainmenu.c` / `menu.c` / `clock.c` / `radio.c` / `alarm.c` /
+`calenui.c` (clock/alarm/radio/calendar — the photo-frame feature set), plus
+`logo{,1,2}.bin` and `snd1.bin`. **Use `950_Files/*.c` as the retail logic map**
+in preference to the root SDK `.c` files (still no retail symbol table — match
+functions to code by string references / behaviour, always verifying).
+
+**Built-in slideshow photos (verified content).** `950_Files/01.jpg`,
+`02.jpg`, `03.jpg` are the three built-in images (`BUILD_IN_JPG_ENCODE_NUM = 3`,
+§9.2): a pink **rose**, a pink **orchid**, and a **rose bouquet**, all 720-wide
+(matches the 720×448 decode buffer). They are **not** byte-identical in the ROM
+(re-encoded), but the ROM carries JPEG data at the expected SPI photo region:
+22 `FFD8FF` SOI markers, a clean one at **`0x160000`** (the `SRCFTR_SPI_ENCODE`
+base the retail build uses; the SDK default was `0x110000`, §9.2) and an
+icon/thumbnail cluster around `0x104de0`–`0x11xxxx`. The stored photos are in the
+device's 64 KiB-slot SPI format, not plain JFIF (a naïve SOI→EOI carve yields a
+short, non-decodable segment), so reading them needs the SOURCE_SPI / HW-decode
+path — the §10.10 datapath.
+
+### 10.20 eCos SPARC thread-context decode (for finding the blocked thread, symbol-free)
+
+To locate where the CC/boot thread is actually stuck without a retail symbol
+table, decode its saved context straight from a RAM dump. Layout confirmed from
+upstream eCos source (`ecos-rtos/ecos`, kernel 3.x tree; member *orders* are
+stable back to the 1.x/2.x our ROM marks, but `#ifdef`-gated offsets must be
+sanity-checked against the dump). NOTE: the GitHub repo `Ecos-platform/ecos` is a
+different project (an FMI co-simulation engine) — **not** the RTOS.
+
+- **`cyg_flag_t`/`Cyg_Flag`**: the 32-bit flag VALUE is at **offset 0** (first
+  word); the waiter `Cyg_ThreadQueue` follows at +4. (Confirms the §10.17 flag
+  model read the right word — for whatever the retail flag addresses turn out to be.)
+- **`Cyg_Thread`** (no vtable/vptr; `Cyg_HardwareThread` is the first base):
+  `stack_base` @+0, `stack_size` @+4, then **`stack_ptr` @+8** (or +12 if
+  `CYGFUN_KERNEL_THREADS_STACK_LIMIT`). `state` (`cyg_uint32`) is the first member
+  after the scheduler base block (~+44, verify): `0`=RUNNING, `1`=SLEEPING,
+  `2`=COUNTSLEEP, `4`=SUSPENDED, `8`=CREATING, `16`=EXITED (bitmask). Enumerate via
+  the static `Cyg_Thread::thread_list` + per-node `list_next`, or scan for objects
+  whose `stack_ptr ∈ [stack_base, stack_base+stack_size)`.
+- **SPARC saved-context frame** (`hal/sparc/arch` `HAL_SavedRegisters`, 32 words /
+  128 bytes, sitting AT the thread's saved `%sp`=`stack_ptr`, big-endian):
+  `l[0..7]`=words 0–7, `i[0..7]`=words 8–15, saved **PSR**=word 16 (the `%g0`
+  slot), `g[1..7]`=words 17–23, `o[0..7]`=words 24–31. So:
+  - kernel resume PC = word 31 (`%o7`, byte 124) — lands in the scheduler.
+  - **application PC via the window chain**: word 15 (`%i7`, byte 60) = caller
+    return PC; word 14 (`%i6`, byte 56) = caller `%fp`. Walk up: at each `fp`,
+    `fp[15]`=return PC, `fp[14]`=next `fp`, until `fp` leaves the stack range.
+    Each return PC is a retail flash/DRAM address to disassemble and match to the
+    `950_Files` source. (If built with `CONTEXT_SAVE_MINIMUM`, only word 31/PSR +
+    the L/I windows are valid, but the `i6/i7` unwind still works.)

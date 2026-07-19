@@ -2061,3 +2061,62 @@ Loading advances. New retail anchors: PROC1-2nd ISR `0x4001f720`;
 `ISR_IRSaveClearStatus 0x42328`; `INPUT_RemoteScan`/`DSR_IR` @flash `0x423xx`;
 `__bISRKey 0x40039074`; IR regs `0x80000390/0x80000394`; PROC1-2nd ctrl `0x800000d0-dc`.
 Diagnostics: `CT952_IRKEY`, `CT952_IRTRACE`, `CT952_KEYTRACE`.
+
+### 10.39 DEEP DECODER DIG — the advance-event never fires; JPEG_Status(DECODE) is the true gate
+
+A full retail disassembly of the "Loading" event framework + the JPEG decode
+orchestrator, reconciling §10.22/10.30/10.32/10.37. All addresses retail-verified.
+
+**(A) The Loading advance-event NEVER fires (decisive, via `CT952_REACH`).** The
+modal-wait (`0x24d0c`) advances only when its list (`0x40032180`, checked by
+`0x11f48`) gets an event. The **sole** function that posts to that list is
+`0x12f10` (`PostEvent`, via `0x6b80c`→list `0x40032188`), and its **sole caller**
+is `0x6eec` — inside the CC event **dispatcher** (`0x6df8-0x6f0c`) that reads CC
+flag bits and posts events from ring buffers (bit `0x80` = key ring, `0x200` =
+next, …). Over a 60M-instruction boot, **neither `0x12f10` nor `0x6eec` is ever
+reached.** So the modal-wait list is permanently empty and no forward event exists.
+
+**(B) The media scan never runs.** The media thread reaches `MEDIA_Management`
+(`0x1152c`) at icount 4.9M but **never** reaches `MEDIA_MonitorStatus` (`0x1186c`)
+or `_MEDIA_MonitorMediaStatus` (`0x118b8`). So the USB/removable-media scan that
+would post a media event (and let `CT952_NOMEDIA` engage, §10.17) never executes —
+the media worker is parked asleep (USB/card HW init unmodeled). No media event.
+
+**(C) The logo decode succeeds at the JPU level but JPEG_Status(DECODE) stays
+non-OK.** `UTL_ShowLogo`→`UTL_ShowJPEG_Slide` shows the logo; its DECODE-status poll
+(`HALJPEG_Status(HALJPEG_DECODE)`→`JPEG_Status(JPEG_DECODE)`, precompiled lib) never
+returns OK, so `HALJPEG_Display` never runs — **`F0Y/F0C`/`VIDEO_EN` are never
+written in the whole boot** (§10.37). Yet the JPU work *does* complete: `JPU_WaitDone`
+(`0x6bb14`) returns 1 (the emulator clears `JPU_BUSY` on each kick), and the decode
+sub-orchestrator (`0x6d4c0`, two `WaitDone` calls at `0x6d510`/`0x6d558`) returns 1
+(success). **So the non-OK comes from a frame/VLD-level completion gate ABOVE the
+per-op JPU_BUSY** — the signal the precompiled `JPEG_Decode` thread waits on before
+writing `JPEG_Status=OK`, which the emulator never produces. This **supersedes
+§10.30** ("infinite JPU loop on `0x80000e00`" — that growth was the GPU redraw,
+§10.32; the actual JPU decode runs once and succeeds).
+
+**(D) The video compositor (found).** `0xac120` updates the DISP video plane
+(writes `0x8000194c/0x80001950` + the `VIDEO_EN 0x80001a4c` region) whenever a state
+byte `state+310` differs from the "displayed" byte `0x40040ee4` (with a `0x40040ee2`
+dirty flag). It runs each ~200K-instr redraw pulse but the bytes always match
+(nothing advances the state), so the plane is never reconfigured.
+
+**Unified conclusion (reconciles §10.17/10.22/10.24/10.37/10.38).** The boot is
+parked in a multi-thread sleep because **the entire event-generation chain is
+dormant** — every forward event requires an upstream HW signal that the emulator
+doesn't produce:
+- the precompiled `JPEG_Decode` never reports OK (missing **frame-completion**
+  signal, distinct from `JPU_BUSY`), so no logo-display-done event;
+- the media worker never posts (USB/card HW unmodeled), so no media event;
+- input works (§10.38) but "Loading" doesn't consume keys.
+
+**Sharpest next target:** find the precompiled `JPEG_Status` status variable + what
+`JPEG_Decode` waits on for **frame** completion (the VLD/decode-done signal above
+`JPU_BUSY` — candidates: a VLD frame-done reg, or an interrupt/semaphore the decode
+thread blocks on). Provide it (alongside the functional picojpeg output already
+written) → `JPEG_Status(DECODE)=OK` → `HALJPEG_Display` sets `F0Y/F0C/VIDEO_EN` AND
+`UTL_ShowJPEG_Slide` returns TRUE → the state machine posts its logo-display-done
+event via `0x6eec`/`0x12f10` → boot advances. New retail anchors: `PostEvent 0x12f10`;
+event dispatcher `0x6df8`/`0x6eec`; decode sub-orchestrator `0x6d4c0`; video
+compositor `0xac120` (state byte `+310`, displayed byte `0x40040ee4`);
+`MEDIA_Management 0x1152c`. Diagnostics: `CT952_DSTRACE`, `CT952_KEYTRACE`, `CT952_REACH` (+PostEvent/dispatch watches).

@@ -689,6 +689,16 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
                 fprintf(stderr, "[KEYrd] __bISRKey read pc=%08x icount=%llu\n",
                         m->cpu.pc, (unsigned long long)m->cpu.icount); krt++; }
         }
+        /* DECODE-status poll locator (CT952_DSTRACE): log reads of the HAL/JEPG
+         * status region around the logo-decode finish so we can find the var
+         * HALJPEG_Status(DECODE) polls and force it OK (10.39 decoder work). */
+        if (getenv("CT952_DSTRACE") && (addr & ~3u) >= 0x40040c00u &&
+            (addr & ~3u) < 0x40041000u &&
+            m->cpu.icount > 10600000ull && m->cpu.icount < 13000000ull) {
+            static int ds; if (ds < 80) {
+                fprintf(stderr, "[DSTrd] %08x pc=%08x icount=%llu\n",
+                        addr & ~3u, m->cpu.pc, (unsigned long long)m->cpu.icount); ds++; }
+        }
         if (m->skip_panelcfg && addr == 0x4002f770u)
             return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
         /* Decoder-STOP window: present the state mirror (0x40039cd0, read by
@@ -1390,8 +1400,8 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                 {0x00002318u,"Thread_CTKDVD(F)"}, {0x0001152cu,"MEDIA_Management(F)"},
                 {0x0001186cu,"MEDIA_MonitorStatus(F)"}, {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"},
                 {0x4000eb90u,"INITIAL_System(D)"}, {0x4004b808u,"POWERONMENU_Initial(D)"},
-                {0x40002014u,"CC_DVD_MainLoop(D)"}, {0x4001186cu,"MEDIA_MonitorStatus(D)"},
-                {0x400118b8u,"_MEDIA_MonitorMediaStatus(D)"}, {0x4001152cu,"MEDIA_Management(D)"},
+                {0x00012f10u,"PostEvent->list(F)"}, {0x00006eecu,"EvtDispatch_bit80(F)"},
+                {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"}, {0x0001186cu,"MEDIA_MonitorStatus2(F)"},
             };
             static uint8_t hit[14];
             int wi;

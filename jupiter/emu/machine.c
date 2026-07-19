@@ -676,6 +676,17 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
     if (addr >= 0x80000000u && addr < 0x80000000u + MACH_IO_SIZE) {
         uint32_t off = (addr - 0x80000000u) & ~3u;
         uint32_t v = io_read(m, off);
+        /* Decode-window IO trace (CT952_DECTRACE): log reads of the decode
+         * DMA/status regs during the logo-decode burst so we can see what the
+         * driver polls and where it gives up (roadmap P1). */
+        if (getenv("CT952_DECTRACE") && m->cpu.icount > 10000000ull &&
+            m->cpu.icount < 11600000ull &&
+            (off == 0xe00u || off == 0x2a28u || off == 0x2a34u ||
+             off == 0x2a30u || off == 0x2884u || off == 0xc10u)) {
+            static int dt; if (dt < 80) {
+                fprintf(stderr, "[DECrd] %08x=%08x pc=%08x icount=%llu\n",
+                        addr, v, m->cpu.pc, (unsigned long long)m->cpu.icount); dt++; }
+        }
         if (size == 4) return v;
         /* sub-word I/O read: extract big-endian lane */
         if (size == 1) return (v >> ((3 - (addr & 3)) * 8)) & 0xFF;

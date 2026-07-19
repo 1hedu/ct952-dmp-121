@@ -1810,3 +1810,33 @@ reg writes + PC), `CT952_DRAMHIST=<icount>` (DRAM data read-frequency, gated to 
 JPU-active window via `machine.h jpu_active_until`), `sparc_t.brk_pc` fast
 breakpoint. Retail anchors: JPU decode burst code `0x6bb00`/`0x6bbb4`, decode DMA
 regs `0x80000e00`/`0x8000031c`, BIU `0x4001fe90`.
+
+### 10.33 P1 pinned — the decode produces NO output; functional decode is the requirement
+
+Sampling the decode burst (icount 10.4-11.2M) shows its hot code is a **buffer-fill
+loop `0x3bf00`** (`st` to `[base+0/0x40/0x80]`, 64 words ×3) + OS scheduling + the
+idle wait `0x841e8` — i.e. the decode does real setup work, not a busy-poll, then
+returns. A decode-window IO trace (`CT952_DECTRACE`) found the only heavily-read
+reg is `0x8000031c` at PC `0x497ac` — a *periodic* handler (checks bit 28, timer
+calc), NOT the decode. So the decode is not stalled on a status poll.
+
+**The decisive check:** after the decode, the **Y video frame buffer
+`0x40065000..0x400B3C00` is entirely zero** (0/80640 words). The decode ran its
+op sequence but **wrote no decoded pixels** — because the emulator's JPU model
+only clears `JPU_BUSY`; it never actually decodes the bitstream to YUV. With no
+valid frame, `JEPG_Decode` returns non-OK → `HALJPEG_Display`/`VIDEO_EN` never.
+
+**So P1's requirement is concrete and unavoidable (this is §10.10 step 3):**
+functionally decode the staged logo JPEG (`0x401DC000`, `FF D8 FF E0` JFIF) with
+the in-tree picojpeg and **write the result as macroblock-tiled YUV 4:2:0** into
+the firmware's video frame buffer (Y `0x40065000`, C `0x400B3C00`; tiling formulas
+§10.2), on the decode kick (JPU decode op burst at ~10.4M, or `HALJPEG_Decode`).
+Then the driver's completion (which validates the produced frame) can succeed →
+`JPEG_Status(DECODE)=OK` → `HALJPEG_Display` sets `F0Y/F0C/VIDEO_EN` → the logo is
+on the panel through the firmware's own pipeline, and the same path serves the
+built-in photos. The emulator already has picojpeg + `machine_maybe_jpeg_decode`
+(writes host RGB) + `jupiter/jfb.c` tiling — the next build wires them to emit the
+tiled YUV into the frame buffer at the kick, and (if the driver still needs it)
+presents the JPU/BIU completion. Retail anchors: buffer-fill `0x3bf00`, JPU engine
+`0x6bb00`, frame buffers `0x40065000`/`0x400B3C00`. Diagnostic added:
+`CT952_DECTRACE` (decode-window IO trace).

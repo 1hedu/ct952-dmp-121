@@ -1343,3 +1343,52 @@ different project (an FMI co-simulation engine) — **not** the RTOS.
     Each return PC is a retail flash/DRAM address to disassemble and match to the
     `950_Files` source. (If built with `CONTEXT_SAVE_MINIMUM`, only word 31/PSR +
     the L/I windows are valid, but the `i6/i7` unwind still works.)
+
+### 10.21 GROUND TRUTH — the CC boot thread's wait, decoded from the live stack
+
+Applied §10.20 to a RAM dump of the stuck "Loading" state. **This is all
+retail-verified** (real execution addresses), replacing the unreliable SDK
+symbols. Config note: `CYGFUN_KERNEL_THREADS_STACK_LIMIT` is enabled, so
+`stack_ptr` is at object **+12** (not +8), and `state` (`cyg_uint32`) is at
+**+40**: `1`=SLEEPING for every blocked thread.
+
+**Thread map (10 blocked threads found by structural scan).** Two share the
+sampler's live stacks: `T@40038fb8` (stack `0x34408..0x35908`, the `0x34000`
+bucket) is the **OSD render** thread (its chain runs through `OSD_SetBufferMode`
+`0x4001f3a8` etc.); **`T@400371f8`** (stack `0x359d8..0x371d8`, the `0x36000`
+bucket) is the **CC/main thread**. Common OS wait wrappers seen across threads:
+`0x4001dab0`/`0x4001d4c0` (timed flag-wait), `0x4001ea40`/`0x4001ea60`
+(sleep/delay); timed waiters tail into the tick backing store `0x4002e320`.
+
+**The CC thread's blocked call chain** (inner→outer, from its saved SPARC frame):
+`[OS flag-wait] ← 0x4001dab0 ← 0x4001d4c0 ← 0x49970 ← 0x25240 ← 0x12028`.
+- `0x25240` calls `0x49944(2, 0, 0xFF)` — an `OSD_Output(MSG=2,…)`-shaped call
+  (the "Loading"/`MSG_WAITING` draw), which internally does a **timed flag-wait**
+  (`0x4001d4c0`: `ld [%l7+0x104],%o1; add %sp,0x60,%o2; call …` = flag ptr +
+  timeout) — the per-frame redraw sync.
+- `0x12028` is inside a **modal-wait dispatcher** (flash entry ~`0x11fc0`, args
+  `%i0`=mode, `%i1`=callback). Mode 0: loop `call %i1` (the redraw callback) then
+  `call 0x66a0(0x1000)`; `if ((ret&0xff)==0) goto loop`. On exit it stores result
+  `1` at `[0x40026EBC]`, clears the loop-active marker `[0x40026EB8]`, sets
+  `[0x40039344]=1`, and returns 1. Modes 1/2 return result 2 without waiting.
+
+**The gate primitive.** `0x66a0(mask)` = peek-and-clear on the flag object at
+**`0x40026EA4`**: `getbits(0x59640)` → `if (val & mask) { clearbits(0x59628); return 1 }
+else return 0`. So the CC thread advances only when **bit `0x1000` is posted to
+flag `@0x40026EA4`**. In the stuck dump that flag reads `0x00000000` (and the
+loop-active marker `[0x40026EB8]=1`), confirming it is waiting.
+
+**Poke experiment (`CT952_CCEVENT=<icount>`, added).** Posting
+`*(u32*)0x40026EA4 |= 0x1000` once, past the given icount: the firmware **consumes
+it** (flag reads back `0`, so `0x66a0` did see+clear it and the wait exited once)
+— but the screen stays on "Loading". So **bit `0x1000` is the modal response/
+refresh event, NOT the boot advance gate**: exiting the wait once returns into an
+outer context that re-enters it (the actual precondition — media/servo/decoder
+state — is still unmet). Useful negative result: the advance is not this one flag
+bit.
+
+**Next (retail-native, symbol-free):** unwind `T@400371f8` past `0x12028` to the
+frame that *calls* the dispatcher (its context: is this the §9.3 media/servo wait,
+or a UI confirm?), disassemble that caller against `950_Files/*.c`, and find who
+`OS_SetFlag`s the real advance condition. The dispatcher/flag addresses above are
+the anchors. Tool added: `CT952_CCEVENT=<icount>` (one-shot flag poke).

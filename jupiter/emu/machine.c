@@ -1127,8 +1127,24 @@ uint64_t machine_run(machine_t *m, uint64_t n)
         if (e) { g_pcsamp_thresh = strtoull(e, NULL, 0); atexit(pcsamp_dump); }
     }
     static int g_reach = -1;
+    static uint64_t ccev = 0; static int ccev_done = 0;
     if (g_reach < 0) g_reach = getenv("CT952_REACH") ? 1 : 0;
+    if (!ccev && !ccev_done) { const char *e = getenv("CT952_CCEVENT");
+                               ccev = e ? strtoull(e, NULL, 0) : 0; if (!ccev) ccev_done = 1; }
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
+        /* One-shot CC event-flag poke (CT952_CCEVENT=<icount>): the CC/boot
+         * thread spins in a wait-for-event dispatcher polling the flag object at
+         * 0x40026EA4 for bit 0x1000 (peek-and-clear via flash 0x66a0), redrawing
+         * "Loading" each iteration. Post that bit once, past the given icount, to
+         * probe what the firmware does when the event fires. Retail-verified addr
+         * (from the live thread-stack decode, not the SDK symbols). */
+        if (!ccev_done && m->cpu.icount > ccev) {
+            uint32_t v = mem_read_raw(m->dram + 0x26ea4u, 4);
+            mem_write_raw(m->dram + 0x26ea4u, v | 0x1000u, 4);
+            fprintf(stderr, "[CCEVENT] posted flag 0x40026EA4 |= 0x1000 at icount=%llu\n",
+                    (unsigned long long)m->cpu.icount);
+            ccev_done = 1;
+        }
         uint64_t chunk = n - done;
         uint64_t ran, i;
         if (g_reach) {

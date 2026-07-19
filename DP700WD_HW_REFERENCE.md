@@ -2604,3 +2604,54 @@ screensaver mode) → `_OSDSS_PictureUpdate` → `UTL_ShowJPEG_Slide` decode (§
 same path that already renders all 5 album photos). The one remaining engineering
 task is orchestration: post event 0x80 in the live CC-thread context (not injected
 into idle) and advance the clock — no unknowns remain in the path, only wiring.
+
+## 11. FAITHFUL BOOT — removing the crutches (the real goal)
+
+The scaffolding envs (`CT952_VDEC_DONE`, `CT952_CHOOSEMEDIA`, `CT952_NOMEDIA`,
+`CT952_TICK_FAST_AT`, injection) are FAKES — they stand in for unmodeled hardware.
+The real target is the retail firmware booting and running **naturally**, RTOS alive
+on its own, with every crutch deleted. The screensaver autostarting is just the first
+acceptance test that the machine is genuinely alive. This section tracks crutch
+removal by faithful hardware modeling.
+
+### 11.1 Measured crutch baseline (what faking actually bought)
+
+Milestone ladder (REACH, retail `dp700wd.bin`, 90M budget), measured — NOT recalled:
+
+| config | ceiling reached |
+|--------|-----------------|
+| raw, zero crutches (old) | `UTL_ShowJPEG_Slide` @46M — stalls |
+| `CT952_VDEC_DONE` only    | `POWERONMENU_Initial` @75.5M |
+| `CT952_CHOOSEMEDIA` only  | stalls @46M (no help alone) |
+| all crutches              | @75.5M (identical to VDEC_DONE alone) |
+| *any config*              | never reaches OSDSS / alive RTOS |
+
+Key facts this pins down, so no faithful result is ever mis-sold as a "first":
+- **Everything up to 46M happens raw** — no crutch is involved before `UTL_ShowJPEG_Slide`.
+- **The one gate between the raw ceiling and POWERONMENU is the JPEG decode completing.**
+  `CT952_VDEC_DONE` alone bridges 46M→75.5M; `CHOOSEMEDIA`/`NOMEDIA` do nothing for it.
+- **The splash-on-panel is downstream of that same gate** — raw reaches the decode call
+  but the decoder never reports done, so `HALJPEG_Display` never runs. So "it showed the
+  splash" was a *faked* milestone (needs the decode-completion). Reproducing splash or
+  POWERONMENU is therefore parity with fakes, not progress; only doing it crutch-free is.
+
+### 11.2 Gate 1 REMOVED faithfully — decode-completion (retire CT952_VDEC_DONE)
+
+`CT952_VDEC_DONE` was only a `getenv` A/B toggle on an already-faithful transition: a
+JPU decode op (`R_GPU_CTL0`, non-GPU branch) clears `JPU_BUSY` and the modeled decoder
+reaches MODE_STOP(0x10)=frame-done — the real kick→busy-clears→status-done sequence,
+just instant. The decode-status getter (0x375a0 action 0) maps mirror `0x40039cd0`=0x10
++ HW `0xB0000190`=0x11 → `JPEG_STATUS_OK`. Removing the env gate (report frame-done
+whenever a frame was actually decoded, `vdec_frame_done`) makes it faithful.
+
+**Result: the raw boot — no `VDEC_DONE`, no `CHOOSEMEDIA`, no `NOMEDIA`, nothing —
+reaches `POWERONMENU_Initial` @75.5M on its own.** Verified: `CT952_VDEC_DONE` has 0
+references left in the code. (A first attempt also cleared `vdec_frame_done` on a stop
+command "latest-command-wins"; that broke it — the firmware issues a stop in the
+decode→display flow and relies on frame-done persisting through it — so that was
+reverted. Frame-done persisting is what the hardware presents until the next decode.)
+
+This also retires `CHOOSEMEDIA`/`NOMEDIA` as dead weight *for reaching POWERONMENU*
+(they may still matter past it). Honest new ceiling: **crutch-free boot reaches
+POWERONMENU; the RTOS is still not alive** (CC loop blocks on mbox `0x40033830`,
+§10.50) — the next gate to make faithful, not fake.

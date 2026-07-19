@@ -457,9 +457,9 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
             /* Faithful decode-completion: a JPU decode op means the hardware
              * decoder is processing/finishing a frame -> it reaches MODE_STOP(0x10)
              * = frame-done. The decode-status getter (0x375a0 action 0) maps 0x10
-             * to JPEG_STATUS_OK. Set after the boot stop gates (JPU decode runs
-             * only once the firmware is decoding), so gate-3's 0x11 is unaffected.
-             * Effective only under CT952_VDEC_DONE (mirror read gate) (10.40). */
+             * to JPEG_STATUS_OK. JPU decode ops run only once the firmware is past
+             * the boot decoder-stop handshake (which runs before any decode), so
+             * gate-3's 0x11 is unaffected. */
             m->vdec_frame_done = 1;
             /* P1: on the JPU decode kick, functionally decode the staged JPEG
              * and emit the tiled-YUV frame the real hardware would produce
@@ -747,7 +747,7 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         if (addr == 0x40039cd0u) {
             if (getenv("CT952_MIRTRACE")) {
                 uint32_t rv = (m->cycles < m->vdec_stop_until) ? 0x10u :
-                    (m->vdec_frame_done && getenv("CT952_VDEC_DONE")) ? 0x10u :
+                    m->vdec_frame_done ? 0x10u :
                     m->vdec_stopped ? 0x11u : mem_read_raw(m->dram + 0x39cd0u, size);
                 static int mt; if (mt < 60) {
                     fprintf(stderr, "[MIRrd] ->%02x fdone=%d pc=%08x icount=%llu\n",
@@ -765,8 +765,9 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
              * MODE_STOP(0x10)=frame-done: the decode-status getter (0x375a0 action 0)
              * maps 0x10 -> JPEG_STATUS_OK. This fires only after the boot's stop
              * gates (which run before any decode), so gate-3's 0x11 is unaffected.
-             * Opt-in via CT952_VDEC_DONE for clean A/B (10.40). */
-            if (m->vdec_frame_done && getenv("CT952_VDEC_DONE")) return 0x10u;
+             * Faithful decoder state: reports frame-done whenever a frame has been
+             * decoded (the JPU-decode completion the firmware polls) -- §10.53. */
+            if (m->vdec_frame_done) return 0x10u;
             if (m->vdec_stopped) return 0x11u;
         }
         /* EXPERIMENT (CT952_VDEC_IDLE): present the boot thread's decoder-init
@@ -849,8 +850,8 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             /* After a decode frame completes, the live playmode is idle. The
              * getter (0x6f098) only returns the mirror CLEANLY (no 0x1000 busy
              * bit) when HW in {0,0x11}; present 0x11 so the mirror's 0x10 maps to
-             * JPEG_STATUS_OK (needs both, 10.41). Gated by CT952_VDEC_DONE. */
-            if (m->vdec_frame_done && getenv("CT952_VDEC_DONE")) return 0x11u;
+             * JPEG_STATUS_OK (needs both, 10.41). Faithful: idle after frame-done. */
+            if (m->vdec_frame_done) return 0x11u;
             static int fp = -1;
             if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
                           fp = e ? (int)strtoul(e, NULL, 0) : -2; }

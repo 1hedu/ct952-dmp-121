@@ -611,6 +611,19 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             if (vi < 0) vi = getenv("CT952_VDEC_IDLE") ? 1 : 0;
             if (vi && addr == 0x40039f24u) return 1;   /* gate 2: ==1 */
         }
+        /* INITIAL_PowerONStatus progression probe (CT952_PONSREADY): the
+         * power-on state machine gates "Loading"->next on a countdown byte at
+         * 0x40022F5E; poster fn 0x45660 posts CC event 0x1000 only while it
+         * reads exactly 2. With TICK_MULT time-compression the byte can skip
+         * the ==2 window (it sits at 0 in the stuck dump). Present it as 2 once
+         * Loading is up so the poster fires and the state machine can advance.
+         * Ground-truth addr from the live CC-thread stack decode (10.21/10.22). */
+        {
+            static int pr = -1;
+            if (pr < 0) pr = getenv("CT952_PONSREADY") ? 1 : 0;
+            if (pr && addr == 0x40022F5Eu && size == 1 && m->cpu.icount > 30000000ull)
+                return 2;
+        }
         /* No-media model (CT952_NOMEDIA): stand in for the USBSRC worker
          * thread, which never runs in the emulator (it would block in the
          * opaque usb.a/card.a HW init). The firmware's media-detect loop

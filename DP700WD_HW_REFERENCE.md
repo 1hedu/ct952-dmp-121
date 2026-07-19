@@ -1392,3 +1392,56 @@ frame that *calls* the dispatcher (its context: is this the §9.3 media/servo wa
 or a UI confirm?), disassemble that caller against `950_Files/*.c`, and find who
 `OS_SetFlag`s the real advance condition. The dispatcher/flag addresses above are
 the anchors. Tool added: `CT952_CCEVENT=<icount>` (one-shot flag poke).
+
+### 10.22 FULL unwind — the "Loading" wait is INITIAL_PowerONStatus, gated on decoder-ready
+
+A precise `%fp`-chain walk of the CC thread (`T@400371f8`, `stack_ptr` at obj+12)
+gives a clean 14-frame stack all the way to the thread entry (`i7=0`). Frame
+return addresses (inner→outer):
+```
+[OS flag-wait] 4001dab0 <- 4001d4c0 <- 0x49970 <- 0x25240 <- 0x12028(dispatcher)
+   <- 0x24d54 <- 0x26e58 <- 0x25f48 <- 0xb018 <- 0x41b34 <- 0xadc4 <- [OS entry]
+```
+The outermost app frame (`0xadc4`) is in a function that calls `0x416f4` then
+**`0x418f0`** — i.e. `INITIAL_System` → **`INITIAL_PowerONStatus`** (these two flash
+addrs were already established from execution, §10.11/cc.c:1315). **So the live
+stack independently lands on the exact known boot function — validating the whole
+symbol-free decode method.** The CC thread is in `INITIAL_PowerONStatus`, NOT the
+main loop; the "Loading" is the power-on-status wait, matching §10.11-12.
+
+**The state-machine structure (all retail-verified addresses):**
+- `INITIAL_PowerONStatus` (`0x418f0`) runs a state machine via dispatcher
+  **`0xafd8`** (`ld [%i0+4],%o1; call %o1` — indirect call through a per-state
+  handler table; `%i0` = state object).
+- The current state's handler chain (`0x41b18` → `0xaffc` → `0x25f2c` → `0x26e44`
+  → `0x24d38`) calls the **modal-wait dispatcher `0x11fb0`** with `mode=0`,
+  `callback=0x25234`. `0x25234` = `OSD_Output(2,0,0xFF)` — the `MSG_WAITING`
+  "Loading" draw. The dispatcher loops the callback while polling the CC event
+  flag for bit `0x1000` (waiter `0x66a0` = peek-and-clear of flag `@0x40026EA4`).
+
+**The `0x1000` event mechanics (fully mapped):**
+- Flag object `@0x40026EA4`; primitives `getbits 0x59640`, `clearbits 0x59628`,
+  `setbits 0x597d0`. Poster wrapper `0x6670` = `PostCCEvent(bits)` = `setbits`.
+- The `0x1000` poster is fn **`0x45660`**: posts `0x1000` **iff** `[0x40039344]!=0`
+  (the Loading dispatcher sets this =1 while active) **AND** the countdown byte
+  **`[0x40022F5E]==2`**. That byte is a countdown (writers set it to 3; `0x1d170`
+  decrements 3→2→1→0). In the stuck dump it is **0** (overshot; `TICK_MULT=16`
+  time-compression likely skips the `==2` sample window).
+
+**Two interventions tested — both NEGATIVE, both informative:**
+- `CT952_CCEVENT=<icount>`: poke `*(u32*)0x40026EA4 |= 0x1000`. The firmware
+  consumes it (flag clears, wait exits once) — screen stays on Loading.
+- `CT952_PONSREADY`: present `[0x40022F5E]` as `2` past 30M icount, so the poster
+  can fire `0x1000` naturally — screen still stays on Loading.
+
+**Conclusion:** posting `0x1000` (directly, or by satisfying the countdown) does
+**not** advance past Loading. The event is only a **re-evaluation pulse**; the
+real boot-forward gate is a **decoder/servo readiness condition** that the state
+handler re-checks each pulse and still finds unmet (PROC2/decoder held in reset).
+This ties back to §10.11-12: the power-on-status state machine is waiting on the
+decoder reaching its target state. **Next:** decode the specific state handler
+(`0x25f2c`/`0x26e44` and the `0xafd8` handler-table entry) to find the exact
+decoder/servo predicate it evaluates (likely reads playmode `0xB0000190` / mirror
+`0x40039cd0`), and satisfy it — extending the existing decoder-state model
+(`CT952_TEST_MIRROR10`, the stop-dwell) rather than faking the event.
+Tools added: `CT952_CCEVENT`, `CT952_PONSREADY` (both env-gated probes).

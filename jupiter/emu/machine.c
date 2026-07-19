@@ -39,6 +39,19 @@ static void machine_maybe_jpeg_decode(machine_t *m)
     int w = 0, h = 0;
 
     m->jpeg_done = 1;                 /* decoder reports ready once armed */
+    /* Built-in-photo staging (CT952_STAGE_PHOTO="<flash_off>"): copy a built-in
+     * JPEG from flash (photo album section "0001" @0x160000/0x170000/0x180000)
+     * into the staging buffer so the firmware's own working decode+display path
+     * renders a real photo -- demonstrating the slideshow through the pipeline. */
+    {
+        const char *sp = getenv("CT952_STAGE_PHOTO");
+        if (sp && m->flash) {
+            uint32_t faddr = (uint32_t)strtoul(sp, NULL, 0);
+            uint8_t *dst = machine_dram_ptr(m, m->jpeg_src);
+            if (dst && (uint64_t)faddr + 0x10000u <= m->flash_size)
+                memcpy(dst, m->flash + faddr, 0x10000u);
+        }
+    }
     if (m->jpeg_src < 0x40000000u ||
         m->jpeg_src >= 0x40000000u + MACH_DRAM_SIZE)
         return;

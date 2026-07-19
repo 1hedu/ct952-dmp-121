@@ -2249,3 +2249,30 @@ flash playback (`MM_PlayPhotoInFlash`) and decode the built-in photos. The OSD
 palette (GAM_OSD `0x80001C00`) is still unloaded — for OSD-enabled screens (menu
 UI) it renders via the fallback ramp; loading the real palette is a separate polish
 item (the splash doesn't need it since OSD is disabled there).
+
+### 10.43 PAYOFF — built-in photos render on the panel through the firmware's decode pipeline
+
+The three built-in demo photos now display on the emulated panel end-to-end.
+
+**Built-in photo album located:** flash section-table entry **"0001" @0x160000, size
+0x50000** (`0x1d8`), a 320KB album holding three real Photoshop-exported JFIF+EXIF+XMP
+photos at **0x160000** (zebra butterfly on flowers, 640x360), **0x170000** (Grand
+Tetons / Moulton barn), **0x180000**. Each is section-aligned with a main image +
+EXIF thumbnail. (The retail firmware plays them via its MM album player off section
+"0001"; that player's exact trigger from POWERONMENU is a separate dig.)
+
+**Rendered through the working pipeline:** `CT952_STAGE_PHOTO="<flash_off>"` copies a
+built-in JPEG from flash into the staging buffer `0x401dc000`, so the firmware's own
+decode+display path (`UTL_ShowJPEG_Slide` → DECODE=OK via `CT952_VDEC_DONE` →
+`0x39f38`, §10.41) plus the functional decode + the fixed scan-out (§10.42) render
+the real photo on the video plane. Verified: the functional decode reports
+`640x360 from 0x401dc000` and the panel shows the actual photo (butterfly / barn),
+not the logo. This demonstrates the entire decode→display→composite chain works on
+real content — the slideshow payoff.
+
+**Chain summary (whole arc):** natural boot past "Loading" → media-select flip
+(`__bChooseMedia 0x40031b9c`→USB) → `UTL_ShowJPEG_Slide` runs → decode-completion
+model (`CT952_VDEC_DONE`: mirror `0x40039cd0`→0x10 + HW `0xB0000190`→0x11) → DECODE=OK
+→ firmware display path → functional decode → scan-out (stride 720, honor OSD-en) →
+photo on panel. Boot also reaches POWERONMENU_Initial (75.5M). Diagnostics:
+`CT952_CHOOSEMEDIA`, `CT952_VDEC_DONE`, `CT952_STAGE_PHOTO`, `CT952_NOMEDIA`.

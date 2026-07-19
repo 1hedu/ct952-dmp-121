@@ -2701,3 +2701,25 @@ data/text addresses must stay empirically derived, per the standing warning.
 its init, enters the event loop, and blocks *indefinitely* (no timeout) on mailbox
 `0x40033830` for a message that nothing posts. The remaining gate is a **missing
 hardware-event source** feeding that mailbox — not an alarm, and not a fakeable flag.
+
+### 11.5 MAJOR REFRAME — the RTOS is partly ALIVE; it's a message-ROUTING gap
+
+Breakpointed the eCos mbox PUT primitive 0x4001de5c on the crutch-free snapshot and let
+virtual time run (fast tick). Posts happen. Multiple hits, from real producer threads
+(sp=0x40035180 / 0x40035110 / 0x40034e88, caller 0xaf984), posting periodic messages
+(0,1)(0,5)(0,0x64). So worker threads ARE running and posting on a cadence -- the system
+is not dead (consistent with alarms working, 11.4).
+
+But the posts do not go to the CC/UI mailbox. The put primitive posts to the queue in the
+global *(0x400423a8), which now reads 0x40038fb8 -- a different mailbox. The CC thread
+waits on 0x40033830 (its count field 0x4003386c stays 0). So: active producers post to
+0x40038fb8; the CC/UI thread is blocked on 0x40033830, fed nothing. 0x400423a8 is a
+context-dependent "current queue" pointer (it was 0x40033830 when the CC thread blocked,
+0x40038fb8 now under a producer thread), so the two channels are distinct and the
+producers' events never reach the UI queue.
+
+This reframes the whole "event-starvation": it is NOT a dead RTOS, a broken alarm, or a
+missing hardware event (those all exist / work). It is a message-ROUTING gap -- the live
+producer stream on 0x40038fb8 is not reaching the UI consumer on 0x40033830. Next: find
+who consumes 0x40038fb8 and why the UI isn't among the targets (a relay/dispatch thread
+that should forward 0x40038fb8 -> 0x40033830, asleep or never registered).

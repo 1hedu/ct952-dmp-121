@@ -1604,3 +1604,45 @@ boot-to-Loading path; the decoder-stop handshake is now modelled faithfully.
 
 Remaining roadmap items 2-4 (§10.25) are unchanged: find why the logo decode is
 never kicked, apply the §10.10 JPEG datapath, de-tile the scan-out.
+
+### 10.27 Roadmap item 2 — the logo-decode kick gate located (in source), + a reconciliation to nail
+
+Traced the logo decode from source (utl.c/haljpeg.c are in-tree). The path:
+`INITIAL_PowerONStatus` → `_INITIAL_ShowFirstLOGO()` = **`UTL_ShowLogo()`**
+(utl.c:481). The retail LOGO section header (`flash 0x104DD8`) is
+`5a 00 2c68 …` → `bLogoType=0x5A` ('Z' = **JPEG logo**, not the `0x4D`/'M' MPEG
+path), data `FF D8 FF E0` (480×270 JFIF, 11368 B). So `UTL_ShowLogo` takes its
+`bLogoType==0x5A` branch (utl.c:756): sets JPEG play mode, `HAL_FillVideoBuffer`,
+`HAL_ResetVideoDecoder`, then **`UTL_ShowJPEG_Slide(NORMAL,0)`** (utl.c:831).
+
+**`UTL_ShowJPEG_Slide` (utl.c:377) has two sequential gates, and the FIRST is the
+wall:**
+1. `HALJPEG_ParseHeader` (→ precompiled `JPEG_ParseHeader`; `HALJPEG_SetDisplay`
+   writes `DISP_VIDEO_POS 0x80001a48`, seen 3× — so this path IS reached), then a
+   busy `while (HALJPEG_Status(PARSE_HEADER)!=OK)` with a `COUNT_3_SEC*2` timeout.
+   **If it times out → `return FALSE` at utl.c:425 — before `HALJPEG_Decode()`.**
+2. `HALJPEG_Decode()` (utl.c:429) — the actual `BCR08`/`JPU_GO` kick. Only reached
+   if gate 1 passes.
+
+`HALJPEG_Status(PARSE_HEADER)` = `JPEG_Status(JPEG_PARSE_HEADER)` — a **precompiled
+JPEG-worker thread variable** (haljpeg.c:833), not a register. So gate 1 clears
+only when the worker thread actually finishes parsing the header, which needs the
+BIU bitstream feed + VLD parse to complete (§10.8). It never does → parse times
+out → `UTL_ShowJPEG_Slide` returns FALSE → **`HALJPEG_Decode` is never called →
+`BCR08`/`JPU_GO` never written** (this is the mechanism behind §10.9's observation).
+
+**Reconciliation to nail next (important):** the parse-header wait (utl.c:411-418)
+is a *tight busy-loop reading `JPEG_Status`* with no yield — yet the PC sampler
+(§10.21) shows the boot thread in OSD redraw / the state-machine (§10.21-24), NOT
+in that loop. So `UTL_ShowLogo` most likely **already returned FALSE** (logo
+skipped) and the stuck "Loading" is the **downstream** power-on state machine
+(§10.24), whose `0x254a4` post-wait check references the same logo buffer
+(`0x401DC000`). Whether fixing the logo decode clears the stuck "Loading" depends
+on this: if the state machine waits for the logo-display-complete event, yes; if
+"Loading" is a separate media/servo wait that merely times out, the logo is a
+different (parallel) concern. **Next concrete step:** confirm empirically whether
+the boot thread ever enters `UTL_ShowJPEG_Slide`'s parse/decode loops (find the
+retail address of `UTL_ShowJPEG_Slide` via its `HALJPEG_SetDisplay`/`0x80001a48`
+write, breakpoint it), and whether `UTL_ShowLogo` returns TRUE or FALSE — that
+tells us if item 3 (model the JPEG worker's parse+decode datapath, §10.10) is the
+unlock for "Loading", or a parallel task to a separate media/servo gate.

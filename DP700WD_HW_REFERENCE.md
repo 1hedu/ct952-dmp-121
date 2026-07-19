@@ -2723,3 +2723,32 @@ missing hardware event (those all exist / work). It is a message-ROUTING gap -- 
 producer stream on 0x40038fb8 is not reaching the UI consumer on 0x40033830. Next: find
 who consumes 0x40038fb8 and why the UI isn't among the targets (a relay/dispatch thread
 that should forward 0x40038fb8 -> 0x40033830, asleep or never registered).
+
+### 11.6 The routing gap, pinned to the queue level (relay ID still open)
+
+Mapped the two queues from the crutch-free snapshot:
+
+- **CC/UI mbox `0x40033830`**: ring empty (head==tail), and its wait-list holds **TWO
+  blocked threads** — the CC thread `0x400371f8` (node `0x40037214`) and thread
+  `0x40035928` (node `0x40035944`). Two UI-side threads waiting for a message; none
+  arrives.
+- **Producer queue `0x40038fb8`**: distinct mailbox (external ring buffer at
+  `0x40034408`, size `0x1500`), self-referential wait-list = **no blocked waiter**.
+  Live, the periodic producer threads (`sp≈0x40035xxx`, caller `0xaf984`) post here.
+
+So the producer event stream lands on `0x40038fb8`, which nothing is blocked on, while
+two UI threads starve on `0x40033830`. The gap is at the **queue-routing** level: the
+producer stream never reaches the UI queue, and no thread is parked to drain
+`0x40038fb8` and relay it.
+
+Open: the exact consumer/relay that should drain `0x40038fb8` → `0x40033830`. A broad
+DRAM thread-scan shows many RUN-state threads (system is genuinely partly alive) but is
+too noisy to cleanly single out the relay. That needs a targeted **live** trace
+(breakpoint the receive primitive `0x4001de40`, filter for queue==`0x40038fb8`, read the
+receiving thread) — impeded this pass by background-process/launch flakiness in the
+harness, which is the first thing to stabilize before the next live probe.
+
+**Status of the faithful-boot track:** boot to POWERONMENU is crutch-free (§11.2/11.3);
+the RTOS is partly alive (§11.5); the remaining wall is a queue-routing gap between an
+active producer stream (`0x40038fb8`) and two starved UI consumers (`0x40033830`) — a
+well-posed, specific target, no fakes involved.

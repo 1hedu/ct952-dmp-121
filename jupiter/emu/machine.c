@@ -75,6 +75,39 @@ static void machine_maybe_jpeg_decode(machine_t *m)
     m->jpeg_rgb = rgb;
     m->jpeg_w = w;
     m->jpeg_h = h;
+
+    /* P1 (CT952_LOGODECODE): write the decoded frame into the firmware's video
+     * frame buffer as macroblock-tiled YUV 4:2:0 (§10.2/§10.10), so the hardware
+     * decode the driver kicked "produces" real pixels -- what §10.33 showed is
+     * missing (Y buffer 0x40065000 was all-zero). Y at DS_FRAMEBUF_ST_SLIDESHOW
+     * (0x40065000), C at +0x4EC00 (0x400B3C00); strip=0x2D00 (720-wide buffer). */
+    if (getenv("CT952_LOGODECODE")) {
+        const uint32_t YBASE = 0x40065000u, CBASE = 0x400B3C00u, strip = 0x2D00u;
+        uint8_t *yb = machine_dram_ptr(m, YBASE);
+        uint8_t *cb = machine_dram_ptr(m, CBASE);
+        int x, y;
+        if (yb && cb) {
+            for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+                const uint8_t *px = rgb + ((size_t)y * w + x) * 3;
+                int R = px[0], G = px[1], B = px[2];
+                int Y = (299*R + 587*G + 114*B) / 1000;
+                uint32_t yo = (uint32_t)(y>>4)*strip + (uint32_t)(x>>2)*64u
+                            + (uint32_t)(y&15)*4u + (uint32_t)(x&3);
+                yb[yo] = (uint8_t)(Y < 0 ? 0 : Y > 255 ? 255 : Y);
+                if (!(x & 1) && !(y & 1)) {
+                    int U = (-169*R - 331*G + 500*B) / 1000 + 128;
+                    int V = ( 500*R - 419*G -  81*B) / 1000 + 128;
+                    uint32_t cx = x>>1, cy = y>>1;
+                    uint32_t co = (cy>>4)*strip + (cx>>3)*256u + ((cx&7)>>2)*64u
+                                + (cy&15)*4u + (cx&3);
+                    cb[co]       = (uint8_t)(U < 0 ? 0 : U > 255 ? 255 : U);
+                    cb[co + 128] = (uint8_t)(V < 0 ? 0 : V > 255 ? 255 : V);
+                }
+            }
+            fprintf(stderr, "[LOGODECODE] wrote %dx%d tiled YUV to 0x%08x/0x%08x\n",
+                    w, h, YBASE, CBASE);
+        }
+    }
 }
 
 /* LEON core block offsets (ctkav_platform.h:19-97) */
@@ -385,6 +418,10 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
              * decoder thread's `while (REG_JPU_CTRL & 1)` exits. */
             io_set(m, off, v & ~JPU_BUSY_BIT);
             m->jpu_active_until = m->cycles + 300000u;   /* decode-active window */
+            /* P1: on the JPU decode kick, functionally decode the staged JPEG
+             * and emit the tiled-YUV frame the real hardware would produce
+             * (CT952_LOGODECODE). Guarded by jpeg_sig so it decodes once/frame. */
+            if (getenv("CT952_LOGODECODE")) machine_maybe_jpeg_decode(m);
         }
         return;
     case R_GPU_FONT_IDX:

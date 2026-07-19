@@ -2276,3 +2276,28 @@ model (`CT952_VDEC_DONE`: mirror `0x40039cd0`→0x10 + HW `0xB0000190`→0x11) �
 → firmware display path → functional decode → scan-out (stride 720, honor OSD-en) →
 photo on panel. Boot also reaches POWERONMENU_Initial (75.5M). Diagnostics:
 `CT952_CHOOSEMEDIA`, `CT952_VDEC_DONE`, `CT952_STAGE_PHOTO`, `CT952_NOMEDIA`.
+
+### 10.44 The built-in album is FIVE photos (not 3) + faithful screensaver path mapped
+
+**Correction (user-confirmed):** the built-in demo album is section **"0001" @ flash
+0x160000, size 0x50000** (320KB), holding **FIVE** 640x360 JFIF photos at
+0x160000/0x170000/0x180000/0x190000/0x1a0000 (butterfly, Grand Tetons/barn,
+chrysanthemums, Golden Gate Bridge, mountain river). The source constant
+`BUILD_IN_JPG_ENCODE_NUM=3` (Winav.h) is stale for this retail build. Full section
+table: CUST/CLCK/lang-strings(DUTC..SPAN)/**0001**(album)/COPY(scratch @0x1b0000).
+All five verified rendered on the panel via `CT952_STAGE_PHOTO` through the
+firmware decode pipeline (§10.41-43).
+
+**Faithful slideshow path (retail-traced), for the natural trigger:** the JPEG
+screensaver plays the album. `OSDSS_Monitor()` (osdss.c:298, called from CC main
+loop cc.c:1004) fires `OSDSS_Entry()` (osdss.c:228) after `OSDSS_ENTER_TIME`
+(=10 min) idle, gated on `__bPOWERONMENUInitial && !clock && !alarm`. `OSDSS_Entry`
+returns early unless `__bMMJPGEncodeNum>0` (set to the photo count by
+`MM_EncodeFile_Init` mm_play.c:2402). A 5-sec timer (osdss.c:560) advances
+`__bOSDSSPicIdx` (0..count-1) and calls `_OSDSS_PictureUpdate` (osdss.c:122), which
+in `SUPPORT_ENCODE_JPG_PICTURE` mode sets source=SOURCE_SPI and calls
+`UTL_PlayItem(idx+1,0)` → reads the encoded JPEG from SPI flash → `UTL_ShowJPEG_Slide`
+(already DECODE=OK, §10.41). The 10-min idle timeout is impractical to reach in
+emulation, so the natural trigger must be forced (force `__bMMJPGEncodeNum=5` +
+short-circuit the idle-timeout compare / call OSDSS_Entry). Addresses under
+investigation. Diagnostics: `CT952_STAGE_PHOTO` (renders any album photo now).

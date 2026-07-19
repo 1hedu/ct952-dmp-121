@@ -2781,6 +2781,10 @@ verify event-flow claims against the RUNNING target, not one dump.
 
 ## 12. THE PLOT (re-anchor — read this first each session)
 
+> **AUTHORITATIVE SOURCE = the `950_Files/` overlay (see §12.4). We are CT952/DMP1.**
+> When a file exists in `950_Files/`, that copy — not the project-root copy — is what
+> built `dp700wd.bin`. Read source from there for any overridden module.
+
 **Quest:** a faithful natural boot of the retail firmware — peripherals modeled well
 enough that the RTOS comes ALIVE on its own, every crutch gone.
 
@@ -2885,3 +2889,35 @@ during POWERONMENU menu-setup, blocks in the message module waiting for a reply 
 never comes. Attack THAT directly: catch the block live on a fresh boot, read the exact
 message posted + who should reply + what that replier is waiting on. Everything else
 (screensaver, OSD-enable, palette) is downstream of this one wait.
+
+### 12.4 AUTHORITATIVE SOURCE — the `950_Files/` overlay is our build (CT952 / DMP1)
+
+**This is the single most important source fact and it corrects a standing assumption.**
+The repo root holds the *base* CheerTek reference tree (909-lineage DVD player). Our
+retail `dp700wd.bin` is the **CT950/951/952 DMP1 photo-frame** build, produced by
+**copying `950_Files/*` over the project root** and building with a specific define set.
+So for any module that exists in `950_Files/`, THAT copy is authoritative — the root
+copy is the wrong (DVD) variant. This is *why* `DVD909.sym` addresses never matched
+retail: that sym is a different product built from the un-overlaid tree.
+
+**Build recipe (`950_Files/950_make.txt`, config #1 "8M solution release" = DMP1):**
+- `#define CT950_STYLE`   (winav.h)      — enables ALARM_Trigger/AUTOPWR_Trigger etc.
+- `#define CT951_PLATFORM` (customer.h)
+- `DRAM_CONFIGURATION_TYPE = DRAM_SIZE_16`, `DECODER_SYSTEM = DVD909R_EVAL`,
+  `CPU_SPEED = CPU_146M`, `SUPPORT_950 = 1`
+- `romcfg_16M_951_DMP1.txt`, `DVD909_16M.ld` (minus `srv_dram.a`), 146 MHz mclk,
+  8M serial flash. OSD strings from `950_Files/OSDEuro_16M`, BMPs from `950_Files/BMP`.
+
+**Overridden modules (use `950_Files/` copy):** alarm, autopower, backdoor, calenui,
+clock, dialog, dmpcustm, dvdsetup, dvdsetup_op, edit, mainmenu, menu, notedlg,
+**poweronmenu**, radio, radiodrv, rtcdrv, setdate, settime, toolbar.
+
+**NOT overridden (use root copy):** cc, osdss, initial, media, input, oswrap, utl, gdi,
+disp/hal/haljpeg, interrupt, hsystem, etc. — the CC main loop, screensaver monitor, OS
+wrappers, and init flow are the root versions, *compiled with the defines above*.
+
+Checked: `950_Files/poweronmenu.c` `POWERONMENU_Initial` is byte-for-byte the root one
+at the same lines (380/434), so §11.4's read stands. But menu bring-up (`mainmenu.c`,
+`menu.c`) and the alarm/autopower triggers differ from root and must be read from
+`950_Files/` going forward. Define-gated paths in root files (`#ifdef CT950_STYLE`,
+`CT951_PLATFORM`, `SUPPORT_950`) are LIVE for us — do not dismiss them.

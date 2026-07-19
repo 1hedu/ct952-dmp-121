@@ -862,6 +862,17 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
+        /* JPEG_Status write locator (CT952_JSTAT): the decode driver stores
+         * UNFINISH(2)/OK(1)/FAIL to its JPEG_Status thread var; log small-value
+         * byte writes in the HAL data region during the decode window + PC so we
+         * can find that var and drive DECODE=OK (roadmap faithful-VIDEO_EN). */
+        if (getenv("CT952_JSTAT") && size == 1 && (val == 1u || val == 2u) &&
+            addr >= 0x40028000u && addr < 0x40080000u &&
+            m->cpu.icount > 9500000ull && m->cpu.icount < 12500000ull) {
+            static int js; if (js < 60) {
+                fprintf(stderr, "[JSTAT] %08x=%u pc=%08x icount=%llu\n",
+                        addr, val, m->cpu.pc, (unsigned long long)m->cpu.icount); js++; }
+        }
         /* No-media model (CT952_NOMEDIA): emulate the USBSRC worker completing
          * a CHECK_DEVICE command with a "no removable media" verdict. The
          * firmware sets bit CHECK_DEVICE(0x1) in _fUSBSRCCmdd (0x4003f540) via

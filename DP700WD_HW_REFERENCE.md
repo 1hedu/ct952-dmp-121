@@ -1897,3 +1897,40 @@ op sequence completes), raise the JPU completion interrupt on its LEON IRQ line
 write the tiled YUV into, instead of the hardcoded 0x40065000), the LEON IRQ
 controller (`0x80000000` block). With that, the CT952_LOGODECODE output + the IRQ
 completes the fully-hands-off natural display.
+
+### 10.36 Faithful-VIDEO_EN — the decode-completion is the full VLD+JPU protocol
+
+Attempts to drive `JPEG_Status(DECODE)=OK` narrowed the mechanism:
+- **No firmware `.c` waits on the JPU IRQ** — the completion handling lives in the
+  precompiled decode lib (`JEPG_Decode`/`JEPG_Status`). The emulator models the
+  `PROC1_1ST` secondary IRQ (LEON line 13, bit0=VSYNC); the JPU done is another
+  bit there, but raising it only helps if the precompiled ISR advances the state.
+- **`JPEG_Status` isn't a single pokeable byte:** a status-write trace
+  (`CT952_JSTAT`) during the decode shows a *cluster* of small-value writes at
+  `0x40040dxx` (~icount 10.72M, an array fill at decode-finish), not one clean
+  UNFINISH→OK transition — consistent with the driver tracking per-block state.
+- **The JPU is scale/fill only** (§10.35); the entropy decode is the **VLD**. The
+  emulator answers the JPU_BUSY + some VLD polls but does not run the VLD to
+  produce valid decoded macroblocks, so the driver never sees a valid completed
+  frame → returns non-OK → `HALJPEG_Display`/`VIDEO_EN` never.
+
+**So faithful `VIDEO_EN` = model the full VLD→JPU→done pipeline**, not one signal:
+present the VLD entropy-decode as done (per-block + frame), run the JPU
+scale/fill (or short-circuit it) writing to `ADDR_W_ST 0x2888`, and raise the JPU
+completion IRQ (`PROC1_1ST`, honoring `JPU_INT_CLR` bit31). Then the precompiled
+`JEPG_Decode` runs to OK → `HALJPEG_Display` sets `F0Y/F0C/VIDEO_EN` itself. This
+is the deep next build; it is well-scoped (all registers/IRQ known) but multi-step.
+
+**Pragmatic alternative already working:** `CT952_LOGODECODE` produces the correct
+tiled frame (the verified COBY logo, §10.34) and the scanout composites it, so the
+image is on the panel through the real tiling — just not firmware-flipped. For a
+clean visible panel, load/emulate the OSD palette (or treat the firmware's OSD
+background index as transparent) to remove the §10.34 gray striping.
+
+**Session close-out:** the decoder bring-up went from "Loading never draws" to
+booting naturally to "Loading" AND decoding the real logo through the firmware's
+own tiling into its frame buffer (verified pixels). Remaining, all mapped: (a)
+faithful `VIDEO_EN` via the VLD+JPU+IRQ pipeline above; (b) the separate P2
+"Loading" state-machine advance (§10.24); (c) OSD-palette for a clean composite.
+Diagnostics: `CT952_LOGODECODE`, `CT952_JSTAT`, `CT952_DECTRACE`, `CT952_LOGOTRACE`,
+`CT952_DRAMHIST`, `sparc_t.brk_pc`.

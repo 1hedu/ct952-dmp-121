@@ -1646,3 +1646,37 @@ retail address of `UTL_ShowJPEG_Slide` via its `HALJPEG_SetDisplay`/`0x80001a48`
 write, breakpoint it), and whether `UTL_ShowLogo` returns TRUE or FALSE — that
 tells us if item 3 (model the JPEG worker's parse+decode datapath, §10.10) is the
 unlock for "Loading", or a parallel task to a separate media/servo gate.
+
+### 10.28 Roadmap progress — the faithful mirror UNLOCKED the JPEG decode kick
+
+Re-audited the decode datapath in the faithful config (§10.26, no MIRROR10) with a
+new `CT952_LOGOTRACE` (logs PC+icount for writes to the DISP/JPU display regs).
+**The boot now actively kicks and runs the logo JPEG decode** — overturning §10.9's
+"the kick never fires" (that was the pre-faithful stall point):
+
+- **JPU is kicked repeatedly by the boot thread** (`sp=0x40036xxx`): `REG_JPU_CTRL`
+  `0x80002880` written `0x42/0x5a/0x6a` = `JPU_GO(0x2)` on ops 4/5/6, from retail
+  PCs `0x6bb38`/`0x6be40`/`0x6be70`, starting ~icount 10.4M and churning.
+- **Display setup runs** on a separate display thread (`sp=0x40026xxx`):
+  `DISP_VIDEO_POS 0x80001a48 = 0x00150065` (pos 21,101) and `VIDEO_SIZE 0x80001a4c`
+  from PCs `0xa32ac`/`0xa3324`/`0xa56f4`/`0xa4654`/`0xa685c`.
+
+**But it does not COMPLETE:** `REG_MCU_BCR08` (bitstream base `0x80002a20`),
+`REG_DISP_F0Y/F0C_ADDR` (`0x80001ac0/ac4`), and `DISP_VIDEO_EN` (bit `0x10000000`
+in `0x80001a4c`, still `0`) are **never written**. The JPU op churns without a
+bitstream (`BCR08` unset) so it never produces the decoded frame, never signals
+decode-done, and `HALJPEG_Display` (which would write `F0Y`/`F0C` and set
+`VIDEO_EN`) is never reached. Exactly §10.8's diagnosis: the worker's completion
+needs real decode progress (bitstream flowing to EOI + the tiled output), not just
+the JPU_GO kick.
+
+**Item 3 is now the clear, well-anchored target.** Retail anchors: JPU-kick code
+`0x6bb38`/`0x6be40`/`0x6be70`; display-setup `0xa32ac..0xa685c`; the §10.10 datapath
+(BIU drain + functional decode → tiled YUV to `0x40065000`/`0x400B3C00` + present
+polls done) plugs in here so the running JPU decode completes → `HALJPEG_Display`
+→ `VIDEO_EN` → boot advances. `CT952_LOGOTRACE` kept as the anchor probe.
+
+**Session net (decoder bring-up):** item 1 done (faithful decoder-stop mirror,
+MIRROR10 retired); item 2 done (logo-decode gate located, and the faithful mirror
+proven to advance the boot from "never kicks" to actively running the JPU decode);
+item 3 (model the JPEG-datapath completion) is next, with every address known.

@@ -815,6 +815,17 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
             uint32_t mask = (size == 1) ? 0xFFu : 0xFFFFu;
             val = (cur & ~(mask << sh)) | ((val & mask) << sh);
         }
+        /* Logo-display locator (CT952_LOGOTRACE): DISP_VIDEO_POS/SIZE/EN,
+         * F0Y/F0C and JPU_GO/BCR08 are written by the logo/JPEG display path --
+         * log PC+icount to find its retail addresses (roadmap item 2). */
+        if (getenv("CT952_LOGOTRACE") &&
+            (off == 0x1a48u || off == 0x1a4cu || off == 0x1ac0u || off == 0x1ac4u ||
+             off == 0x2880u || off == 0x2a20u)) {
+            static int lt; if (lt < 30) {
+                fprintf(stderr, "[LOGOwr] %08x=%08x pc=%08x sp=%08x icount=%llu\n",
+                        addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 14),
+                        (unsigned long long)m->cpu.icount); lt++; }
+        }
         io_write(m, off, val);
         return;
     }

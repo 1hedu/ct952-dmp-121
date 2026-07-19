@@ -2862,3 +2862,26 @@ if called with the wrong type, the region descriptor's type field is the bug; if
 called, the menu-setup stall (§11.4) blocks before region-apply. That distinguishes a
 data/descriptor problem from a control-flow (event) problem. Live breakpoint on `0xa3f90`
 + read `%i0`.
+
+### 12.3 Display RULED OUT as the cause — it works; root is the menu-setup stall (§11.4)
+
+Answered the §12.2 split question live (bp `0xa3f90`/`0xa3fcc` on a fresh boot):
+- Region-apply `0xa3f90` IS called and REACHES the gate store `0xa3fcc` (~12M), setting
+  `0x40024050 = 0x200`. So the OSD-activation machinery works and runs.
+- BUT that is for an EARLY screen (~12.6M display setup, before POWERONMENU @75.5M). By
+  90M `0x40024050` is back to 0 (only writer is 0xa3fcc=set-0x200; it's cleared by a
+  re-init on screen transition), and the POWERONMENU menu's region-apply NEVER runs.
+
+**Conclusion (honest -- a narrowing that returns to a known wall):** the black panel is
+NOT a display-config / register / region-type bug -- the display path is proven working
+and is exercised. The POWERONMENU menu's OSD simply never gets set up because the
+**menu-setup UI thread stalls before its region-apply** -- the same §11.4 message-wait.
+The §12 display detour excluded the entire display-cause branch with evidence, then
+pointed back at the menu-setup stall as THE root. Not wasted (a class of causes ruled
+out), but not a fresh break either.
+
+**Next (the actual root, no more detours):** the §11.4 menu-setup stall. The UI thread,
+during POWERONMENU menu-setup, blocks in the message module waiting for a reply that
+never comes. Attack THAT directly: catch the block live on a fresh boot, read the exact
+message posted + who should reply + what that replier is waiting on. Everything else
+(screensaver, OSD-enable, palette) is downstream of this one wait.

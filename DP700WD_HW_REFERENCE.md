@@ -2921,3 +2921,66 @@ at the same lines (380/434), so §11.4's read stands. But menu bring-up (`mainme
 `menu.c`) and the alarm/autopower triggers differ from root and must be read from
 `950_Files/` going forward. Define-gated paths in root files (`#ifdef CT950_STYLE`,
 `CT951_PLATFORM`, `SUPPORT_950`) are LIVE for us — do not dismiss them.
+
+### 12.5 BIG REFRAME — the CC thread is ALIVE and PROGRESSING; boot is virtual-time-starved in a long init, not dead
+
+This session re-probed the "block" LIVE on a fresh, fully crutch-free boot (no VDEC/
+CHOOSEMEDIA/NOMEDIA; those are gone/faithful) and the prior "dead RTOS / event-starved"
+picture is **wrong**. All measured, not recalled:
+
+**1. The CC thread cycles — it is not parked-dead.** Breakpointing the eCos msg-get
+wrapper `0x5969c` and the put primitive `0x4001de5c` on a running `continue`: the CC
+thread (stack `0x400359d8..0x400371d8`) repeatedly wakes, GETs messages, and POSTs them
+— including to `0x40033830` (the very queue §11.5/11.6 called orphaned). Posts come from
+several threads. The system is genuinely multi-threaded-alive. The old snapshots that
+read "blocked forever on 0x40033830" just froze it mid-sleep between cycles.
+
+**2. It is grinding forward through power-on init.** Unwinding the CC stack at two times:
+at ~90M icount (tick ~0x320) it was inside `INITIAL_PowerONStatus` (flash `0x41axx`,
+identified below); after fast-tick ran virtual time to tick ~0xe973 (~60k) the stack had
+moved to an entirely different, deeper init subtree (top OS frame `0xd5440`, a mutex
+unlock → `0x4001e66c` reschedule). So it advances — it is not wedged on one wait.
+
+**3. But it burns ABNORMAL virtual time — the real anomaly.** A real DMP boots to the
+menu by ~tick 500 (eCos tick = 100 Hz ⇒ ~5 s). Here it is still in init at **tick
+~60 000 (~10 virtual minutes)**. Something retries/waits in a loop, each pass sleeping a
+`delay()` and burning ticks, before timing out and inching on. At the 1x emu tick this is
+invisible-slow; even the fast-tick (§10.46 tooling) doesn't reach the menu because the
+init itself consumes ~100x the normal tick budget.
+
+**4. Prime suspect: two threads never signal init-done.** The eCos flag `__fThreadInit`
+@ **`0x40038f80`** (value at +0x00) reads **`0x102`** = JPEG(`0x2`)+PARSER(`0x100`) done,
+but **MISSING MPEG-decoder (`0x1`) and Info-Filter (`0x200`)** vs the desired `0x301`
+(`INIT_POWER_ON_THREAD_X_SOURCE_DONE`, initial.c:679/697). initial.c:697 is only a
+one-shot 50 ms `OS_TimedWaitFlag` (warns "Some thread not initial done" and proceeds), so
+that line is not itself the wall — but the MPEG-dec/Info-Filter threads being permanently
+un-inited (their init presumably waits on unmodeled HW — PROC2/DSP is held in reset) is
+the likeliest thing the deeper init keeps retrying against. **Next: find the retry loop
+(persistent ancestor flash `0x61378`, present in every CC stack this session) and what it
+polls; and check whether bringing PROC2 out of reset lets the MPEG/Info-Filter threads
+complete.**
+
+**5. FIRMWARE DEBUG NARRATION — infra fully mapped (thanks to the "hack the enable byte"
+idea).** `DBG_MINI_PRINTF` + `SERIAL_DEBUG` are compiled IN (debug.c:30, customer.h:232).
+Addresses (found via string-ref `0xe8b00` → call site `0x41998`):
+- `DBG_Printf` = **`0x13598`**; gate `if(_bDBGEnable==FALSE)return` reads byte
+  **`_bDBGEnable` @ `0x40021eb0`**; type mask **`__dwDebugFlag` @ `0x40021dd4`**
+  (default `0x80000001`; set `0xffffffff` to pass all types).
+- Output path: `DBG_Printf` buffers into a 96-byte-stride ring `*(_pDBG_Header1
+  @0x40032508)` indexed by `_wInfoWIdx@0x400324d8`; ring is drained to UART only by
+  `DBG_Polling→DBG_INT` **in `CC_DVD_MainLoop` (cc.c:848)** — which the stalled CC thread
+  never reaches, so nothing prints.
+- **GOTCHA:** just poking `_bDBGEnable=1` is NOT enough — `_pDBG_Header1` is **NULL**
+  until `DBG_Init` (utl.c, gated by `__bDebugMode & UTL_DBG_UART1_EN`, off in retail)
+  runs `_DBG_ResetDRAMDebugMessage` (ring-alloc store @ `0x13ea8`). To get narration:
+  inject a `DBG_Init`/`_DBG_ResetDRAMDebugMessage` call via the stub so the ring is
+  allocated, then either let the main loop drain it or read the ring from DRAM directly
+  (`probe_ring.py`). The emu DOES capture UART1/UART2 TX (`R_UART1_DATA 0x070 → uart_tx`
+  → stderr/`--uart` file), so once the ring drains, output is visible.
+
+**Net:** the wall is no longer "dead RTOS" — it is "alive RTOS stuck retrying an init
+step that waits on the never-completing MPEG-decoder / Info-Filter threads, consuming
+huge virtual time." That is a concrete, faithful-boot target (model the HW those threads
+need — likely PROC2), and the firmware can be made to narrate its own progress via the
+DBG addresses above. New probe scripts: `probe_stall/stack2/posts/flags/dbg/narrate/
+ring/ladder.py` in `jupiter/emu/`; full TEXT disasm cached at `/tmp/fulltext.dis`.

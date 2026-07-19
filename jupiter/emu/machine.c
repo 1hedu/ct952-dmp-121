@@ -833,6 +833,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
              * the getter (0x6f054) adds no busy bit and returns the mirror's
              * MODE_STOP(0x10) cleanly. */
             if (m->cycles < m->vdec_stop_until) return 0x11u;
+            /* After a decode frame completes, the live playmode is idle. The
+             * getter (0x6f098) only returns the mirror CLEANLY (no 0x1000 busy
+             * bit) when HW in {0,0x11}; present 0x11 so the mirror's 0x10 maps to
+             * JPEG_STATUS_OK (needs both, 10.41). Gated by CT952_VDEC_DONE. */
+            if (m->vdec_frame_done && getenv("CT952_VDEC_DONE")) return 0x11u;
             static int fp = -1;
             if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
                           fp = e ? (int)strtoul(e, NULL, 0) : -2; }
@@ -1014,7 +1019,8 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
          * F0Y/F0C and JPU_GO/BCR08 are written by the logo/JPEG display path --
          * log PC+icount to find its retail addresses (roadmap item 2). */
         if (getenv("CT952_LOGOTRACE") &&
-            (off == 0x1a48u || off == 0x1a4cu || off == 0x1ac0u || off == 0x1ac4u ||
+            ((off == 0x1a48u || off == 0x1ac0u || off == 0x1ac4u ||
+              (off == 0x1a4cu && val != 0)) ||   /* skip the compositor VIDEO_EN=0 spam */
              (getenv("CT952_LOGOTRACE_JPU") && (off == 0x2880u || off == 0x2a20u)))) {
             static int lt; if (lt < 500) {
                 fprintf(stderr, "[LOGOwr] %08x=%08x pc=%08x sp=%08x icount=%llu\n",
@@ -1443,11 +1449,12 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                 {0x0001186cu,"MEDIA_MonitorStatus(F)"}, {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"},
                 {0x4000eb90u,"INITIAL_System(D)"}, {0x4004b808u,"POWERONMENU_Initial(D)"},
                 {0x00012f10u,"PostEvent->list(F)"}, {0x00006eecu,"EvtDispatch_bit80(F)"},
-                {0x00061170u,"UTL_ShowJPEG_Slide(F)"}, {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"},
+                {0x00061170u,"UTL_ShowJPEG_Slide(F)"}, {0x00061344u,"ShowJPEG_DECODE_OK_path(F)"},
+                {0x00039f38u,"JPEG_Display_call(F)"},
             };
-            static uint8_t hit[14];
+            static uint8_t hit[15];
             int wi;
-            for (wi = 0; wi < 14; wi++)
+            for (wi = 0; wi < (int)(sizeof(wl)/sizeof(wl[0])); wi++)
                 if (!hit[wi] && m->cpu.pc == wl[wi].pc) {
                     hit[wi] = 1;
                     fprintf(stderr, "[REACH] %-26s pc=%08x icount=%llu\n",

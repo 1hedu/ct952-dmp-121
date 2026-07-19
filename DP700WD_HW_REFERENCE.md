@@ -2175,3 +2175,45 @@ which is the retail path to the built-in slideshow. New anchors: getter action-0
 `0x6f098`/`0x6f0c0`; mapper `0x375a0`; `UTL_ShowJPEG_Slide 0x61170` (unreached);
 `UTL_ShowLogo` early-return utl.c:512; media Gate B media.c:1479/616. Diagnostics:
 `CT952_VDEC_DONE`, `CT952_MIRTRACE` (now logs returned state + fdone).
+
+### 10.41 BREAKTHROUGH — the firmware's JPEG decode pipeline runs end-to-end (DECODE=OK, display called)
+
+Combining the media-select flip with the decode-completion model unblocked the
+entire slideshow/logo decode path. All effects verified in one run
+(`CT952_CHOOSEMEDIA=0x40031b9c CT952_LOGODECODE=1 CT952_VDEC_DONE=1 CT952_NOMEDIA=1`).
+
+**Chain of unlocks:**
+1. **`__bChooseMedia`@`0x40031b9c` → USB(1)** (subagent-located; write pair at flash
+   `0x5a96c`, `__bNavigateMode`@`0x40031bac`=3 corroborates). Read-override via
+   `CT952_CHOOSEMEDIA`. This alone makes **`UTL_ShowJPEG_Slide` (`0x61170`) execute**
+   (icount 46M) — it never ran before (§10.40) — and the firmware **stages a real
+   JPEG at `0x401dc000`** (SOI `ff d8 ff e0`, the 480x270 COBY splash), which was
+   never staged in the DVD-mode path.
+2. **`CT952_VDEC_DONE` (decode-completion model).** The decode-status getter
+   (`0x375a0`→`0x6f054` action-0 handler `0x6f098`) returns OK only when it yields
+   state `0x10`, which needs **BOTH** the mirror `0x40039cd0`==0x10 **AND** HW
+   `0xB0000190` ∈ {0,0x11} (else it OR-s in the `0x1000` busy bit → the `0x6f0c8`
+   path → non-OK). So the fix sets, after the JPU decode burst (`vdec_frame_done`):
+   mirror `0x40039cd0` → `0x10` **and** HW `0xB0000190` → `0x11`. Verified the
+   getter then returns clean `0x10` via `0x6f0c0`.
+3. **Result:** `UTL_ShowJPEG_Slide`'s DECODE poll (`0x61318`→`0x375a0(ctx,1)`)
+   returns **OK(1)**, the OK path (`0x61344`) is reached, and the firmware calls its
+   **display function `0x39f38`** (icount 49.39M). The functional decode produces
+   the **clean 480x270 COBY logo** into the tiled-YUV video buffer
+   `0x40065000`/`0x400b3c00`.
+
+**Verified anchors (retail):** DECODE poll `0x61318`; OK path `0x61344`; display
+call `0x39f38`; status mapper `0x375a0` (state 0x10→OK, 0x11→FAIL, 0→UNFINISH);
+getter `0x6f054`/handler `0x6f098` (clean `0x6f0c0` vs busy `0x6f0c8`); mirror
+`0x40039cd0`; HW playmode `0xB0000190`; `__bChooseMedia 0x40031b9c`;
+`UTL_ShowJPEG_Slide 0x61170`.
+
+**What's left for a VISIBLE photo on the panel:** the firmware's display path
+(`0x39f38`) does NOT write `F0Y/F0C 0x80001ac0/ac4` nor set `VIDEO_EN 0x80001a4c`
+(still 0 — the per-frame compositor `0xa685c` copies software flag `*0x40023fc0`,
+which stays 0). So the decoded logo sits in the video buffer but the video plane is
+not enabled; the panel scanout still shows the OSD ("COBY" with the §10.34 palette
+striping). Next: find where this build enables the video plane for the JPEG (does
+`0x39f38` set a software flag the compositor reads, or is the photo meant for the
+OSD/GPU plane?), so the clean decoded image composites onto the panel. Diagnostics:
+`CT952_CHOOSEMEDIA`, `CT952_VDEC_DONE`, `CT952_MIRTRACE`, REACH watches.

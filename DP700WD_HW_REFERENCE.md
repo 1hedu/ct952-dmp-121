@@ -2752,3 +2752,29 @@ harness, which is the first thing to stabilize before the next live probe.
 the RTOS is partly alive (§11.5); the remaining wall is a queue-routing gap between an
 active producer stream (`0x40038fb8`) and two starved UI consumers (`0x40033830`) — a
 well-posed, specific target, no fakes involved.
+
+### 11.7 CORRECTION — the static snapshot misled me; live, the system cycles
+
+Stabilized the harness (launch the emu alone via the background mechanism on a FRESH
+port; the earlier "failed exit 1" churn was stale emus holding the port + pkill races)
+and re-ran the routing probe LIVE with virtual time advancing (fast tick). This
+corrects 11.5/11.6.
+
+Breakpointing the receive primitive 0x4001de40 live shows THREE threads cycling
+round-robin (sp 0x40034150, 0x40038b38, 0x40036d48), each reading a DIFFERENT
+*(0x400423a8): 0x40033830, 0x40035928, 0x400371f8. Two of those are thread objects, not
+mailboxes. So *(0x400423a8) is a volatile per-operation "current wait-object" global,
+NOT a fixed per-thread queue. Reading it at the single frozen instant of the snapshot is
+what produced the tidy-but-wrong "producers post to orphan 0x40038fb8, UI waits on
+0x40033830" story in 11.5/11.6. Live, several threads cycle through receives and DO get
+the producer messages -- the system is genuinely partly alive and dynamic.
+
+What still holds: crutch-free to POWERONMENU (11.2/11.3), alarms work (11.4), and the
+specific screensaver path never runs -- but the reason is narrower than "a missing
+relay." Despite general message cycling, __bPOWERONMENUInitial stays 0,
+__dwOSDSSCheckTime stays -1, and the POWERONMENU-completion handler 0x61cf8 / event 0x80
+are never dispatched. The next probe is targeted and must be LIVE: breakpoint 0x61cf8 and
+the monitor-table dispatch to see why that path is never selected.
+
+Lesson logged: single-instant snapshot reads of a volatile message system are unreliable;
+verify event-flow claims against the RUNNING target, not one dump.

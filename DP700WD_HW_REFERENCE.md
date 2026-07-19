@@ -2390,3 +2390,51 @@ firmware's own decode→display→scan-out pipeline (butterfly, Tetons/barn,
 chrysanthemums, Golden Gate Bridge, mountain river) and stitched into an animated
 slideshow — the visual final-boss payoff — while the *fully autonomous* firmware
 timer cycle stays blocked on the H2 event injection above.
+
+### 10.47 The screensaver trigger, DISASSEMBLED — exact gate + the flag-set stall
+
+Tooling note (and a mea culpa): a working SPARC disassembler was available the
+whole time — `sparc64-linux-gnu-objdump -b binary -m sparc -EB -D` (the machine
+name is plain `sparc`; `sparc:v8` is rejected by this build). LEON is SPARC V8, so
+this decodes the retail image cleanly. Helper: `jupiter/emu/dis.sh <addr> <len>`
+(XIP: flash offset == vaddr). This section is the first read of the actual
+screensaver code rather than inference.
+
+**`OSDSS_Monitor` (0x591b4) — the trigger, decoded.** It calls `OSDSS_Entry`
+(0x59108) only if ALL of:
+1. `0x4002fb58 == 0` (mode/enable byte),
+2. `_bOSDSSScreenSaverMode 0x400239c4 == 0` (not already saving),
+3. activity token `0x400239c0 == 0x40031abc` (the live "last activity" word — if
+   they differ, it resets the timer via 0x594f4 and exits),
+4. `(OS_GetSysTimer() - __dwOSDSSCheckTime 0x400239b8) > 0xe260` (**57952 ticks** —
+   the idle timeout; on the very first pass `__dwOSDSSCheckTime==-1` and it just
+   stamps "now" and exits),
+5. `__bPOWERONMENUInitial 0x40023a10 != 0`, and `0x40020ff4 == 0`, `0x4002f7c6 == 0`.
+
+**Gate values read from the 200M dump — the decisive lines:**
+- `__dwOSDSSCheckTime == 0xFFFFFFFF` (still its power-on value). Since the monitor's
+  first action is to overwrite it with "now", **a value of −1 at 200M proves
+  `OSDSS_Monitor` was never called even once** — the screensaver's own bookkeeping
+  variable is the witness. No inference.
+- `__bPOWERONMENUInitial == 0` — an independent hard gate (step 5) also unmet.
+- Also note step 4's threshold **57952 > the 30766 ticks** the fast tick reached, so
+  even a live loop wouldn't have fired yet by 200M.
+
+**Who sets `__bPOWERONMENUInitial`?** Exactly one non-zero writer, `stb` at **0x61d30**
+inside the routine at **0x61cf8**: `if (__bPOWERONMENUInitial==0) { call 0x61be8(1);
+call 0x61be8(2); __bPOWERONMENUInitial=1; call 0x4a754(0x11); call 0x62080; }` —
+i.e. the "POWERONMENU fully entered / start slideshow" action. (The lone `clrb` at
+0x61894 is the *clear*-to-0 path.) So the flag flips the instant 0x61cf8 runs — and
+it never runs. `0x61cf8`'s address is **never** materialized (no `call`, no literal
+pointer, no `sethi/or`, in flash or the 0x4006xxxx alias), so it is dispatched via a
+jump table / handler slot selected by a menu/event state — the same indirect
+dispatch as `CC_DVD_MainLoop`/`OSDSS_Monitor`. The boot parks before that dispatch
+selects it.
+
+**Net (final-boss localization).** The autonomous screensaver is gated by a single
+handler, `0x61cf8`, that both sets `__bPOWERONMENUInitial=1` and completes
+POWERONMENU entry, and that handler is never dispatched because the CC event loop is
+asleep (§10.46). The one concrete unblock is still H2 — drive the CC loop's event
+dispatch (inject its periodic non-user wake) so it selects the POWERONMENU-entry
+handler; the flag flips, and with the fast tick pushed past 57952 ticks the monitor
+then fires `OSDSS_Entry` on its own. All addresses retail-empirical via `dis.sh`.

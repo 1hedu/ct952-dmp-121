@@ -1934,3 +1934,79 @@ faithful `VIDEO_EN` via the VLD+JPU+IRQ pipeline above; (b) the separate P2
 "Loading" state-machine advance (§10.24); (c) OSD-palette for a clean composite.
 Diagnostics: `CT952_LOGODECODE`, `CT952_JSTAT`, `CT952_DECTRACE`, `CT952_LOGOTRACE`,
 `CT952_DRAMHIST`, `sparc_t.brk_pc`.
+
+### 10.37 CORRECTION + full gate map — decode-done is NOT a JPU IRQ; "Loading" is the upstream blocker
+
+Disassembling the retail ROM directly (no SDK symbols; flash XIP + the DRAM-
+resident firmware image dumped live) overturned the §10.35/10.36 "JPU completion
+interrupt" theory and re-prioritised the roadmap. Every address below is
+retail-verified.
+
+**(A) `JPU_WaitDone` @flash `0x6bb14` already succeeds — the per-op JPU wait is NOT
+the blocker.** It kicks `JPU_GO` (bit1 of `REG_JPU_CTRL 0x80002880`), then
+`while (JPU_CTRL & JPU_BUSY(bit0))` with a ~499-tick timeout, aborting if
+`REG_SRAM_PLAYMODE(0xB0000190) == MODE_STOP(0x10)`. Returns 1=done. The emulator
+**already** clears `JPU_BUSY` on the kick (`io_write R_GPU_CTL0`), so this wait
+returns success immediately. There is no IRQ in this path — it is a busy-poll of
+`JPU_BUSY`. §10.35's "JPU raises a completion interrupt the firmware waits on" is
+**retired**.
+
+**(B) The `pc=0x4001f600` read of `0x800000b4` was a ghost.** `0x4001f5ec` is the
+`PROC1_1st` ISR: it reads pending `0x800000b4` **& mask `0x800000b0`**, dispatches
+bit0=VSYNC→`0xa8bb0` and bit7(0x80)→`0x6f664`, runs a callback list at
+`0x40039114`, clears serviced bits via `0x800000b8`, EOIs `0x8000009c`. The
+`0x800000b4` reads seen "during the decode" were just this ISR firing on **VSYNC
+every frame**, not a decode poll. Raising `RL_DONE|MC_DONE (0x60)` was chasing that
+ghost (the ISR masks+clears them) — **reverted** in `io_write`.
+
+**(C) `VIDEO_EN` is a per-frame software→hardware copy, downstream of everything.**
+The DISP compositor at flash `0xa683c` does `REG_DISP_VIDEO_EN(0x80001a4c) =
+*0x40023fc0` every frame (gated by `*0x40040e70 != 3`). It always writes **0**
+because the software video-enable flag `*0x40023fc0` is never set — `HALJPEG_Display`
+never runs, so `F0Y/F0C (0x80001ac0/0x80001ac4)` are **never written in the entire
+90M-instr boot** (verified). So VIDEO_EN cannot flip until the decode path runs,
+which cannot happen until the boot advances past "Loading". **VIDEO_EN (old build
+#1) is premature; the "Loading" advance is upstream and comes first.**
+
+**(D) The "Loading" advance chain, mapped gate-by-gate (retail addresses).** Steady
+state (PCSAMP + disasm): the boot thread sleeps in the eCos scheduler; the state-8
+Loading handler is blocked in its modal wait. State-8 draw+wait `0x26e44`:
+```
+0x26e44  OSD_Output(MSG_WAITING)=draw "Loading"   (0x49944(2,0,0xFF))
+0x26e58  call modal-wait 0x24d0c(0)
+0x26e68  if ret==0 -> 0x26f30  (EXIT: keep waiting)      <-- gate 1
+0x26e70  call 0x254a4  (post-wait queue check)
+0x26e80  if ret==0 -> 0x26ea0  (ADVANCE)                 <-- gate 2 (0 == advance)
+```
+Modal-wait wrapper `0x24d0c` returns non-zero (→ reaches `0x254a4`) **only** when a
+real event is dequeued+handled:
+```
+0x24d54 call 0x11fb0(0)  -> if 0 exit(0x24e4c: redraw, ret 0)   [flag wait]
+0x24d68 call 0x11f48     -> if 0 exit(0x24e4c)                  [list 0x40032180]
+0x24de8 call 0x252d0 ; 0x24e10 call 0x24ea0  (process event)
+0x24e1c if byte *0x40032a31 == 0 -> 0x24e4c (redraw, ret 0)     [handled-event]
+        else set flags, 0x40228, ret 1
+```
+- `0x11fb0(0)` peeks flag `0x1000` via `0x65dc` on flag words `0x40026e9c/…ea4`;
+  returns after a wake.
+- `0x11f48` counts a linked list anchored at `0x40032180`; **at runtime the list is
+  self-referential (empty) → returns 0 → wrapper exits early.** Concrete gate 1.
+- `0x254a4` copies event source `*0x400328b8` (NULL at runtime) into queue
+  `0x400329fc` via `0x6b6a4`, then `0x25d58→0x6b660` counts null-terminated
+  **halfword** event codes; `[fp-16]!=0 ⇒ return 0 ⇒ advance`. Queue empty.
+- The fetch `0x12e18` reads an **input-state structure** at `*0x40021db8` (42-entry
+  bitmap via `0xdd904`), not a simple queue — this is the input subsystem.
+
+**Conclusion (confirms + sharpens §10.24):** the "Loading" state advances **only when
+the input/event subsystem delivers a real event** (key / IR / media / decode-done).
+Every gate — flag `0x1000`, list `0x40032180`, handled-event byte `0x40032a31`,
+queue `0x400329fc`, input struct `*0x40021db8` — is a facet of "a real event
+arrived," and all are downstream of the decoder held in reset + no input. The
+faithful unlocks are unchanged: **(1) drive the input path** (post a key faithfully
+through the `0x12e18` input structure `*0x40021db8`, the user's "inject a key event"
+request), or **(2) model the decoder** so it posts its own decode-done event.
+Re-prioritised roadmap: the **Loading advance (input/event subsystem)** is the true
+next build, ahead of `VIDEO_EN`. New retail anchors: modal-wait `0x24d0c`; flag
+predicate `0x11fb0`/`0x11f48`; list `0x40032180`; handled-event byte `0x40032a31`;
+event source ptr `*0x400328b8`; input struct `*0x40021db8`; JPU_WaitDone `0x6bb14`;
+PROC1_1st ISR `0x4001f5ec`; DISP video-enable copy `0xa683c` (`*0x40023fc0`).

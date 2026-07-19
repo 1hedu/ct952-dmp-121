@@ -718,7 +718,7 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
          * driver polls and where it gives up (roadmap P1). */
         if (getenv("CT952_DECTRACE") && m->cpu.icount > 10000000ull &&
             m->cpu.icount < 11600000ull &&
-            (off == 0xe00u || off == 0x2a28u || off == 0x2a34u ||
+            (off == 0xb4u || off == 0xb8u || off == 0xc10u || off == 0xe00u || off == 0x2a28u || off == 0x2a34u ||
              off == 0x2a30u || off == 0x2884u || off == 0xc10u)) {
             static int dt; if (dt < 80) {
                 fprintf(stderr, "[DECrd] %08x=%08x pc=%08x icount=%llu\n",
@@ -911,8 +911,8 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
          * log PC+icount to find its retail addresses (roadmap item 2). */
         if (getenv("CT952_LOGOTRACE") &&
             (off == 0x1a48u || off == 0x1a4cu || off == 0x1ac0u || off == 0x1ac4u ||
-             off == 0x2880u || off == 0x2a20u)) {
-            static int lt; if (lt < 60) {
+             (getenv("CT952_LOGOTRACE_JPU") && (off == 0x2880u || off == 0x2a20u)))) {
+            static int lt; if (lt < 500) {
                 fprintf(stderr, "[LOGOwr] %08x=%08x pc=%08x sp=%08x icount=%llu\n",
                         addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 14),
                         (unsigned long long)m->cpu.icount); lt++; }

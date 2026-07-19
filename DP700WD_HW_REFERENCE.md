@@ -1840,3 +1840,34 @@ tiled YUV into the frame buffer at the kick, and (if the driver still needs it)
 presents the JPU/BIU completion. Retail anchors: buffer-fill `0x3bf00`, JPU engine
 `0x6bb00`, frame buffers `0x40065000`/`0x400B3C00`. Diagnostic added:
 `CT952_DECTRACE` (decode-window IO trace).
+
+### 10.34 MILESTONE — the logo decodes through the firmware's pipeline (P1 working)
+
+Implemented `CT952_LOGODECODE` (machine.c): on the JPU decode kick, functionally
+decode the staged logo JPEG (`0x401DC000`) with picojpeg and write the result as
+macroblock-tiled YUV 4:2:0 into the firmware's video frame buffer (Y `0x40065000`,
+C `0x400B3C00`, strip `0x2D00`; §10.2 tiling). **Verified:** de-tiling the frame
+buffer back to RGB yields the real **COBY power-on logo** (white "COBY®" on blue,
+480×270), pixel-clean — the emulator now produces exactly what the JPU hardware
+would, where `HALJPEG_Display` expects it (§10.33 showed this buffer was all-zero).
+The emulator's `machine_disp_scanout` already composites the decoded video plane
+under the OSD, so a full-panel render shows the logo behind the "Loading" OSD.
+
+**Two remaining polish items (both cosmetic/faithfulness, not the decode):**
+1. **Faithful `VIDEO_EN`:** the firmware's `JPEG_Decode` still doesn't report
+   `DECODE=OK` (`VIDEO_EN 0x80001a4c` stays 0, `F0Y/F0C` unwritten), so it doesn't
+   *itself* flip the video plane on — the emulator composites it regardless. The
+   decode-done signal (a JPU/VLD completion IRQ or the `JPEG_Status` thread var)
+   is the last piece for a fully hands-off natural display. Producing the output
+   and answering the `0xC10`/BIU polls did NOT flip it, so completion is driven by
+   a signal not yet modelled (candidate: the decode-done interrupt).
+2. **Scanout striping:** at ~60M the OSD plane is dominated by index 37 (a firmware
+   background fill) + near-white indices; with `GAM_OSD` unloaded the scanout's
+   fallback ramp renders index 37 as light-gray bands over the video. A faithful
+   OSD palette (or treating the firmware's OSD-background index as transparent)
+   cleans it up.
+
+**Net:** P1's core — functional decode → tiled YUV in the firmware's buffer — is
+DONE and verified (the COBY logo). The decoder bring-up now produces real pixels
+through the firmware's own tiling; the same path carries the built-in photos.
+Env: `CT952_LOGODECODE`. Retail anchors as §10.33.

@@ -140,6 +140,23 @@ static void machine_maybe_jpeg_decode(machine_t *m)
 #define R_P1_1ST_MDIS  0x0BC        /* MASK_DISABLE (W1C into MASK) */
 #define INT_NO_PROC1_1ST 13
 #define IRQ_P1_1ST_VSYNC 0x1u
+/* Secondary "PROC1 2nd" interrupt controller (ctkav_platform.h:70-76):
+ * cascades into LEON interrupt line 10 (INT_NO_PROC1_2ND). Sources: USB/SERVO/
+ * IR/BIU/MCU/VPU. We model the IR source (bit2) so a modeled remote keypress
+ * drives the firmware's own INT_Proc1_2nd_isr -> ISR_IRSaveClearStatus ->
+ * DSR_IR -> INPUT_RemoteScan -> __bISRKey: the faithful key-input path that
+ * feeds the "Loading" event queue (DP700WD_HW_REFERENCE.md 10.37/10.38). */
+#define R_P1_2ND_MASK  0x0D0        /* MASK_ENABLE: direct RW enable mask */
+#define R_P1_2ND_PEND  0x0D4        /* PENDING: RW */
+#define R_P1_2ND_STCL  0x0D8        /* STATUS(R) / CLEAR(W1C) */
+#define R_P1_2ND_MDIS  0x0DC        /* MASK_DISABLE (W1C into MASK) */
+#define INT_NO_PROC1_2ND 10
+#define INT_P1_2ND_IR  0x4u         /* INT_PROC1_2ND_IR (interrupt.c) */
+/* Platform IR receiver block (ctkav_platform.h:497-506), HW-NEC decoder.
+ * IR_DATA[7:0]=scancode, [8]=repeat, [10]=invalid data; IR_RAW_CODE[31:24]=
+ * customer, [23:16]=customer1. INPUT_RemoteScan reads the ISR-saved copies. */
+#define R_IR_DATA      0x390
+#define R_IR_RAWCODE   0x394
 #define R_DSU_UART_DATA 0x0C0
 #define R_DSU_UART_STAT 0x0C4
 /* Command block (ctkav_platform.h:474-481): PARAMETER1 = 0x364 */
@@ -256,6 +273,8 @@ static uint32_t io_read(machine_t *m, uint32_t off)
     case R_P1_1ST_STCL:
         /* STATUS read: the live secondary pending register */
         return io_get(m, R_P1_1ST_PEND);
+    case R_P1_2ND_STCL:
+        return io_get(m, R_P1_2ND_PEND);
     case R_IIC_CMD:
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
@@ -469,6 +488,13 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
         /* secondary MASK_DISABLE: clear the named enable bits */
         io_set(m, R_P1_1ST_MASK, io_get(m, R_P1_1ST_MASK) & ~v);
         return;
+    case R_P1_2ND_STCL:
+        /* PROC1-2nd CLEAR: write-1-to-clear pending bits */
+        io_set(m, R_P1_2ND_PEND, io_get(m, R_P1_2ND_PEND) & ~v);
+        return;
+    case R_P1_2ND_MDIS:
+        io_set(m, R_P1_2ND_MASK, io_get(m, R_P1_2ND_MASK) & ~v);
+        return;
     case R_PARAM1:
         /* AM mailbox: PROC1 writes cmd with [31:30]=1 write / 2 read;
          * PROC2 acks by clearing [31:30] (hdecoder.c:1718-1727).
@@ -657,6 +683,12 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         return 0xFFFFFFFFu;   /* erased flash */
     }
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
+        if (getenv("CT952_KEYTRACE") && (addr & ~3u) == 0x40039074u &&
+            m->cpu.icount > 40001300ull && m->cpu.icount < 50000000ull) {
+            static int krt; if (krt < 40) {
+                fprintf(stderr, "[KEYrd] __bISRKey read pc=%08x icount=%llu\n",
+                        m->cpu.pc, (unsigned long long)m->cpu.icount); krt++; }
+        }
         if (m->skip_panelcfg && addr == 0x4002f770u)
             return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
         /* Decoder-STOP window: present the state mirror (0x40039cd0, read by
@@ -713,6 +745,16 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
     if (addr >= 0x80000000u && addr < 0x80000000u + MACH_IO_SIZE) {
         uint32_t off = (addr - 0x80000000u) & ~3u;
         uint32_t v = io_read(m, off);
+        /* IR-injection trace (CT952_IRTRACE): log the firmware reading the IR
+         * data/status regs and the PROC1-2nd pending -- proves the injected IR
+         * interrupt drove the real ISR/DSR (INPUT_RemoteScan) path (10.38). */
+        if (getenv("CT952_IRTRACE") &&
+            (off == R_IR_DATA || off == R_IR_RAWCODE || off == R_P1_2ND_PEND ||
+             off == R_P1_2ND_STCL)) {
+            static int it; if (it < 60) {
+                fprintf(stderr, "[IRrd] %08x=%08x pc=%08x icount=%llu\n",
+                        addr, v, m->cpu.pc, (unsigned long long)m->cpu.icount); it++; }
+        }
         /* Decode-window IO trace (CT952_DECTRACE): log reads of the decode
          * DMA/status regs during the logo-decode burst so we can see what the
          * driver polls and where it gives up (roadmap P1). */
@@ -862,6 +904,16 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
+        /* IR-key propagation trace (CT952_KEYTRACE): after the IR injection, log
+         * small DRAM byte writes so we can locate __bISRKey and see whether the
+         * key reaches the "Loading" event queue / input struct (10.38). */
+        if (getenv("CT952_KEYTRACE") && size == 1 && val != 0 && val != 0xFFu &&
+            ((addr >= 0x40032200u && addr < 0x40032a40u) || addr == 0x40039074u) &&
+            m->cpu.icount > 40001300ull && m->cpu.icount < 50000000ull) {
+            static int kt; if (kt < 80) {
+                fprintf(stderr, "[KEYwr] %08x=%02x pc=%08x icount=%llu\n",
+                        addr, (unsigned)val, m->cpu.pc, (unsigned long long)m->cpu.icount); kt++; }
+        }
         /* JPEG_Status write locator (CT952_JSTAT): the decode driver stores
          * UNFINISH(2)/OK(1)/FAIL to its JPEG_Status thread var; log small-value
          * byte writes in the HAL data region during the decode window + PC so we
@@ -962,6 +1014,10 @@ static int bus_irq_level(sparc_bus_t *b)
      * whenever any of its enabled sources is pending (level-triggered). */
     if (io_get(m, R_P1_1ST_PEND) & io_get(m, R_P1_1ST_MASK))
         pend |= (1u << INT_NO_PROC1_1ST);
+    /* cascade: the secondary PROC1-2nd controller drives LEON line 10 whenever
+     * any of its enabled sources (IR, SERVO, BIU, MCU, ...) is pending. */
+    if (io_get(m, R_P1_2ND_PEND) & io_get(m, R_P1_2ND_MASK))
+        pend |= (1u << INT_NO_PROC1_2ND);
     uint32_t eff = pend & io_get(m, R_INT_MASK);
     int lvl;
     for (lvl = 15; lvl >= 1; lvl--)
@@ -1249,6 +1305,19 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     if (g_reach < 0) g_reach = getenv("CT952_REACH") ? 1 : 0;
     if (!ccev && !ccev_done) { const char *e = getenv("CT952_CCEVENT");
                                ccev = e ? strtoull(e, NULL, 0) : 0; if (!ccev) ccev_done = 1; }
+    /* One-shot faithful IR keypress (CT952_IRKEY="<scancode>[@<icount>]"): drive
+     * the modeled IR receiver + PROC1-2nd IR interrupt so the firmware's own
+     * INT_Proc1_2nd_isr / DSR_IR / INPUT_RemoteScan decode the key into __bISRKey
+     * (10.38). scancode indexes _IRInfo.aIRMap; icount defaults to 40M (Loading). */
+    static int irkey_init = -1; static uint32_t irkey_code = 0;
+    static uint64_t irkey_at = 40000000ull; static int irkey_done = 0;
+    if (irkey_init < 0) {
+        const char *e = getenv("CT952_IRKEY");
+        irkey_init = e ? 1 : 0;
+        if (e) { char *at = NULL; irkey_code = (uint32_t)strtoul(e, &at, 0);
+                 if (at && *at == '@') irkey_at = strtoull(at + 1, NULL, 0); }
+        else irkey_done = 1;
+    }
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
         /* One-shot CC event-flag poke (CT952_CCEVENT=<icount>): the CC/boot
          * thread spins in a wait-for-event dispatcher polling the flag object at
@@ -1262,6 +1331,23 @@ uint64_t machine_run(machine_t *m, uint64_t n)
             fprintf(stderr, "[CCEVENT] posted flag 0x40026EA4 |= 0x1000 at icount=%llu\n",
                     (unsigned long long)m->cpu.icount);
             ccev_done = 1;
+        }
+        if (!irkey_done && m->cpu.icount > irkey_at) {
+            /* present a clean NEC data frame (not repeat 0x100, not invalid 0x400)
+             * with the scancode in the low byte; customer=0x00 customer1=0xFF.
+             * Also enable the IR source in the PROC1-2nd mask: on real silicon IR
+             * is enabled, but the stuck-at-Loading boot never ran that init, so the
+             * secondary mask lacks bit2 -- set it so the cascade can deliver. */
+            io_set(m, R_IR_DATA, irkey_code & 0xFFu);
+            io_set(m, R_IR_RAWCODE, 0x00FF0000u | ((irkey_code & 0xFFu) << 8));
+            io_set(m, R_P1_2ND_MASK, io_get(m, R_P1_2ND_MASK) | INT_P1_2ND_IR);
+            io_set(m, R_P1_2ND_PEND, io_get(m, R_P1_2ND_PEND) | INT_P1_2ND_IR);
+            fprintf(stderr, "[IRKEY] injected scancode 0x%02x: IR_DATA=%08x "
+                    "P1_2ND mask=%08x pend=%08x leonmask=%08x at icount=%llu\n",
+                    irkey_code & 0xFF, io_get(m, R_IR_DATA), io_get(m, R_P1_2ND_MASK),
+                    io_get(m, R_P1_2ND_PEND), io_get(m, R_INT_MASK),
+                    (unsigned long long)m->cpu.icount);
+            irkey_done = 1;
         }
         uint64_t chunk = n - done;
         uint64_t ran, i;

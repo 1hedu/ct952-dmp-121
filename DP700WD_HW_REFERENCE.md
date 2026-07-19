@@ -2010,3 +2010,54 @@ next build, ahead of `VIDEO_EN`. New retail anchors: modal-wait `0x24d0c`; flag
 predicate `0x11fb0`/`0x11f48`; list `0x40032180`; handled-event byte `0x40032a31`;
 event source ptr `*0x400328b8`; input struct `*0x40021db8`; JPU_WaitDone `0x6bb14`;
 PROC1_1st ISR `0x4001f5ec`; DISP video-enable copy `0xa683c` (`*0x40023fc0`).
+
+### 10.38 MILESTONE — faithful IR input hardware modeled + verified (Loading is decode/media-gated, not key-gated)
+
+Built roadmap item #1 (faithful input path): modeled the CT909P **IR receiver +
+PROC1-2nd interrupt** so a synthetic remote keypress drives the firmware's OWN
+ISR/DSR/decode chain — no memory-poking of decoded state.
+
+**What was added (`machine.c`):**
+- **PROC1-2nd interrupt controller** (`ctkav_platform.h:70-76`): `MASK_ENABLE 0x0D0`,
+  `PENDING 0x0D4`, `STATUS/CLEAR 0x0D8` (W1C), `MASK_DISABLE 0x0DC`. Cascades to
+  **LEON line 10** (`INT_NO_PROC1_2ND`) in `bus_irq_level`, mirroring the PROC1-1st
+  (line 13) VSYNC cascade. IR source bit = `INT_PROC1_2ND_IR 0x4`.
+- **IR receiver block** (`ctkav_platform.h:497-506`): `IR_DATA 0x390`
+  (`[7:0]`=scancode, `[8]`=repeat, `[10]`=invalid), `IR_RAW_CODE 0x394`
+  (`[31:24]`=customer, `[23:16]`=customer1).
+- **One-shot injector** `CT952_IRKEY="<scancode>[@<icount>]"` (default icount 40M):
+  presents a clean NEC data frame, force-enables the IR mask bit (real silicon has
+  IR enabled; the stuck-at-Loading boot never ran that init, so `0x0D0` read `0x400`
+  = VBUF_UNDERFLOW only), and raises PROC1-2nd IR pending.
+
+**Verified end-to-end (`CT952_IRTRACE`/`CT952_KEYTRACE`):** injecting scancode `0x06`:
+```
+[IRrd] 800000d4=00000004 pc=4001f730   <- PROC1-2nd ISR read pending (line-10 IRQ TAKEN)
+[IRrd] 80000390=00000006 pc=00042328   <- ISR_IRSaveClearStatus read IR_DATA (our scancode)
+[IRrd] 80000394=00ff0600 pc=00042340   <- read IR_RAW_CODE; customer 0x00/0xFF == CUSTOMER_CODE/1
+[KEYwr] 40039074=72 pc=000423a0        <- DSR_IR/INPUT_RemoteScan wrote __bISRKey = aIRMap[0x06]
+[KEYrd] __bISRKey read pc=000423f0     <- read once, inside the DSR itself
+```
+So the whole faithful chain runs: **line-10 IRQ → INT_Proc1_2nd_isr →
+ISR_IRSaveClearStatus (saves IR regs) → DSR_IR → INPUT_RemoteScan → `__bISRKey`**.
+The compiled remote map gives `aIRMap[0x06] = 0x72 = KEY_N9` (a *different* map than
+`ir.h:57`; the customer code `0x00/0xFF` matches `CUSTOMER_CODE/CUSTOMER_CODE1`).
+`__bISRKey` (retail addr **`0x40039074`**) is confirmed.
+
+**Key finding — the "Loading" state does NOT consume keys.** After the DSR sets
+`__bISRKey`, it is **never read again** to 50M, and **nothing writes the Loading event
+queue** `0x400329FC` / input struct `0x40032290` (`*0x40021db8`). The panel is
+byte-identical with vs. without the keypress. The CC main loop (`CC_MainProcessKey`,
+`cc.c:882`) that would convert `__bISRKey` → events is **not the running thread**
+during the INITIAL/`Loading` modal-wait — INITIAL is a self-contained power-on flow,
+and the CC event loop only runs after INITIAL completes. So a remote key cannot skip
+"Loading": it advances on **decode-done / media**, faithfully (a photo frame doesn't
+let you key past its splash). This **reinforces §10.24/10.37**: the single upstream
+unlock is the **decoder/media bring-up**, which posts the advance event itself.
+
+**Net:** the IR input subsystem is now a real, reusable capability (verified against
+the firmware's own ISR/DSR), ready for the interactive states the boot reaches once
+Loading advances. New retail anchors: PROC1-2nd ISR `0x4001f720`;
+`ISR_IRSaveClearStatus 0x42328`; `INPUT_RemoteScan`/`DSR_IR` @flash `0x423xx`;
+`__bISRKey 0x40039074`; IR regs `0x80000390/0x80000394`; PROC1-2nd ctrl `0x800000d0-dc`.
+Diagnostics: `CT952_IRKEY`, `CT952_IRTRACE`, `CT952_KEYTRACE`.

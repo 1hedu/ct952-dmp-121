@@ -1751,3 +1751,24 @@ boot reaches Loading naturally). item 2 DONE (logo-decode gate located; faithful
 mirror proven to unlock the decode kick — the JPU now genuinely runs). item 3 IN
 PROGRESS (BIU phase completes; the JPU-op loop's terminal condition + functional
 output is the remaining piece; all retail anchors recorded).
+
+### 10.31 Nuance — the JPU decode is a PERIODIC RETRY, not a tight loop
+
+PC sampling past icount 140M (faithful config) shows the dominant hot loop is the
+**OSD "Loading" redraw** (`0x4001f3a8` OSD_SetBufferModeInfo, `0x4001d66c`
+OSD_Output, glyph `memcpy` `0xd39xx`) — the §10.21-24 state-machine redraw. The
+JPU decode accesses grow only slowly (`JPU_CTRL` 13026→39562 over 130M instr), so
+the decode is **not** a tight infinite loop; it is a **periodic retry**: the
+power-on state machine redraws "Loading" and every so often re-attempts the logo
+`UTL_ShowJPEG_Slide`, which runs the JPU op sequence, fails to complete, returns
+FALSE, and the state re-arms. This reconciles §10.21-24 (event-driven "Loading"
+state) with §10.28-30 (the JPU actually runs): they are the same loop at two time
+scales — redraw fast, decode-retry slow.
+
+**Item-3 conclusion unchanged, target sharpened:** make ONE decode attempt
+COMPLETE (produce the decoded frame + signal `JPEG_Status(DECODE)=OK`), and the
+retry becomes a success → `HALJPEG_Display` → `VIDEO_EN` → the state machine's
+logo-display event posts → boot advances. The completion signal the JPU op
+sequence waits on (the `0x80000e00`/`0x8000031c` predicate + a valid decoded
+frame) remains the one piece to model; it just fires per-retry, not in a tight
+loop. Every retail anchor is recorded (§10.28-30).

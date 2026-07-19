@@ -2778,3 +2778,37 @@ the monitor-table dispatch to see why that path is never selected.
 
 Lesson logged: single-instant snapshot reads of a volatile message system are unreliable;
 verify event-flow claims against the RUNNING target, not one dump.
+
+## 12. THE PLOT (re-anchor — read this first each session)
+
+**Quest:** a faithful natural boot of the retail firmware — peripherals modeled well
+enough that the RTOS comes ALIVE on its own, every crutch gone.
+
+**Why the screensaver is "first":** it is the acceptance test that the system is alive,
+not the goal. And critically — **the faithful boot IS the path to the screensaver, not a
+detour.** The crutches got us to POWERONMENU but left the system DEAD, because a crutch
+fakes *state* (a status byte) instead of producing the *event* (the IRQ/message) the real
+peripheral would. A faithfully modeled block raises the interrupt and feeds the producer,
+so the RTOS stays awake. Reach POWERONMENU that way and the screensaver fires by itself.
+The "event-starvation / routing" walls (§10.24–11.7) are the crutches' own fault.
+
+**Crutch taxonomy (do not conflate again):**
+- *Boot-progress* — VDEC_DONE (removed, made faithful §11.2), CHOOSEMEDIA/NOMEDIA
+  (deleted, inert §11.3). Gate whether the boot ADVANCES; touch nothing on the panel.
+- *Display/pixel* — LOGODECODE, STAGE_PHOTO. STILL PRESENT. They put the splash + the
+  5 photos on the panel (video plane). Not yet made faithful.
+- *Timing* — TICK_FAST_AT (clock-rate calibration).
+- *Injection tools* — inject_wake.py / inject_osdss.py (forced the screensaver; proved
+  the code runs, never autonomous).
+
+**Established position (verify against this, don't reconstruct from memory):**
+- Crutch-free boot reaches POWERONMENU; splash renders with LOGODECODE (verified). The
+  5 photos + OSDSS_Entry/_OSDSS_PictureUpdate ran with the display crutches. The
+  AUTONOMOUS screensaver was NEVER reached, even fully scaffolded — that is the wall.
+- At crutch-free POWERONMENU the OSD menu does NOT draw (buffer 0x4005f000 all-zero);
+  the UI thread is stuck in menu-setup. Rendering the menu naturally = the real next
+  milestone (proves the UI is alive), and it is a DISPLAY-path question.
+
+**Next faithful target:** the display/GDI pipeline — find what the menu-setup draw is
+waiting on (a DISP/GPU/VSYNC completion the model doesn't faithfully raise), model it,
+and watch the menu draw on its own. That is the concrete door in the wall.

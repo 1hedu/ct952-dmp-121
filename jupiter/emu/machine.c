@@ -1758,6 +1758,9 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
         for (x = 0; x < w; x++) {
             uint8_t idx = fb[(uint64_t)y * stride + x];
             uint32_t c;
+            /* OSD plane off -> the panel shows only the video plane (the decoded
+             * photo); don't composite the not-yet-displayed OSD content. */
+            if (!osd_en) idx = 0;
             if (idx == 0 && m->jpeg_rgb && m->jpeg_w > 0 && m->jpeg_h > 0) {
                 /* transparent OSD pixel -> sample the video plane */
                 int vx = (int)((uint64_t)x * m->jpeg_w / (w ? w : 1));

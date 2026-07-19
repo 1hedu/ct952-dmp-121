@@ -2217,3 +2217,35 @@ striping). Next: find where this build enables the video plane for the JPEG (doe
 `0x39f38` set a software flag the compositor reads, or is the photo meant for the
 OSD/GPU plane?), so the clean decoded image composites onto the panel. Diagnostics:
 `CT952_CHOOSEMEDIA`, `CT952_VDEC_DONE`, `CT952_MIRTRACE`, REACH watches.
+
+### 10.42 MILESTONE — natural boot to POWERONMENU + clean COBY splash on the panel
+
+The full chain now works end-to-end and renders the real power-on splash.
+
+**Boot reaches POWERONMENU_Initial** (`0x4b808`, icount 75.5M) — the power-on menu
+that launches the built-in slideshow — with `CT952_CHOOSEMEDIA=0x40031b9c
+CT952_VDEC_DONE=1 CT952_NOMEDIA=1`. From "stuck at Loading forever" (start of this
+arc) to the menu, entirely through the firmware's own flow.
+
+**Panel render fixed (two scan-out bugs):**
+1. **OSD buffer stride is 720, not 616.** `machine_disp_scanout` was called with
+   `stride = fb_w = 616`; the real OSD framebuffer at `0x4005F000` is 720-byte-
+   aligned per row (SDTV width). Reading a 720-stride buffer at 616 drifted each
+   row by 104 bytes → horizontal striping. Added `--fb-stride` (default 720).
+   Verified: a vertical slice at stride 720 is clean (`37 37 …37 0 0 0` = COBY text
+   then transparent index-0), garbage at 616.
+2. **Honor DISP_OSD_EN.** When the OSD plane is disabled (as at the splash phase),
+   the panel shows ONLY the video plane; the scan-out was compositing the not-yet-
+   displayed OSD content and mixing its fallback-ramp gray (index 37 → 240) with
+   the video → striping. Now `!osd_en → idx=0` (video-plane only).
+
+**Result:** the panel shows the clean **COBY splash logo** — the 480x270 JPEG the
+firmware decoded (via `UTL_ShowJPEG_Slide` → DECODE=OK → display, §10.41) on the
+video plane. This is exactly what the real device shows at power-on.
+
+**Remaining for the slideshow:** POWERONMENU is reached but only the COBY splash is
+decoded so far (no `01/02/03.jpg` yet to 130M). Next: get POWERONMENU to select
+flash playback (`MM_PlayPhotoInFlash`) and decode the built-in photos. The OSD
+palette (GAM_OSD `0x80001C00`) is still unloaded — for OSD-enabled screens (menu
+UI) it renders via the fallback ramp; loading the real palette is a separate polish
+item (the splash doesn't need it since OSD is disabled there).

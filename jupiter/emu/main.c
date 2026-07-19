@@ -22,6 +22,7 @@ int main(int argc, char **argv)
     uint32_t seed_entry = 0, seed_sp = 0;
     uint32_t fb_addr = 0x4005F000u;   /* DS_OSDFRAME_ST */
     uint32_t fb_w = 616, fb_h = 440;  /* firmware OSD region geometry */
+    uint32_t fb_stride = 720;         /* OSD buffer row stride (720-aligned, not fb_w) */
     int rom_load = 0;
     int m_skip_panelcfg = 0;
     int m_build_panelcfg = 0;
@@ -54,6 +55,8 @@ int main(int argc, char **argv)
             char *xp; fb_w = (uint32_t)strtoul(argv[++i], &xp, 0);
             if (xp && (*xp == 'x' || *xp == 'X')) fb_h = (uint32_t)strtoul(xp + 1, NULL, 0);
         }
+        else if (!strcmp(argv[i], "--fb-stride") && i + 1 < argc)
+            fb_stride = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
@@ -206,7 +209,7 @@ int main(int argc, char **argv)
     }
 
     if (fb_path) {
-        int r = machine_disp_scanout(m, fb_addr, fb_w, fb_h, fb_w, fb_path);
+        int r = machine_disp_scanout(m, fb_addr, fb_w, fb_h, fb_stride, fb_path);
         if (r < 0)
             fprintf(stderr, "[ct952emu] fb scanout FAILED\n");
         else

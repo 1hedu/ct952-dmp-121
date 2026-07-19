@@ -1111,6 +1111,10 @@ Three model changes together carry the retail image from "menu never draws"
    chain would need billions of instructions; with it the boot reaches the UI in
    ~27M instructions.
 
+> **UPDATE (§10.26):** `CT952_TEST_MIRROR10` is **retired** — the faithful
+> decoder-stop mirror (§10.26) now clears these gates. The reproduction command is
+> just `CT952_PROC2=1 CT952_TICK_MULT=16` (no MIRROR10).
+
 **Result (verified):** `CT952_PROC2=1 CT952_TEST_MIRROR10=1 CT952_TICK_MULT=16`
 → first GPU op at icount≈26.5M, then **45k+ GPU font ops** draw the firmware's
 `"Loading ."` status screen (media-detect indicator, `osdnd.c`
@@ -1523,3 +1527,80 @@ faithful power-on-status state machine whose every forward transition waits on t
 decoder. The render fidelity is correct (§10.16); the remaining work is squarely
 the decoder bring-up (PROC2), which is the single upstream blocker behind all the
 nested gates catalogued in §10.21-10.24.
+
+### 10.25 Decoder bring-up roadmap (the faithful path to a natural boot)
+
+Chosen direction: get the decode/display to actually complete so the firmware
+advances on its own. Synthesizing §10.8-10.24 into the faithful work items and
+their true dependency order (all addresses execution-verified / symbol-free):
+
+**A. The state-8 "Loading" gates are the firmware's own event system, fed by the
+decode/display-complete path.** The state-8 handler (`0x25ef4`) advances only when
+its post-wait check (`0x254a4`) sees a message; the intermediate gate `0x11f48`
+sums a linked list at `0x40032180`; the queue getter `0x6b660` reads `0x400329FC`;
+the CC event flag is `0x40026EA4` bit `0x1000`. These are UI/event structures —
+**not decoder registers** — so they can't be poked meaningfully; they are *posted
+to* by the decode-done / `HALJPEG_Display` / servo-complete handlers. Faking any
+one just exposes the next (§10.24, verified twice).
+
+**B. The true upstream blocker is that `_INITIAL_ShowFirstLOGO` never kicks the
+decode.** Whole-boot I/O audit (§10.9): `REG_MCU_BCR08` (0x80002a20),
+`REG_JPU_CTRL`/`JPU_GO` (0x80002880), `REG_DISP_F0Y_ADDR` (0x80001AC0) are **never
+written**; `DISP_VIDEO_EN`/`DISP_OSD_EN` never set. With the decoder-stop dwell
+(§10.13) the boot reaches `_INITIAL_ShowFirstLOGO` and the `0x80000C10` decode-
+progress gate is polled 15 436× (§10.14) — but the firmware still never issues the
+JPEG kick, so the logo decode never starts, so the decode-done event that would
+feed the §A queues never posts. The wait is for something that never begins.
+
+**C. Why the kick never fires — the remaining root to crack.** Between reaching
+`_INITIAL_ShowFirstLOGO` and the `BCR08`/`JPU_GO` kick lies the `display.a` /
+`dec_dram.a` decoder-command + display bring-up handshake (precompiled, no .c).
+The still-unmet piece from §10.12-13 is the **software mirror `0x40039cd0` never
+reaching `MODE_STOPPED 0x11`** (getter `0x6f054` ORs a busy bit while it lags),
+which `CT952_TEST_MIRROR10` currently fakes. The mirror is written through a
+pointer in the decoder library (no direct `sethi 0x1000e7` store found), so the
+faithful model reproduces the library's STOP→STOPPED bookkeeping: on the
+firmware's own `MODE_STOP` issue (flash `0x6f2b0`), drive both the live playmode
+`0xB0000190` AND the software mirror `0x40039cd0` through `0x10 -> 0x11` with the
+dwell — so every `0x375a0`/`0x33dac`/`0x36ff0` check passes without MIRROR10.
+
+**Faithful implementation order:**
+1. **Retire MIRROR10** — make the decoder-stop stand-in also drive mirror
+   `0x40039cd0` to `0x11` after the dwell (extends §10.13; clears §10.12 gate 3
+   naturally). Re-verify boot still reaches "Loading" with the dwell alone.
+2. **Find why the logo decode isn't kicked** — trace, from the state-8 handler's
+   decode/display path, the precondition the firmware checks before writing
+   `BCR08`/`JPU_GO` (candidate: a `display.a` bring-up ack, or `HALJPEG_Decode`'s
+   own gate). This is the true wall (§B).
+3. **Apply the §10.10 JPEG datapath** once the kick fires: functional-decode the
+   staged logo (`0x401DC000`) → tiled YUV to `0x40065000`/`0x400B3C00`, present
+   BIU/VLD/JPU/`0xC10` polls done → `JPEG_Status OK` → `HALJPEG_Display` sets
+   `DISP_VIDEO_EN`. The firmware then posts its advance event and §A clears.
+4. **De-tile in `machine_disp_scanout`** and composite video under the OSD.
+
+**Honest scope note:** items 2-3 depend on precompiled `display.a`/`dec_dram.a`
+handshakes interlocked with the (reset) PROC2 and unmodeled BIU/JPU hardware, so
+this is a genuinely multi-session bring-up, not a one-shot fix. If a visible
+result is wanted sooner, the functional-decode display bypass (drive the §10.10
+datapath directly from the built-in photos without the boot state machine) shows
+the actual images through the real scan-out while item 2's root is worked out.
+
+### 10.26 DONE (roadmap item 1) — faithful decoder-stop mirror; MIRROR10 retired
+
+Implemented the faithful software-mirror bookkeeping and **removed the
+`CT952_TEST_MIRROR10` read-hack entirely**. New state `machine.h vdec_stopped`:
+when the firmware issues a `MODE_STOP` from the COMDEC issuer (flash
+`0x6f2b0..0x6f400`), the stand-in now (a) holds the live playmode `0xB0000190` and
+the software mirror `0x40039cd0` at `MODE_STOP(0x10)` for the ack dwell, then
+(b) presents both as `MODE_STOPPED(0x11)` afterwards, until a real play/scan
+command clears `vdec_stopped`. So the getter `0x6f054` returns `0x10` for gate-1
+and `0x11` for gate-3 (§10.12) through the same handshake a real decoder would
+drive — no per-thread / per-icount hack.
+
+**Verified:** `CT952_PROC2=1 CT952_TICK_MULT=16` (no MIRROR10) boots to the
+identical `"Loading"` screen (OSD plane indices 0/2/3 = 110656/1545/119, matching
+§10.16). disp regression green. This retires the last diagnostic hack on the
+boot-to-Loading path; the decoder-stop handshake is now modelled faithfully.
+
+Remaining roadmap items 2-4 (§10.25) are unchanged: find why the logo decode is
+never kicked, apply the §10.10 JPEG datapath, de-tile the scan-out.

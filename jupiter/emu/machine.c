@@ -593,13 +593,15 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         /* Decoder-STOP window: present the state mirror (0x40039cd0, read by
          * getter 0x6f054) as MODE_STOP(0x10) so the boot stop-poll latches it
          * before the state settles to STOPPED(0x11). See machine.h. */
-        if (m->cycles < m->vdec_stop_until && addr == 0x40039cd0u)
-            return 0x10u;
-        if (addr == 0x40039cd0u && getenv("CT952_TEST_MIRROR10") &&
-            m->cpu.icount > 45000000ull) {
-            uint32_t sp = sparc_get_reg(&m->cpu, 14);
-            if (sp >= 0x40036e00u && sp < 0x40037100u)
-                return 0x10u;   /* DIAGNOSTIC: only the 0x612b0-poll thread */
+        if (addr == 0x40039cd0u) {
+            /* Faithful software-mirror model: MODE_STOP(0x10) during the ack
+             * dwell, then MODE_STOPPED(0x11) once stopped -- standing in for the
+             * firmware/decoder-library mirror write that a real decoder-stop
+             * produces (§10.25). Clears the boot's gate-1 (0x10) and gate-3
+             * (0x11) decoder-stop polls naturally -- retired the sp-gated
+             * CT952_TEST_MIRROR10 read-hack this replaced. */
+            if (m->cycles < m->vdec_stop_until) return 0x10u;
+            if (m->vdec_stopped) return 0x11u;
         }
         /* EXPERIMENT (CT952_VDEC_IDLE): present the boot thread's decoder-init
          * handshake flags as "decoder idle/ready" so INITIAL_PowerONStatus's
@@ -657,11 +659,6 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
              * the getter (0x6f054) adds no busy bit and returns the mirror's
              * MODE_STOP(0x10) cleanly. */
             if (m->cycles < m->vdec_stop_until) return 0x11u;
-            if (getenv("CT952_TEST_MIRROR10") && m->cpu.icount > 45000000ull) {
-                uint32_t sp = sparc_get_reg(&m->cpu, 14);
-                if (sp >= 0x40036e00u && sp < 0x40037100u)
-                    return 0x11u;   /* DIAGNOSTIC: only the 0x612b0-poll thread */
-            }
             static int fp = -1;
             if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
                           fp = e ? (int)strtoul(e, NULL, 0) : -2; }
@@ -756,8 +753,12 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
          * visibility window so the boot poll (which reads the mirror via
          * 0x6f054) latches 0x10 before the state settles to 0x11. */
         if ((cmd == 0x10u || cmd == 0x11u) &&
-            m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f400u)
+            m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f400u) {
             m->vdec_stop_until = m->cycles + m->proc2_ack_dwell;
+            m->vdec_stopped = 1;   /* mirror -> STOPPED(0x11) after the window */
+        } else if (cmd != 0x10u && cmd != 0x11u && cmd != 0x00u) {
+            m->vdec_stopped = 0;   /* a real play/scan command: no longer stopped */
+        }
         if (getenv("CT952_STOPTRACE") && m->cpu.icount > 55000000ull) {
             static int sn; if (sn < 24) {
                 fprintf(stderr, "[PMwr>55M] b0000190=%02x pc=%08x armed=%d icount=%llu\n",

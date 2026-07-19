@@ -107,6 +107,10 @@ typedef struct machine {
      * for a short window after a stop command, present the mirror read as
      * MODE_STOP(0x10) so the poll latches it, then let it settle to STOPPED. */
     uint64_t vdec_stop_until;   /* present mirror as MODE_STOP while cycles < this */
+    int vdec_stopped;           /* a stop has been issued: after the 0x10 window the
+                                 * software mirror 0x40039cd0 holds STOPPED(0x11), so
+                                 * the boot's gate-3 poll passes without the MIRROR10
+                                 * read-hack (faithful decoder-stop bookkeeping) */
 
     /* uart capture */
     FILE *uart_file;         /* optional capture file (may be NULL) */

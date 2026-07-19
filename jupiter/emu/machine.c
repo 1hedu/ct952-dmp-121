@@ -705,6 +705,12 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
          * getter 0x6f054) as MODE_STOP(0x10) so the boot stop-poll latches it
          * before the state settles to STOPPED(0x11). See machine.h. */
         if (addr == 0x40039cd0u) {
+            if (getenv("CT952_MIRTRACE") && m->cpu.icount > 10300000ull &&
+                m->cpu.icount < 13000000ull) {
+                static int mt; if (mt < 60) {
+                    fprintf(stderr, "[MIRrd] 40039cd0 pc=%08x icount=%llu\n",
+                            m->cpu.pc, (unsigned long long)m->cpu.icount); mt++; }
+            }
             /* Faithful software-mirror model: MODE_STOP(0x10) during the ack
              * dwell, then MODE_STOPPED(0x11) once stopped -- standing in for the
              * firmware/decoder-library mirror write that a real decoder-stop

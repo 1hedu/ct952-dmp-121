@@ -1489,3 +1489,37 @@ unlocks, in order of faithfulness:
 Key retail addresses: event queue `0x400329FC`; getter `0x6b660`; fetch `0x12e18`;
 state-8 handler `0x25ef4`; draw+wait `0x26e44`; post-wait check `0x254a4`; advance
 `0x2605c`; logo jpeg `0x401DC000`. All execution-verified (symbol-free).
+
+### 10.24 Key-event injection attempt — the gate is MULTI-LAYERED (all decoder-gated)
+
+Tried to advance state-8 by simulating "an event arrived." Added infrastructure:
+a fast CPU breakpoint (`sparc_t.brk_pc`; `sparc_run` stops AT it without single-
+stepping) and probe `CT952_LOGOEVENT` (posts CC event `0x1000` so the modal-wait
+exits, and forces the queue check `0x254a4` to report success at `0x26e78`).
+
+**Result: it does not advance — because the wait is gated at MULTIPLE nested
+levels, not one.** Disassembling the modal-wait wrapper `0x24d0c` shows: after the
+dispatcher `0x11fb0` returns 1 on event `0x1000`, it calls **`0x11f48`** (another
+predicate); only if THAT passes does control reach `0x254a4` (the queue check),
+and only then `0x26e78`. So `0x26e78` is never reached (the `0x11f48` gate blocks
+first), and blindly posting `0x1000` just churns the per-frame redraw (the render
+shows "Loading" caught mid-draw, fewer pixels). Chain so far:
+```
+modal-wait 0x11fb0 (event 0x1000)  ->  0x11f48 predicate  ->  0x254a4 queue check
+   ->  0x25d58 -> 0x6b660(queue 0x400329FC)   ->  advance 0x2605c
+```
+Each layer re-checks real state (event pulse, then `0x11f48`, then the event
+queue), and every one is ultimately downstream of the **decoder (PROC2) being
+held in reset** — nothing produces the decode/servo completion that would set
+these predicates. **Conclusion: faking the gates one-by-one is an unbounded chain;
+the faithful unlock is to make PROC2 / the JPEG-still decoder actually run (kick +
+model the decode-done, §10.9-10.10), or bypass the boot state machine entirely and
+drive the display datapath directly with a functional decode of the built-in
+photos (§10.19 / §10.10).** The `brk_pc` breakpoint added here is reusable general
+infrastructure; `CT952_LOGOEVENT` remains as a documented (negative) probe.
+
+**Net for the "boot naturally to the slideshow" goal:** the "Loading" screen is a
+faithful power-on-status state machine whose every forward transition waits on the
+decoder. The render fidelity is correct (§10.16); the remaining work is squarely
+the decoder bring-up (PROC2), which is the single upstream blocker behind all the
+nested gates catalogued in §10.21-10.24.

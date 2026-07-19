@@ -80,6 +80,9 @@ typedef struct sparc {
     /* per-instruction PC ring: pinpoints the exact hot loop at halt */
     uint32_t pc_ring[64];
     int pc_ri;
+    /* optional breakpoint: sparc_run stops (returns early) when pc==brk_pc,
+     * so the machine layer can intervene at an exact PC without single-stepping */
+    uint32_t brk_pc;
 } sparc_t;
 
 /* Reset: PC=0, nPC=4, S=1, ET=0, CWP=0, impl/ver = LEON2-ish */

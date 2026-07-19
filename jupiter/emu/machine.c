@@ -1141,6 +1141,8 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     }
     static int g_reach = -1;
     static uint64_t ccev = 0; static int ccev_done = 0;
+    static int g_logoev = -1;
+    if (g_logoev < 0) g_logoev = getenv("CT952_LOGOEVENT") ? 1 : 0;
     if (g_reach < 0) g_reach = getenv("CT952_REACH") ? 1 : 0;
     if (!ccev && !ccev_done) { const char *e = getenv("CT952_CCEVENT");
                                ccev = e ? strtoull(e, NULL, 0) : 0; if (!ccev) ccev_done = 1; }
@@ -1160,6 +1162,38 @@ uint64_t machine_run(machine_t *m, uint64_t n)
         }
         uint64_t chunk = n - done;
         uint64_t ran, i;
+        /* Logo/status-state event injection (CT952_LOGOEVENT): the power-on
+         * state-8 handler advances only when its post-wait check (flash 0x254a4)
+         * returns 0 -- which happens when the key/event queue (0x400329FC) has a
+         * pending message. With no input and the decoder in reset the queue stays
+         * empty. Simulate "an event arrived" surgically: at the instruction right
+         * after `call 0x254a4` (0x26e78), force its return value %o0=0 so the
+         * handler takes the advance path (0x26ea0 -> 0x2605c). Preserves 0x254a4's
+         * side effects (it still ran). Past 30M icount so it only fires in the
+         * Loading state. See DP700WD_HW_REFERENCE.md 10.23. */
+        if (g_logoev && m->cpu.icount > 30000000ull) {
+            /* Breakpoint at 0x26e78 (the instr after `call 0x254a4`): stop there
+             * without single-stepping the whole run. Also keep the CC event flag
+             * 0x1000 posted so the modal-wait dispatcher exits each poll and the
+             * handler reaches the queue check that leads to 0x26e78. Gated past
+             * 30M icount so only the Loading state is affected (event 0x1000 is
+             * reused by earlier boot states). */
+            m->cpu.brk_pc = 0x26e78u;
+            uint32_t v = mem_read_raw(m->dram + 0x26ea4u, 4);
+            if (!(v & 0x1000u)) mem_write_raw(m->dram + 0x26ea4u, v | 0x1000u, 4);
+            if (m->cpu.pc == 0x26e78u) {
+                static int announced = 0;
+                sparc_set_reg(&m->cpu, 8, 0);   /* %o0 = 0 -> 0x254a4 "event pending" */
+                if (!announced) { announced = 1;
+                    fprintf(stderr, "[LOGOEVENT] reached 0x26e78, forcing advance at icount=%llu\n",
+                            (unsigned long long)m->cpu.icount); }
+                m->cpu.brk_pc = 0;                     /* clear so we can step past it */
+                sparc_run(&m->cpu, 1);                 /* execute the forced instr */
+                for (i = 0; i < 1; i++) machine_cycle(m);
+                done += 1;
+                continue;
+            }
+        }
         if (g_reach) {
             static const struct { uint32_t pc; const char *name; } wl[] = {
                 {0x0000eb90u,"INITIAL_System(F)"}, {0x0000f6f8u,"ShowFirstLOGO(F)"},
@@ -1225,7 +1259,9 @@ uint64_t machine_run(machine_t *m, uint64_t n)
          * (DRAM / vdec SRAM / JPU), so its decode work is visible to PROC1. */
         if (m->proc2_on && !m->cpu2.halted)
             sparc_run(&m->cpu2, ran ? ran : chunk);
-        if (ran < chunk)
+        /* A short run because we stopped AT the breakpoint is not a halt --
+         * keep going so the next iteration can intervene. */
+        if (ran < chunk && !(m->cpu.brk_pc && m->cpu.pc == m->cpu.brk_pc))
             break;
     }
     return done;

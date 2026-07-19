@@ -621,6 +621,7 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
     uint64_t i;
     for (i = 0; i < n; i++) {
         if (c->halted) break;
+        if (c->brk_pc && c->pc == c->brk_pc) break;   /* stop AT the bp, don't execute it */
         if (step(c)) break;
     }
     return i;

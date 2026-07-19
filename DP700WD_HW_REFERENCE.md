@@ -2563,3 +2563,44 @@ periodic timer message that a live system posts), and post *that* — then the
 screensaver fires on its own. The mechanism is now not just diagnosed but
 **experimentally validated**: the pathway from a dead boot to a live, cycling event
 loop is intact and revivable with one poke.
+
+### 10.52 LAST MILE — OSDSS is a monitor-table entry dispatched on EVENT BIT 0x80
+
+**How OSDSS_Monitor is invoked (the missing link).** It has no direct caller and its
+address is never a flash constant because it lives in a **runtime-built monitor
+table**. Searching the snapshot's DRAM for the pointer `0x000591b4` found it at
+exactly one place: **`0x40020e18`**. The table (base `0x40020dd0`) is an array of
+`{handler, param, event_mask}` triplets:
+
+```
+0x40020dd0 {0x00048de8, 0xffff, 0x001}    0x40020e0c {0x000454d4, 0xffff, 0x020}
+0x40020ddc {0x00013338, 0xffff, 0x002}    0x40020e18 {0x000591b4, 0xffff, 0x080} <-OSDSS
+0x40020de8 {0x00013acc, 0xffff, 0x004}    0x40020e24 {0x000a34b8, 0,      0x080}
+0x40020df4 {0x0004283c, 0xffff, 0x008}    0x40020e30 {0x00048e04, 0,      0x200}
+0x40020e00 {0x00009e58, 0xffff, 0x010}    0x40020e3c {0x0005dfe8, 0,      0x400} ...
+```
+
+So **`OSDSS_Monitor` is registered on event bit `0x80`** — it runs when event 0x80 is
+dispatched. This matches the `EvtDispatch_bit80 @0x6eec` / `PostEvent->list @0x12f10`
+functions (0x6eec explicitly sets/clears bit 0x80 — `mov -129,%o1` = `~0x80` — on the
+event flag `0x40026ea4`). **The complete autonomous trigger is now known end to end:**
+`event 0x80 posted → dispatcher walks table 0x40020dd0 → OSDSS_Monitor(0x591b4) →
+(idle > 0xe260 ticks, §10.47) → OSDSS_Entry(0x59108)`.
+
+**OSDSS_Entry runs under the live scheduler (what `machine_call` never could).**
+Injected `OSDSS_Entry` via the stub (traps ON, scheduler live): it **executed** —
+`_bOSDSSScreenSaverMode 0x400239c4` flipped `0→1` (screensaver mode entered) and it
+reached **`_OSDSS_PictureUpdate 0x59004`**. It then halted at `0x4001e000` (scheduler)
+before the decode, because injecting sleep-heavy code into the *idle* thread's context
+corrupts its shallow window/stack state. So the entry logic is proven live; a robust
+full decode needs the call to run in a real thread's context (the CC thread), i.e.
+driven by the natural event-0x80 dispatch rather than injected into idle.
+
+**Net — final boss, fully reduced.** Every stage of the autonomous screensaver is now
+either proven to run or pinpointed: revive the CC loop (post to mbox `0x40033830`,
+§10.51) → post **event 0x80** so the monitor table dispatches `OSDSS_Monitor` → with
+the fast tick (§10.46) idle passes `0xe260` → `OSDSS_Entry` (proven to enter
+screensaver mode) → `_OSDSS_PictureUpdate` → `UTL_ShowJPEG_Slide` decode (§10.41, the
+same path that already renders all 5 album photos). The one remaining engineering
+task is orchestration: post event 0x80 in the live CC-thread context (not injected
+into idle) and advance the clock — no unknowns remain in the path, only wiring.

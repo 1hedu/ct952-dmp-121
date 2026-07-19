@@ -2301,3 +2301,39 @@ in `SUPPORT_ENCODE_JPG_PICTURE` mode sets source=SOURCE_SPI and calls
 emulation, so the natural trigger must be forced (force `__bMMJPGEncodeNum=5` +
 short-circuit the idle-timeout compare / call OSDSS_Entry). Addresses under
 investigation. Diagnostics: `CT952_STAGE_PHOTO` (renders any album photo now).
+
+### 10.45 Faithful screensaver trigger — gates satisfied, but blocked by scheduler + event-starvation
+
+Cross-verified the built-in JPEG-screensaver playback path and its gates (retail
+addrs, from `dp700wd.bin`, NOT the SDK sym which mismatches):
+`OSDSS_Entry 0x59108`, `_OSDSS_PictureUpdate 0x59004`, `OSDSS_Monitor 0x591b4`,
+`_OSDSS_Move 0x59474`, `UTL_PlayItem 0x5b964`, `MM_EncodeFile_Init 0x29864`,
+`SrcFilter_ReadSectors 0x5a3d4`. DRAM: `__bMMJPGEncodeNum 0x40032b3b=**5**`,
+`__bOSDSSPicIdx 0x400239cc`, `_bOSDSSScreenSaverMode 0x400239c4`,
+`__dwOSDSSCheckTime 0x400239b8=0xFFFFFFFF`, `__bPOWERONMENUInitial 0x40023a10=0`.
+
+**Three of four gates already satisfied:** `MM_EncodeFile_Init` ran the fresh-init
+branch → `__bMMJPGEncodeNum=5` and the file list {1,2,3,4,END} is built; the
+`SOURCE_SPI` read auto-resolves to **flash 0x160000 + idx*0x10000** (SrcFilter SPI
+case at 0x5a404, `SRCFTR_SPI_ENCODE_ADDR=0x160000`) — no SPI-HW modeling needed,
+the flash is already memory-mapped; decode is handled by `CT952_VDEC_DONE` +
+scan-out by §10.42.
+
+**The blocker: screensaver ENTRY never fires, and can't be shortcut.**
+- Natural: `OSDSS_Monitor` (CC main loop, cc.c:1004) is never reached —
+  `__dwOSDSSCheckTime` stays 0xFFFFFFFF (its first-init never ran),
+  `__bPOWERONMENUInitial` stays 0 (POWERONMENU_Initial doesn't complete),
+  `__dwTimeNow` stays 0 (tick base not advancing). Same **event-starvation** class
+  that has gated this boot throughout — the CC idle loop isn't fully alive.
+- Forced via `machine_call(OSDSS_Entry/_OSDSS_PictureUpdate)`: **HALTS** with
+  `trap 0x06 (window_underflow) at pc=0x4001e52c` (the eCos scheduler). The play
+  path makes a blocking OS call (OS_DelayTime/semaphore) that enters the scheduler
+  for a context switch — impossible inside the isolated, trap-off, single-thread
+  `machine_call` context. So `machine_call` fundamentally can't run
+  scheduler-dependent firmware.
+
+**Net:** the firmware's decode+display pipeline renders all 5 real album photos
+(from the real flash addresses, via `CT952_STAGE_PHOTO`, §10.43-44); the fully
+autonomous screensaver cycle needs the deep event-starvation fix (make the system
+tick + CC idle loop live) — the true remaining frontier, and the same root as
+§10.24/10.39. That fix would also complete the natural boot.

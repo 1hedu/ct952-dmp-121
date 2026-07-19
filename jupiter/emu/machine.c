@@ -611,6 +611,17 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             if (vi < 0) vi = getenv("CT952_VDEC_IDLE") ? 1 : 0;
             if (vi && addr == 0x40039f24u) return 1;   /* gate 2: ==1 */
         }
+        /* No-media model (CT952_NOMEDIA): stand in for the USBSRC worker
+         * thread, which never runs in the emulator (it would block in the
+         * opaque usb.a/card.a HW init). The firmware's media-detect loop
+         * (_MEDIA_MonitorMediaStatus, media.c:1489) gates on the USB source
+         * thread having initialised: USBSRC_TriggerCmd requires
+         * __fThreadInit & INIT_SRC_THREAD_USB_DONE (0x80000). Present that bit
+         * as set on every read of __fThreadInit (0x4003e590) so the trigger
+         * path runs; the CHECK_DEVICE handshake completion is modelled on the
+         * write side. See DP700WD_HW_REFERENCE.md 10.17. */
+        if (m->nomedia && addr == 0x4003e590u && size == 4)
+            return mem_read_raw(m->dram + (addr - 0x40000000u), 4) | 0x00080000u;
         return mem_read_raw(m->dram + (addr - 0x40000000u), size);
     }
     if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)
@@ -757,6 +768,23 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
+        /* No-media model (CT952_NOMEDIA): emulate the USBSRC worker completing
+         * a CHECK_DEVICE command with a "no removable media" verdict. The
+         * firmware sets bit CHECK_DEVICE(0x1) in _fUSBSRCCmdd (0x4003f540) via
+         * OS_SetFlag; the real worker thread would then run USB_CheckConnect,
+         * set _bUSBSRCState, post the status flag and clear the command. We do
+         * that here so the media-detect loop sees SRCFTR_USB_STATE_NO_MEDIA and
+         * falls through to POWERONMENU_Initial / MM_PlayPhotoInFlash. */
+        if (m->nomedia && addr == 0x4003f540u &&
+            (mem_read_raw(m->dram + 0x3f540u, 4) & 0x1u)) {
+            mem_write_raw(m->dram + 0x3f510u, 1, 1);       /* _bUSBSRCState = NO_MEDIA */
+            mem_write_raw(m->dram + 0x3f514u,              /* _fUSBSRCCmddStatus |= CHECK_DEVICE */
+                          mem_read_raw(m->dram + 0x3f514u, 4) | 0x1u, 4);
+            mem_write_raw(m->dram + 0x3f540u,              /* _fUSBSRCCmdd &= ~CHECK_DEVICE */
+                          mem_read_raw(m->dram + 0x3f540u, 4) & ~0x1u, 4);
+            mem_write_raw(m->dram + 0x3f524u,              /* _fUSBSRCCmddRunning &= ~CHECK_DEVICE */
+                          mem_read_raw(m->dram + 0x3f524u, 4) & ~0x1u, 4);
+        }
         return;
     }
     if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE) {
@@ -938,6 +966,7 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     m->bus2.irq_ack = bus2_irq_ack;
     m->proc2_enable = getenv("CT952_PROC2") ? 1 : 0;
     m->proc2_on = 0;
+    m->nomedia = getenv("CT952_NOMEDIA") ? 1 : 0;
     /* Decoder-stop dwell (cycles). Default sized to span a boot-thread poll
      * interval (~2 eCos ticks) so the MODE_STOP(0x10) window is visible before
      * the ack to STOPPED(0x11); tunable for bring-up. */
@@ -1038,12 +1067,107 @@ void machine_free(machine_t *m)
     m->rx_buf = NULL;
 }
 
+/* Env-gated PC sampler (CT952_PCSAMP=threshold): after `threshold` icount,
+ * sample the CPU pc once per run chunk into an open-addressed histogram and
+ * dump the hottest PCs at exit -- pinpoints the spin loop a boot gate rides. */
+#define PCSAMP_N 8192
+static uint32_t g_pcsamp_pc[PCSAMP_N], g_pcsamp_ct[PCSAMP_N];
+static uint32_t g_spsamp_sp[256], g_spsamp_ct[256];
+static uint64_t g_pcsamp_thresh = 0;
+static int g_pcsamp_on = -1;
+static void pcsamp_dump(void)
+{
+    int i, j, top = 20;
+    fprintf(stderr, "[PCSAMP] top %d hot PCs (sampled per chunk past icount %llu):\n",
+            top, (unsigned long long)g_pcsamp_thresh);
+    for (j = 0; j < top; j++) {
+        int best = -1; uint32_t bc = 0;
+        for (i = 0; i < PCSAMP_N; i++)
+            if (g_pcsamp_ct[i] > bc) { bc = g_pcsamp_ct[i]; best = i; }
+        if (best < 0 || !bc) break;
+        fprintf(stderr, "  pc=%08x  %u\n", g_pcsamp_pc[best], bc);
+        g_pcsamp_ct[best] = 0;
+    }
+    fprintf(stderr, "[PCSAMP] stack (sp&~0xfff) buckets:\n");
+    for (j = 0; j < 12; j++) {
+        int best = -1; uint32_t bc = 0;
+        for (i = 0; i < 256; i++)
+            if (g_spsamp_ct[i] > bc) { bc = g_spsamp_ct[i]; best = i; }
+        if (best < 0 || !bc) break;
+        fprintf(stderr, "  sp~%08x  %u\n", g_spsamp_sp[best], bc);
+        g_spsamp_ct[best] = 0;
+    }
+}
+static void spsamp_hit(uint32_t sp)
+{
+    uint32_t bucket = sp & 0xFFFFF000u;   /* page-granular stack bucket */
+    uint32_t h = (bucket >> 12) & 0xFF, i;
+    for (i = 0; i < 256; i++) {
+        uint32_t k = (h + i) & 0xFF;
+        if (g_spsamp_ct[k] == 0) { g_spsamp_sp[k] = bucket; g_spsamp_ct[k] = 1; return; }
+        if (g_spsamp_sp[k] == bucket) { g_spsamp_ct[k]++; return; }
+    }
+}
+static void pcsamp_hit(uint32_t pc)
+{
+    uint32_t h = (pc * 2654435761u) & (PCSAMP_N - 1), i;
+    for (i = 0; i < PCSAMP_N; i++) {
+        uint32_t k = (h + i) & (PCSAMP_N - 1);
+        if (g_pcsamp_ct[k] == 0) { g_pcsamp_pc[k] = pc; g_pcsamp_ct[k] = 1; return; }
+        if (g_pcsamp_pc[k] == pc) { g_pcsamp_ct[k]++; return; }
+    }
+}
+
 uint64_t machine_run(machine_t *m, uint64_t n)
 {
     uint64_t done = 0;
+    if (g_pcsamp_on < 0) {
+        const char *e = getenv("CT952_PCSAMP");
+        g_pcsamp_on = e ? 1 : 0;
+        if (e) { g_pcsamp_thresh = strtoull(e, NULL, 0); atexit(pcsamp_dump); }
+    }
+    static int g_reach = -1;
+    if (g_reach < 0) g_reach = getenv("CT952_REACH") ? 1 : 0;
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
         uint64_t chunk = n - done;
         uint64_t ran, i;
+        if (g_reach) {
+            static const struct { uint32_t pc; const char *name; } wl[] = {
+                {0x0000eb90u,"INITIAL_System(F)"}, {0x0000f6f8u,"ShowFirstLOGO(F)"},
+                {0x0004b808u,"POWERONMENU_Initial(F)"}, {0x00002014u,"CC_DVD_MainLoop(F)"},
+                {0x00002318u,"Thread_CTKDVD(F)"}, {0x0001152cu,"MEDIA_Management(F)"},
+                {0x0001186cu,"MEDIA_MonitorStatus(F)"}, {0x000118b8u,"_MEDIA_MonitorMediaStatus(F)"},
+                {0x4000eb90u,"INITIAL_System(D)"}, {0x4004b808u,"POWERONMENU_Initial(D)"},
+                {0x40002014u,"CC_DVD_MainLoop(D)"}, {0x4001186cu,"MEDIA_MonitorStatus(D)"},
+                {0x400118b8u,"_MEDIA_MonitorMediaStatus(D)"}, {0x4001152cu,"MEDIA_Management(D)"},
+            };
+            static uint8_t hit[14];
+            int wi;
+            for (wi = 0; wi < 14; wi++)
+                if (!hit[wi] && m->cpu.pc == wl[wi].pc) {
+                    hit[wi] = 1;
+                    fprintf(stderr, "[REACH] %-26s pc=%08x icount=%llu\n",
+                            wl[wi].name, wl[wi].pc, (unsigned long long)m->cpu.icount);
+                }
+            chunk = 1;   /* single-step so every function entry is observed */
+        }
+        if (g_pcsamp_on && m->cpu.icount > g_pcsamp_thresh) {
+            uint32_t sp = sparc_get_reg(&m->cpu, 14);
+            static uint32_t spfilt = 0xFFFFFFFFu;
+            if (spfilt == 0xFFFFFFFFu) {
+                const char *e = getenv("CT952_PCSAMP_SP");
+                spfilt = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
+            }
+            spsamp_hit(sp);
+            if (!spfilt || (sp & 0xFFFFF000u) == (spfilt & 0xFFFFF000u)) {
+                uint32_t pc = m->cpu.pc;
+                /* When the boot thread sits in memcpy (flash 0xd3900..0xd39a4),
+                 * sample the return address (%o7) instead so we see the CALLER. */
+                if (getenv("CT952_PCSAMP_O7") && pc >= 0xd3900u && pc <= 0xd39a4u)
+                    pc = sparc_get_reg(&m->cpu, 15);
+                pcsamp_hit(pc);
+            }
+        }
         /* Faithful panel-config build (opt-in): at the first fetch of the
          * config thunk (flash 0x3d564), run the firmware's own descriptor
          * builder (0x3ce60) on the live machine -- it reads the real SETD

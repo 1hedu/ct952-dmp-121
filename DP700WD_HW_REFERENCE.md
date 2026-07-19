@@ -1172,3 +1172,78 @@ white text (index 3) on a blue highlight box (index 2, `x 200..303 y 3..18`) on
 black (index 0), and **nothing outside that box** (histogram: only indices
 0/2/3). Matches the real device. Render with the faithful palette (0=black,
 2=blue `(28,104,164)`, 3=white) since the firmware hasn't loaded `GAM_OSD` yet.
+
+### 10.17 The media-detect "no media" gate — mechanics, model, and the real blocker
+
+Goal: get past `"Loading"` to the built-in slideshow. `"Loading . . ."` is drawn
+by `_OSDND_ShowWaitingState` (`osdnd.c:2206`) whenever the OSD upper-right
+message state `_bOSDNDMsg == MSG_WAITING`; the animated dots come from
+`_bWaitingCnt` cycling 1→3. A separate OSD-render thread repaints it every tick
+(the glyphs are copied via an unrolled `memcpy` at flash `0xd38b4`, called from
+the font path at flash `0x3259c` — `sll #6` = ×64-byte glyph).
+
+**The intended exit path (source-traced).** In the main loop,
+`MEDIA_MonitorStatus`→`_MEDIA_MonitorMediaStatus` (`media.c:1384`) runs the
+removable-media scan (`media.c:1489`):
+```
+if (SrcFilter_TriggerUSBSRCCmd(FLAG_CMD, CHECK_DEVICE)) _bTriggerCmd1 = TRUE;
+if (_bTriggerCmd1 && SrcFilter_PeekUSBSRCCmd(FLAG_STATUS, CHECK_DEVICE)) {
+    ... if (SrcFilter_GetStatus(SOURCE_USB0_0) == SRCFTR_USB_STATE_NO_MEDIA)
+        ... else { MEDIA_ExitUSBSRC(); POWERONMENU_Initial(); }   // media.c:1575-77
+        //  (retail with SUPPORT_PLAY_MEDIA_DIRECTLY_POWER_ON: MM_PlayPhotoInFlash())
+}
+```
+The handshake is entirely eCos `cyg_flag_t` bits, driven by the `USBSRC_Thread`
+worker (`usbsrc.c:252`). Verified symbol/const map (data symbols are absolute
+DRAM; the flag *value* is the first word of each `cyg_flag_t`):
+
+| symbol | addr | note |
+|---|---|---|
+| `__fThreadInit` | `0x4003e590` | `INIT_SRC_THREAD_USB_DONE = 0x00080000` |
+| `_bUSBSRCState` | `0x4003f510` | byte; `NO_MEDIA = 1` (`USBSRC_STATE_NO_MEDIA`=`SRCFTR_USB_STATE_NO_MEDIA`) |
+| `_fUSBSRCCmddStatus` | `0x4003f514` | worker→FW status flag |
+| `_fUSBSRCCmddRunning` | `0x4003f524` | in-progress flag |
+| `_fUSBSRCCmdd` | `0x4003f540` | FW→worker command flag; `CHECK_DEVICE = 0x1` |
+| `_bMediaInitUSB` | `0x40028aa5` | byte; set once `_MEDIA_MonitorMediaStatus` inits |
+| `__bMediaRegCnt` | (init `2`) | NO_MEDIA rounds before exit (decrements per round) |
+
+`SrcFilter_TriggerUSBSRCCmd` returns FALSE unless
+`OS_PeekFlag(&__fThreadInit) & USB_DONE`; the worker sets `USB_DONE` on its very
+first line, then on each `CHECK_DEVICE` posts `_fUSBSRCCmddStatus|=1`, sets
+`_bUSBSRCState`, clears `_fUSBSRCCmdd`/`Running`. In the emulator the worker
+never runs (it blocks in the opaque `usb.a`/`card.a` HW init — `USB_HCInit`,
+`CARD_InitCard`).
+
+**No-media model implemented (`CT952_NOMEDIA`, `machine.c`).** Stands in for the
+worker at the memory level: reads of `__fThreadInit` return the value OR'd with
+`USB_DONE`; on any FW write that sets `CHECK_DEVICE` in `_fUSBSRCCmdd`, set
+`_bUSBSRCState=NO_MEDIA`, `_fUSBSRCCmddStatus|=CHECK_DEVICE`, clear
+`_fUSBSRCCmdd`/`Running`. This is correct **once the FW reaches the scan**, but…
+
+**Key finding — the real blocker is EARLIER than media-detect.** After a 120M-
+instruction run with `CT952_NOMEDIA=1`, every media data symbol above is still
+**zero** (`_bMediaInitUSB=0`, `_fUSBSRCCmdd=0`, `_bUSBSRCState=0`), i.e.
+`_MEDIA_MonitorMediaStatus` never executed and the model never engaged. A PC
+sampler (`CT952_PCSAMP=<icount>`, with `_SP`/`_O7` filters) shows the two live
+threads are both OSD **redraw** (`OSD_Output` @ DRAM `0x4001d66c`,
+`OSD_SetBufferModeInfo` @ `0x4001f3a8`, glyph `memcpy`); no thread is hot in a
+media/decoder poll. So the CC/boot thread is **blocked in `INITIAL_System`
+before the main loop** — the `"Loading"` here is an init-time `MSG_WAITING`, not
+the media-scan one. The `CT952_TEST_MIRROR10` unblock (§10.15) cleared one
+`INITIAL_PowerONStatus` poll; a **subsequent init gate** is the current wall.
+
+**Open puzzle — the ROMV run-address mapping.** A `CT952_REACH` one-shot PC trap
+watching both `sym` (flash-XIP) and `sym+0x40000000` (DRAM) for the boot
+functions caught only spurious early flash hits (`0x2014`), NOT `INITIAL_System`
+/ `MEDIA_*` / `POWERONMENU_Initial` at either address over 40M instr. TEXT
+(`sym ≥ 0x1d000`) demonstrably runs from DRAM at `sym+0x40000000` (OSD confirmed);
+ROMV (`sym < 0x1d000`) execution address is **not** a clean `+0x40000000` and is
+still unresolved — needed before the init gate can be trapped by name. Next step:
+find the CC/boot thread's *blocked* saved-PC (eCos thread stack) rather than
+sampling only running threads, and resolve the ROMV symbol→run mapping.
+
+**Diagnostic tooling added (all env-gated, zero cost when off):**
+`CT952_PCSAMP=<icount>` (per-chunk hot-PC histogram + stack-page buckets; with
+`CT952_PCSAMP_SP=<base>` to isolate one thread and `CT952_PCSAMP_O7=1` to sample
+the memcpy caller), and `CT952_REACH=1` (single-steps and prints the first hit of
+each watched boot function). `CT952_NOMEDIA=1` is the no-media model above.

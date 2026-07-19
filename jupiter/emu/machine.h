@@ -129,6 +129,10 @@ typedef struct machine {
      * list would have run before the apply callback. */
     int build_panelcfg, panelcfg_built;
 
+    /* No-media model: stand in for the USBSRC worker thread so the firmware's
+     * media-detect loop resolves to "no removable media" (env CT952_NOMEDIA). */
+    int nomedia;
+
     /* GPU 2-D engine op accounting + font-index queue */
     uint64_t gpu_ops, gpu_font_ops, gpu_mode_ops[8];
     uint16_t gpu_fontq[1024];

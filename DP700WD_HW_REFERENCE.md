@@ -3428,3 +3428,49 @@ truths, to be settled next:
 Next step: trace mode 8's return-1 path (`0x27344`→`0x2743c`/`0x69d48`) live — is it starting
 playback of a built-in volume, and if so where does it stall? That distinguishes (1) vs (2).
 Diag: `CT952_UITRACE` now also logs `0x40032b3b` / `0x40032b0d`.
+
+### 12.16 The retail OSD UI-mode table — full map (empirically derived)
+
+The retail OSD framework dispatches UI modes through a **runtime handler table**, not the
+`osd.c` switch in the SDK source (that `osd.c` does not match this build). Mechanism:
+
+- Table of 0x20-byte records at **`0x40024c20 … 0x40024e00`**; record layout
+  `{ id(mode), +4 enter, +8 exit, +c shared/common, +14 key/draw, … }`.
+- **`OSD_ChangeUI(mode, action)` = `0xafd8`** → lookup **`0xae50`** scans the table for
+  `record[0]==mode`, returns the record; `OSD_ChangeUI` calls the **enter handler at
+  `record+4`**. It **returns 0 (declines) if the active-UI latch `0x40020ec8` is already
+  non-zero** (§12.14), else enters the mode and latches.
+- The active mode pointer is **`0x40020ec8`** (§12.14); the current-mode getter is `0xb090`.
+
+**⚠️ The retail mode numbers are NOT `osd.h`'s.** `osd.h` (`POWERON_MENU=17`,`DIGEST=7`) is a
+different SDK. Proven: mode **7**'s enter handler `0x61cf8` is the only writer of
+`__bPOWERONMENUInitial` (`0x40023a10`), which is read by **`OSDSS_Monitor` (`0x591b4`)** as
+the screensaver gate — so **retail mode 7 = POWERON_MENU**, not DIGEST. `osd.h` happens to
+match at a few ids (8, 11) but must not be trusted for numbering.
+
+**The map** (id · enter handler · module · identity / evidence · confidence):
+
+| mode | enter  | module | identity — evidence | conf |
+|------|--------|--------|---------------------|------|
+| 0x06 |0x65494 | menu 0x6x | **Video/LOGO display UI** — "Can't find LOGO data", "MPEG thread not initial done" | med |
+| 0x07 |0x61cf8 | menu 0x6x | **POWERON_MENU** — sets `__bPOWERONMENUInitial`, read by `OSDSS_Monitor`; "Stop playback / Show LOGO / ShowUI" | **HIGH** |
+| 0x08 |0x25ef4 | media 0x25x| **MEDIA / SOURCE-SELECT** — scans USB/SD, "usb no playable file"/"no SD card", `KH_COMMON_QueryIfExistPlayableFile`; **the boot latches here** (§12.15) | **HIGH** |
+| 0x09 |0x26294 | media 0x26x| media-family sub-dialog (shares common handler +c=`0x25e34` with 8/10/12) | low |
+| 0x0a |0x2646c | media 0x26x| media-family sub-dialog (shares +c=`0x25e34`) | low |
+| 0x0b |0x26638 | media 0x26x| **AUTO_UPGRADE / firmware update** — references **`UPG952A.AP`**, File-Manager multivolume | med-HIGH |
+| 0x0c |0x26070 | media 0x26x| media-select **variant** — shares exit(+8=`0x260f4`) & key(+14=`0x2620c`) handlers with mode 8 | med |
+| 0x0d |0x1f484 | 0x1fx | **THUMBNAIL browser** — "THUMB: trigger -> START stage" | med |
+| 0x0e |0x67c28 | menu 0x6x | menu/dialog (poweron-menu module) | low |
+| 0x0f |0x09908 | dlg 0x9x | menu/dialog | low |
+| 0x10 |0x03564 | dlg 0x3x | menu/dialog | low |
+| 0x11 |0x0ff6c | dlg 0xffx | menu/dialog (NOT poweron — see mode 7) | low |
+| 0x12 |0x048c0 | dlg 0x4x | menu/dialog | low |
+| 0x1f |0x41154 | player 0x41x| **MEDIA PLAYER / playback** — `Dec_JPEG`,`Dec_BMP`,`Parser`,`USBSRC`,`/ROOT`,`fatfs` (the JPEG/BMP renderer — the built-in-photo play path) | med-HIGH |
+
+**Boot-relevant reading:** on the faithful boot the UI walks NONE → **mode 8** (media-select)
+and latches (§12.15), so **mode 7 (POWERON_MENU)** never runs and the screensaver never arms.
+**Mode 0x1f** is the actual JPEG/BMP player — the through-line for rendering the built-in
+photo album once the media path yields to it. Modes 8–12 are one media/source family (shared
+handlers); the low-address dialogs (0x0f/0x10/0x11/0x12) and menu-module 0x06/0x0e are the
+remaining unnamed UIs — precise names need the retail `osd.c` (absent from the tree) or live
+per-mode observation via `CT952_UITRACE`.

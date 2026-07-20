@@ -641,7 +641,7 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
     for (i = 0; i < n; i++) {
         if (c->halted) break;
         if (c->brk_pc && c->pc == c->brk_pc) break;   /* stop AT the bp, don't execute it */
-        if (mbt && c->pc == 0x5969cu && c->icount > 25000000ull && mbtn < 4000) {
+        if (mbt && c->pc == 0x5969cu && c->icount > 34000000ull && mbtn < 2000) {
             mbtn++;
             fprintf(stderr, "[MBOX] get caller o7=%08x arg o0=%08x icount=%llu\n",
                     sparc_get_reg(c, 15), sparc_get_reg(c, 8),

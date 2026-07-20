@@ -921,6 +921,10 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             if (pr && addr == 0x40022F5Eu && size == 1 && m->cpu.icount > 30000000ull)
                 return 2;
         }
+        /* (CT952_THREADSDONE probe removed §12.32: NEGATIVE -- OR-ing the missing
+         * MPEG(0x1)+InfoFilter(0x200) thread-done bits into __fThreadInit
+         * 0x40038f80 does not advance the boot; the 0x418f0 thread-sync wait is
+         * timed and already proceeds, so those bits are not the page-8 park.) */
         /* (CT952_FORCEADV probe removed §12.29: proven inert -- forcing the
          * page-8 guard VarB=1 does not advance, because by the time a photo has
          * decoded the page-8 enter handler has already latched/returned; the

@@ -3945,3 +3945,21 @@ Verified anchors: `VarB 0x40022f81`; setter `0x237dc`(@`0x2384c`); event-proc `0
 (bail bit `0x4002fb52`&0x400, buffer `[0x400328b8]`); dispatch gates `0x40022f61`/`0x40022f63`;
 stage handlers `0x1f378`/`0x27454`/`0x2743c` (mode-table, indirect); event-buffer init
 `0x1f634`@`0x1f6f4` ← `0x2374c`@`0x23750` ← `0x24ec8`.
+
+### 12.32 Faithful-target session: INITIAL_PowerONStatus mapped; four levers tested NEGATIVE; honest frontier
+
+Pursued the faithful target (make the boot advance to POWERONMENU → OSDSS screensaver on its own). Mapped `INITIAL_PowerONStatus` (`0x418f0`) and tested every concrete lever the trace suggested. All negative — recorded so they're not re-tried.
+
+**`INITIAL_PowerONStatus 0x418f0` structure (verified):**
+- Thread-sync wait (`0x59654`, **timed**, timeout 0x19) on `__fThreadInit 0x40038f80` for pattern `0x301` = `INIT_DEC_THREAD_MPEG_DONE(0x1)` | `INIT_PARSER_THREAD_DONE(0x100)` | `INIT_INFO_FILTER_THREAD_DONE(0x200)`. Live value at park = `0x00080102` = JPEG-thread(0x2)+Parser(0x100)+USB-src(0x80000) done; **MPEG(0x1) and Info-Filter(0x200) never set.** But the wait is timed and **proceeds anyway** — not a hard block.
+- Hang trap at `0x41a04` (`b 0x41a04`) reached only if `0x5972c()` returns 0; it returns non-zero here, so the boot passes. Then a long linear init (`0x29864`/`0x36654`/`0x65b58`/`0x41efc`/`0x3fccc`/`0x5abb4`...) → `0x41b34` `ChangePage(8)` → **parks** in the page-8 stage (§12 agent C), waiting for `VarB (0x40022f81)`, which needs a delivered event.
+
+**Thread facts (corrects §10.40's "USBSRC worker parked"):** the USB source thread **IS** initialized (`INIT_SRC_THREAD_USB_DONE 0x80000` SET). The threads that never signal done are the **MPEG decoder (0x1)** and **Info Filter (0x200)** threads. `INFOFILTER_Thread` is **precompiled** (declared `infofilter.h:1033`, no source `.c`; nothing in-source sets `INIT_INFO_FILTER_THREAD_DONE`), so its done-flag is set inside the precompiled body, which never reaches that point — i.e. it is blocked in unmodeled HW init.
+
+**Four levers, all NEGATIVE this session:**
+1. `CT952_DECIRQ` — raise+unmask the decoder/BIU PROC1-2nd IRQs on JPU completion (§12.29). No advance.
+2. `CT952_FORCEADV` — force page-8 guard `VarB=1` (§12.29). No advance (page-8 already latched by then).
+3. Higher `TICK_MULT` (1024/4096) — breaks the boot before mode 8 (§12.30). Not a time issue.
+4. `CT952_THREADSDONE` — OR the missing MPEG(0x1)+InfoFilter(0x200) done-bits into `0x40038f80`. No advance (the wait is timed; not the gate).
+
+**Honest frontier.** The page-8 park is event-starvation: it advances only when an event message is delivered to set `VarB`, and no event is produced at idle boot. The full consumer chain is mapped (§12.31); the missing piece is the **producer** — and every proxy for it (decode IRQ, thread-done, forced guard) is negative, meaning the real producer is a specific media/parse event whose source thread (**Info Filter**, precompiled) is blocked in HW the emulator doesn't model. Cracking it requires reverse-engineering the precompiled `INFOFILTER_Thread`/MPEG-thread bodies from the binary to find the exact HW register(s) they poll during init, and modeling those — genuine multi-session hardware-bring-up work, not a single flag. This is the same deep event-starvation core the doc has circled since §10.40; it is now bounded to "the precompiled Info-Filter/decoder threads' unmodeled init HW," with the entire downstream consumer chain proven and ready.

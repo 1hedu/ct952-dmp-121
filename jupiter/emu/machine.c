@@ -321,13 +321,14 @@ static uint32_t io_read(machine_t *m, uint32_t off)
         }
         log_access(m, 0x80000c10u, 0, 0);
         return io_get(m, 0xc10);
-    case 0x407C:
+    case 0x407C: {
         /* ADCGLB: analog key-matrix ADC (panel.c PANEL_KeyScan reads bits
          * [31:24] as the key voltage). No key pressed => high rail (~0xFF).
-         * Returning 0 read as a pressed key -> a phantom KEY_DOWN every scan,
-         * which reset the screensaver idle timer and spammed the UI. Report
-         * "no key" (0xFF in the result byte). */
-        return 0xFF000000u;
+         * Returning 0 reads as a pressed key. CT952_ADC overrides for A/B
+         * verification (e.g. =0x00000000 reproduces the unmodeled behavior). */
+        const char *e = getenv("CT952_ADC");
+        return e ? (uint32_t)strtoul(e, NULL, 0) : 0xFF000000u;
+    }
     default:
         log_access(m, 0x80000000u + off, 0, 0);
         return io_get(m, off);

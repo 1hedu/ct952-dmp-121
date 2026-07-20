@@ -632,9 +632,21 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
     };
     static uint16_t hit[8];
     if (pchit < 0) pchit = getenv("CT952_PCHIT") ? 1 : 0;
+    /* mbox-get caller trace (CT952_MBOXTRACE): log every call to the generic
+     * mbox-get wrapper 0x5969c with its caller-site (%o7) and object arg (%o0),
+     * past the park window. The FINAL non-returning get names the CC_DVD_MainLoop
+     * poll-call that blocks (§12.46). */
+    static int mbt = -1; static uint32_t mbtn = 0;
+    if (mbt < 0) mbt = getenv("CT952_MBOXTRACE") ? 1 : 0;
     for (i = 0; i < n; i++) {
         if (c->halted) break;
         if (c->brk_pc && c->pc == c->brk_pc) break;   /* stop AT the bp, don't execute it */
+        if (mbt && c->pc == 0x5969cu && c->icount > 25000000ull && mbtn < 4000) {
+            mbtn++;
+            fprintf(stderr, "[MBOX] get caller o7=%08x arg o0=%08x icount=%llu\n",
+                    sparc_get_reg(c, 15), sparc_get_reg(c, 8),
+                    (unsigned long long)c->icount);
+        }
         if (pchit) {
             uint32_t pc = c->pc;
             for (unsigned k = 0; k < sizeof(WL)/sizeof(WL[0]); k++)

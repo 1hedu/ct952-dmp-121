@@ -3281,3 +3281,55 @@ histogram (`CT952_PCSAMP_WIN=<icount>`, default 200M) that prints the live hot l
 window and resets, so a long run the sandbox kills before the atexit `pcsamp_dump` still
 leaves the current spin in its log. `jupiter/emu/seg.sh` chains `--restore/--run-to/--snapshot`
 to advance the boot in sandbox-sized segments when continuous long runs are throttled.
+
+### 12.13 Re-measured the faithful boot — `__bPOWERONMENUInitial` is the shared root gate
+
+With the JPU decode now faithful (§12.12) + EHCI + ADC, re-measured the actual gate
+flags in the CURRENT boot (new `CT952_DUMPFLAGS` diag in main.c; snapshot-chained via
+`seg.sh` to dodge the sandbox's long-run throttle). Per §11.7's own lesson — verify
+against the running target, not a stale dump — this **supersedes** the pre-EHCI reads.
+
+**Measured across the boot (`dp700wd_ring.bin`, TICK_MULT=64):**
+| icount | `__bPOWERONMENUInitial` 0x40023a10 | `__dwOSDSSCheckTime` 0x400239b8 | `_bOSDSSScreenSaverMode` |
+|--------|-----|-----|-----|
+| 3M  | 0 | 0x00000000 (BSS) | 0 |
+| 20M | 0 | 0xFFFFFFFF (first-init ran) | 0 |
+| 50M | 0 | 0x00001771 (live tick) | 0 |
+| 85M | 0 | 0x000033FE (**advancing**) | 0 |
+
+**Two findings:**
+1. **Progress vs the old wall:** `__dwOSDSSCheckTime` now advances with the system timer
+   (old §10.44 had it stuck at `0xFFFFFFFF`, "first-init never ran"). OSDSS time-tracking
+   is alive in the faithful boot.
+2. **The shared root gate is `__bPOWERONMENUInitial`, which stays 0.** It gates BOTH
+   unsolved walls at once: the menu draw (POWERONMENU only draws once it's set) AND the
+   screensaver (`OSDSS_Monitor` step 5 requires `__bPOWERONMENUInitial != 0`, §10.44).
+   One flag, both symptoms.
+
+**Who sets it — pinned by exhaustive store-scan (not one DRAM dump).** Scanning every
+`stb → [base(0x40023800)+0x210]` in flash finds exactly two writers:
+- `0x61880` (`0x61894`): only **clears** it to 0 (`if(arg==0) __bPOWERONMENUInitial=0`).
+- `0x61cf8` (`0x61d30`): the sole **setter** to 1 —
+  `if(__bPOWERONMENUInitial==0){ 0x61be8(1); 0x61be8(2); __bPOWERONMENUInitial=1;
+  0x4a754(0x11); 0x62080; }`.
+
+**`0x61cf8` has NO direct callers** (call-scan of flash is empty). Its address
+`0x00061cf8` appears exactly once in live DRAM — at `0x40024da4`, inside a runtime handler
+table (records ~`0x40024c20…0x40024de0`, each 0x20 bytes, first word = a UI/mode id,
+handler ptrs following; e.g. id `0xf`=MAIN_MENU→`0x9908`, id `0x11`=POWERON_MENU→`0xff6c`).
+So `0x61cf8` is dispatched indirectly, never by a direct call — and it is never dispatched,
+so the flag is never set. (Note: the SDK whitelist address `0x4b808` labelled
+"POWERONMENU_Initial" is a **mislabel** — it disassembles to mid-loop code, not a function
+entry. Retail symbol addresses must stay empirically derived, per the standing warning.)
+
+**Strong lead (needs live confirmation):** the OSD framework's active-record pointer at
+`0x40020ec8` (adjacent to the §10.52 monitor table) points at the table record for mode
+id **8 = `OSD_UI_MEDIA_SELECT_DLG`** — i.e. the UI is parked in the media-select dialog
+(consistent with "usb no playable file / no SD card"), not transitioned into the
+POWERON_MENU path that would run `0x61cf8` and set the flag. **Next:** find the dispatcher
+that walks this table + who should call `OSD_ChangeUI(OSD_UI_POWERON_MENU)` on the
+no-media boot path, and why the transition out of MEDIA_SELECT_DLG isn't taken — that is
+the door to both the menu and the screensaver.
+
+Tooling added this pass: `CT952_DUMPFLAGS` (main.c) prints the POWERONMENU/OSDSS gate
+flags at a `--run-to` checkpoint; `seg.sh` now dumps them per segment.

@@ -182,6 +182,34 @@ int main(int argc, char **argv)
         fprintf(stderr, "[ct952emu] reached icount=%llu pc=0x%08x\n",
                 (unsigned long long)m->cpu.icount, m->cpu.pc);
     }
+    /* CT952_DUMPFLAGS: print the POWERONMENU / OSDSS screensaver gate flags
+     * (DP700WD_HW_REFERENCE.md 10.44/11.7) so the CURRENT faithful boot's state
+     * can be re-measured (the "=0" reads in 11.7 predate the EHCI/faithful-JPU
+     * work -- verify against the running target, not a stale dump). */
+    if (getenv("CT952_DUMPFLAGS")) {
+        static const struct { uint32_t a; int sz; const char *n; } fl[] = {
+            {0x40023a10u, 1, "__bPOWERONMENUInitial"},
+            {0x400239b8u, 4, "__dwOSDSSCheckTime"},
+            {0x400239c4u, 1, "_bOSDSSScreenSaverMode"},
+            {0x400239c0u, 4, "OSDSS_activity_token"},
+            {0x400239ccu, 1, "__bOSDSSPicIdx"},
+            {0x40026ea4u, 4, "event_flag(0x80 bit)"},
+        };
+        unsigned k;
+        fprintf(stderr, "[DUMPFLAGS] pc=0x%08x icount=%llu\n",
+                m->cpu.pc, (unsigned long long)m->cpu.icount);
+        for (k = 0; k < sizeof(fl)/sizeof(fl[0]); k++) {
+            uint8_t *p = machine_dram_ptr(m, fl[k].a);
+            if (!p) { fprintf(stderr, "  %-24s @%08x  <unmapped>\n", fl[k].n, fl[k].a); continue; }
+            if (fl[k].sz == 1)
+                fprintf(stderr, "  %-24s @%08x = 0x%02x\n", fl[k].n, fl[k].a, p[0]);
+            else {
+                uint32_t v = (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 |
+                             (uint32_t)p[2]<<8 | p[3];
+                fprintf(stderr, "  %-24s @%08x = 0x%08x\n", fl[k].n, fl[k].a, v);
+            }
+        }
+    }
     if (snap_out) {
         if (machine_snapshot(m, snap_out) != 0)
             fprintf(stderr, "[ct952emu] snapshot FAILED to %s\n", snap_out);

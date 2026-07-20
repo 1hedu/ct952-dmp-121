@@ -87,6 +87,14 @@ static void machine_maybe_jpeg_decode(machine_t *m)
     }
     fprintf(stderr, "[ct952emu] JPEG decode #%d: %dx%d from 0x%08x\n",
             m->jpeg_count, w, h, m->jpeg_src);
+    if (getenv("CT952_DECODE_STACK")) {   /* caller chain of this decode (play path) */
+        int k;
+        fprintf(stderr, "  [decode#%d caller PCs] o7=%08x i7=%08x recent:",
+                m->jpeg_count, sparc_get_reg(&m->cpu, 15), sparc_get_reg(&m->cpu, 31));
+        for (k = 40; k < 64; k++)
+            fprintf(stderr, " %08x", m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63]);
+        fprintf(stderr, "\n");
+    }
     /* keep the raster for the scan-out video-plane composite */
     free(m->jpeg_rgb);
     m->jpeg_rgb = rgb;

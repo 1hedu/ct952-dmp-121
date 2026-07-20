@@ -9,7 +9,7 @@ SNAP=seg.snap
 RESTORE="--restore $SNAP"
 [ "$2" = "first" ] && RESTORE=""
 for try in 1 2 3; do
-  env CT952_TICK_MULT=64 CT952_DUMPFLAGS=1 CT952_UITRACE=1 \
+  env CT952_TICK_MULT=64 CT952_DUMPFLAGS=1 CT952_UITRACE=1 CT952_DECODE_STACK=1 \
     ./ct952emu dp700wd_ring.bin $RESTORE --run-to $STEP --snapshot ${SNAP}.new 2>seg.err >/dev/null
   rc=$?
   if [ $rc -eq 0 ] && [ -s ${SNAP}.new ]; then mv ${SNAP}.new $SNAP; break; fi

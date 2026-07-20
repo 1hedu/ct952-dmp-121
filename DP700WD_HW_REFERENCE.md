@@ -3700,3 +3700,34 @@ So the eCos system tick (what `OS_GetSysTimer` counts) is **~1 ms (~1 kHz)**, no
 `OSDSS_ENTER_TIME` = `0xEA60` = **60000 ticks ≈ ~60 s (~1 min; ≤2 min within the prescaler factor-of-2
 uncertainty)** — NOT 10 minutes. The "10 minutes" source comment is from the original SDK's slower
 tick; this 950/952 build's faster tick makes the same tick-count ~1 min. (Corrects §12.21/§12.22.)
+
+### 12.24 The two boot decodes share the LOGO/background display path — no slideshow loop runs
+
+Added `CT952_DECODE_STACK` (machine.c): dumps the caller-PC ring on each JPU decode. Both boot
+decodes share the **identical** caller chain:
+```
+decode #1 (480x270 splash)  and  decode #2 (640x360 album photo):
+  ... 0x595c8 (func 0x595bc) -> 0x6bde8 (HALJPEG decode loop) ,  i7=0x6cc18 (func 0x6cb78)
+```
+So decode #2 (the real album photo, §12.19) is rendered by the **same one-shot display path as the
+splash logo** (`0x6cb78 → 0x595bc → 0x6bde8` = the `UTL_ShowLogo`/HALJPEG single-frame path), NOT
+by a slideshow loop. `UTL_ShowJPEG_Slide` is called once per frame from this path; nothing drives it
+repeatedly. So on boot the firmware shows the splash, then **one** album photo as the background/logo,
+then idles — the *cycling* slideshow (repeated `UTL_ShowJPEG_Slide` on `bPhotoIntervalTime`, driven by
+the thumbnail/OSDSS path) never starts.
+
+**State of the trek (honest checkpoint):**
+- ✅ Faithful JPU decode; the built-in album photo is staged from flash and decoded to the video
+  plane, crutch-free (§12.12/12.19) — RENDER PROVEN.
+- ✅ 5 photos detected faithfully (mode 8 stays, §12.15); the count is real (user-confirmed).
+- ❌ No cycling slideshow: only 2 one-shot decodes (splash + one photo), same LOGO display path;
+  the slideshow driver (`UTL_ShowJPEG_Slide` loop) isn't invoked repeatedly.
+- The two candidate auto-play drivers both stall: the **OSDSS idle screensaver** is triple-gated
+  (`__bPOWERONMENUInitial` via the mode-8 latch + `__dwTimeNow` reset + ~1-min idle, §12.21/12.23);
+  the **thumbnail/ImageFrame slideshow** (`_THUMB_ToSlideShow` → `UTL_ShowJPEG_Slide` loop) is
+  reached only from the THUMBNAIL UI, which the boot never enters.
+
+**Cleanest next step:** find what SHOULD start the cycling slideshow at boot on this photo-frame build
+— i.e. the auto-play-on-boot decision (`IMAGE_FRAME_SETUP` / `POWERONMENU_PowerOnPlayMediaDirectly` /
+the thumbnail auto-enter) — and why it isn't taken. That decision, not the render, is the last gap.
+Tools this pass: `CT952_DECODE_STACK` (decode caller chain), `seg.sh` now sets it.

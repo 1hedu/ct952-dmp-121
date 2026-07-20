@@ -188,6 +188,14 @@ int main(int argc, char **argv)
      * work -- verify against the running target, not a stale dump). */
     if (getenv("CT952_DUMPFLAGS")) {
         static const struct { uint32_t a; int sz; const char *n; } fl[] = {
+            /* __fThreadInit (initial.h): per-subsystem thread-init done bits.
+             * bit0x1=MPEG-dec, 0x2=JPEG-dec, 0x100=Parser, 0x200=InfoFilter,
+             * 0x80000=USB-src. Bit0x1 stays 0 by design -- the DMP photo-frame
+             * build's INITIAL_ThreadInit (flash 0x41b60) has NO case for
+             * THREAD_MPEG_DECODER(id 3): it falls through to `b,a 0x41d50`
+             * (bare ret), so the MPEG decoder thread is never created and its
+             * done-bit is never posted. See DP700WD_HW_REFERENCE.md 12.47. */
+            {0x40038f80u, 4, "__fThreadInit"},
             {0x40023a10u, 1, "__bPOWERONMENUInitial"},
             {0x400239b8u, 4, "__dwOSDSSCheckTime"},
             {0x400239c4u, 1, "_bOSDSSScreenSaverMode"},

@@ -4170,3 +4170,62 @@ Live-traced (hardened stub) plus the authoritative source (`cc.c`):
 So the stall is a **producer/consumer deadlock across the media pipeline**: each worker sleeps waiting for a message from the previous stage, and the pipeline is never primed because the source-stage HW event (media/decode) never fires (§12.42/12.43). `OSDSS_Monitor` is collateral — it can't re-run because its host loop (`CC_DVD_MainLoop`) is stuck in a sibling poll-call's mbox-get.
 
 **Clean next step (avoids fragile stack-scraping):** boot fresh to mode-7 under the live stub, breakpoint mbox-get `0x5969c`, and catch the CC thread the FIRST time it enters the blocking get — read `%i7`/`%o7` live to name the exact `CC_DVD_MainLoop` poll-call that blocks (candidate: `MEDIA_Management`), then trace what that call waits for. That names the precise unmodeled HW response. Caveat recorded: manual stack-walks here hit stale/`0x5a5a5a5a`-fill words — trust `%fp`-chain / live regs, not value-shaped scans.
+
+### 12.47 MPEG decoder STRUCK from the boot-stall suspect list — the MPEG decoder thread is never created in this build (bit 0x1 cannot be set faithfully)
+
+Targeted the open `__fThreadInit` (`0x40038f80`) bit `0x1` = `INIT_DEC_THREAD_MPEG_DONE`,
+which is never set (live value `0x00080102` = JPEG `0x2` + Parser `0x100` + USB-src
+`0x80000`). Question: what MPEG/video-decoder HW does the MPEG-init thread poll that the
+emulator fails to satisfy? **Answer: none — there is no MPEG-init thread in this build.**
+
+**Static chain (all in `dp700wd.bin`; `dp700wd_ring.bin` differs by exactly ONE byte at
+`0x1151a`, the narration patch, so the disassembly is authoritative):**
+
+1. `INITIAL_PowerONStatus` (`0x418f0`, confirmed §12.32) calls `INITIAL_ThreadInit(id)`
+   for ATAPI(1), USBSRC(9), INFO_FILTER(8), **MPEG_DECODER(3)** (`0x4190c`: `mov 3,%o0`),
+   PARSER(2) — matching `initial.c:640-647`.
+2. `INITIAL_ThreadInit` is at flash **`0x41b60`** (NOT the SDK symbol). Its compiled
+   dispatch handles **only** id `5`→`0x41c34` (JPEG, entry `0x7007c`=`JPEG_ThreadMain`),
+   id `2`→`0x41bf0` (PARSER, entry `0x83098`=`PARSER_ThreadMain`), id `9`→`0x41ba0`
+   (USBSRC), id `0xb`→`0x41cc4`. **Every other id — including `3` (MPEG) and `4` (DivX)
+   and `8` (INFO_FILTER) — falls through the `cmp` chain to `b,a 0x41d50` (a bare
+   `ret; restore`) and creates NOTHING.** (`0x41b88`: `b,a 0x41d50` for id<5≠2;
+   `0x41b9c`: same for id>5 ∉{9,0xb}.)
+3. Root cause in source: `initial.c:32` `#define SIMP_INITIAL`, and the retail DMP
+   photo-frame build compiles OUT the MPEG/DivX (and, via `#ifndef SIMP_INITIAL`, the
+   INFO_FILTER) decoder-thread cases. Confirmed by the binary: **`decoder.a`'s
+   `MPEG2_ThreadMain` / `DivX_ThreadMain` bodies are NOT linked** — their byte signatures
+   (`sethi %hi(0xb0000000),%i5` MCU-descriptor table fill; `stb 0x10,[0xb0000190]`) are
+   absent from the ROM, while the same archive's `JPEG_ThreadMain` (`0x7007c`, `save
+   %sp,-776`) and `PARSER_ThreadMain` (`0x83098`) ARE present. `MPEG2_ThreadInit` /
+   `MPEG2_ThreadExit` are `retl;nop` stubs (`0x6f8f4`).
+4. Exhaustive scan of all 52 `OS_SetFlag` (`0x59610`→`cyg_flag_setbits 0x4001dffc`)
+   callsites: the ONLY writers of `__fThreadInit` are `0x2`@`0x7023c` (JPEG body),
+   `0x10`@`0x7f0c4` (decode-completion DSR, §12.34), `0x100`@`0x830ac` (Parser body).
+   **There is no `OS_SetFlag(0x40038f80, 0x1)` anywhere in the image.** In the SDK build
+   bit `0x1` would be posted from inside `MPEG2_ThreadMain` (mirroring JPEG's `0x7023c`);
+   that body is absent here, so no code path can set it.
+
+**Consequence.** `INIT_DEC_THREAD_MPEG_DONE` (bit `0x1`) is never set **by design**, not
+because of any unmodeled MPEG/video-decoder register, interrupt, or PROC2 handshake. The
+MPEG decoder engine is simply not instantiated at boot in the photo-frame build (the photo
+path is the hardware JPU/VLD/MCU-BIU still-decode on a PROC1 worker, §12.11-12.12; PROC2
+`mpg.bin` video is never loaded at boot). The `INITIAL_PowerONStatus` thread-sync wait that
+includes bit `0x1` (pattern `0x301`) is a **timed** `OS_TimedWaitFlag` (`0x59654`,
+`COUNT_50_MSEC`) that proceeds on timeout regardless (§12.32); forcing the bits
+(`CT952_THREADSDONE`, §12.32) was already "no advance." So bit `0x1` is neither a boot gate
+nor satisfiable by hardware modeling.
+
+**What was modeled / changed.** Nothing faked. Forcing bit `0x1` would be a crutch (the
+already-inert `CT952_THREADSDONE`) and there is no HW handshake to model — the decoder HW
+the MPEG-init thread would poll is never programmed because that thread never runs. Added
+`__fThreadInit` (`0x40038f80`) to the `CT952_DUMPFLAGS` table (`main.c`) as honest
+instrumentation so the bit state is measurable at any `--run-to` checkpoint, with an inline
+note pointing here. Measured after this pass (raw crutch-free boot, `--run-to 90000000`):
+`__fThreadInit = 0x00080102`, **bit `0x1` = 0 (unchanged, as expected)**.
+
+**VERDICT — MPEG/video decoder engine STRUCK from the boot-stall suspect list.** It cannot
+be the blocker: the MPEG decoder thread is not created, so nothing waits on MPEG-decoder
+hardware at boot, and bit `0x1` is architecturally unsettable in this build. This is the
+honest outcome (b) of the investigation. The real, unchanged boot frontier is the
+event-starvation producer deadlock (§12.42-12.46), which is unrelated to MPEG decode.

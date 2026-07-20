@@ -926,6 +926,14 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             if (pr && addr == 0x40022F5Eu && size == 1 && m->cpu.icount > 30000000ull)
                 return 2;
         }
+        /* (CT952_FORCEPOM probe removed §12.38: CONFOUNDED/NEGATIVE. Forcing the
+         * __bPOWERONMENUInitial read (0x40023a10) to 1 past 40M trips POWERONMENU_
+         * Initial's OWN guard (poweronmenu.c:384 `if(__bPOWERONMENUInitial) return`),
+         * so the menu never initializes; the watchdog-pet thread stalls and the run
+         * dies at ~63M with watchdog_fired. The screensaver never armed
+         * (_bOSDSSScreenSaverMode 0x400239c4 stayed 0). A read-forcing probe can
+         * never validate the gate -- it breaks the very routine that sets it. The
+         * faithful path is making POWERONMENU_Initial complete on its own. */
         /* (CT952_THREADSDONE probe removed §12.32: NEGATIVE -- OR-ing the missing
          * MPEG(0x1)+InfoFilter(0x200) thread-done bits into __fThreadInit
          * 0x40038f80 does not advance the boot; the 0x418f0 thread-sync wait is
@@ -967,6 +975,17 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             static int dt; if (dt < 80) {
                 fprintf(stderr, "[DECrd] %08x=%08x pc=%08x icount=%llu\n",
                         addr, v, m->cpu.pc, (unsigned long long)m->cpu.icount); dt++; }
+        }
+        /* IIC/EEPROM access trace (CT952_IICTRACE): §12.39 -- prove empirically
+         * what the firmware reads from the board EEPROM master (0x80004204/0c/10/14)
+         * and whether the current io_get (last-written) model gives it a value it
+         * accepts or one that drives a retry/re-read cycle. Logs both rd here and
+         * wr below (guarded by the same env). */
+        if (getenv("CT952_IICTRACE") &&
+            (off == 0x4204u || off == 0x4210u || off == 0x4214u)) {
+            static int ic; if (ic < 400) {
+                fprintf(stderr, "[IICrd] %08x=%08x pc=%08x icount=%llu\n",
+                        addr, v, m->cpu.pc, (unsigned long long)m->cpu.icount); ic++; }
         }
         if (size == 4) return v;
         /* sub-word I/O read: extract big-endian lane */
@@ -1254,6 +1273,12 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
                 fprintf(stderr, "[LOGOwr] %08x=%08x pc=%08x sp=%08x icount=%llu\n",
                         addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 14),
                         (unsigned long long)m->cpu.icount); lt++; }
+        }
+        if (getenv("CT952_IICTRACE") &&
+            (off == 0x4204u || off == 0x4210u || off == 0x4214u)) {
+            static int icw; if (icw < 400) {
+                fprintf(stderr, "[IICwr] %08x=%08x pc=%08x icount=%llu\n",
+                        addr, val, m->cpu.pc, (unsigned long long)m->cpu.icount); icw++; }
         }
         io_write(m, off, val);
         return;

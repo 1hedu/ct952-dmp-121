@@ -3116,3 +3116,36 @@ without `--live`) when reading narration from the ring via `probe_drain2.py`.
 **Next:** confirm the OSD/menu actually draws now (end-to-end `--fb-out`), then Stage 2 —
 attach a virtual USB mass-storage device (FAT image w/ the 5 album JPEGs) so "usb no
 playable file" becomes a real photo source, i.e. the DMP's actual function.
+
+### 12.9 Post-USB: phantom key fixed (verified); the MENU isn't DRAWN (not an enable bug)
+
+After Stage 1 (main loop alive), pushed on getting the menu to draw. Two results:
+
+**(a) Phantom key — real bug, found/fixed/VERIFIED, but NOT the menu blocker.** The
+narration showed `-------O --- (KEY_DOWN)` in the idle loop with no user input.
+`PANEL_KeyScan` (panel.c) reads an analog resistor-ladder key matrix via `ADCGLB`
+(`0x8000407c`, bits [31:24] = key voltage): no button => high rail (~`0xFF`); a press
+pulls it down. The emu returned `0` => read as a held button => phantom `KEY_DOWN` every
+scan (which also reset the screensaver idle timer). Modeled `ADCGLB` as `0xFF000000`
+(idle/no-button) in `io_read`; `CT952_ADC=` overrides for A/B. **A/B proof:** `CT952_ADC=0`
+reproduces the `KEY_DOWN`; default `0xFF` removes it. This is faithful (rest state of the
+ladder), not a mask of intended input. Commit `ef10d0e`. BUT the menu still doesn't draw
+with the key gone — so the phantom key was a separate defect, not the menu cause.
+
+**(b) The menu is NOT DRAWN — reframes §12.1–12.3.** Sampled the OSD buffers live at the
+idle main-loop state (fixed emu): `0x4005c000` and `0x4005f000` are ~all-zero (0–10
+non-zero of 2048 sampled), OSD gate `0x40024050`=0. Prior sessions assumed the menu was
+drawn-but-not-composited (an OSD-enable/gate bug). It is not: **`_POWERONMENU_DrawAllUI`
+never renders the menu into the OSD buffer at all.** DISPTRACE confirms: OSD region config
+(`1a48/1a50/1a54`) happens only ≤12.5M (the early splash) and never post-USB. So the
+compositor/gate is downstream of a draw that isn't happening — chasing OSD_EN was the
+wrong layer.
+
+**Open question for next session:** does `POWERONMENU_Initial` (cc.c:1320) even run to
+`_POWERONMENU_DrawAllUI`, or does the DMP's no-media flow (SUPPORT_STB `__bChooseMedia`
+branch, cc.c:1385; or a "waiting for media" state) skip the menu draw? Two concrete paths:
+(1) find `POWERONMENU_Initial`/`_POWERONMENU_DrawAllUI` addresses, breakpoint to see if
+the draw path is entered and where it bails; (2) **Stage 2** — attach a virtual USB
+mass-storage device (FAT + the 5 album JPEGs); the DMP is a photo frame and `usb no
+playable file`/`no SD card` suggest it may simply be idling for media, in which case
+giving it media is the real unblock (and the actual product function).

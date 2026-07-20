@@ -9,6 +9,9 @@ import socket,sys
 class RSP:
     def __init__(self,port=3333,host='127.0.0.1',timeout=300):
         self.s=socket.create_connection((host,port),timeout=timeout)
+        # disable Nagle: RSP is request/response with tiny packets; Nagle +
+        # delayed-ACK add ~40ms per round-trip (22 steps/s -> ~unusable).
+        self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     def _cs(self,d): return sum(d.encode())&0xff
     def send(self,body): self.s.sendall(b'$'+body.encode()+b'#'+('%02x'%self._cs(body)).encode())
     def read(self):
@@ -40,13 +43,30 @@ class RSP:
 REGNAME=(['g%d'%i for i in range(8)]+['o%d'%i for i in range(8)]+
          ['l%d'%i for i in range(8)]+['i%d'%i for i in range(8)])
 
-import select
-def cont_to(r, secs):
-    """Continue; if no stop within `secs`, send Ctrl-C and read the stop reply.
-    Returns (stop_reply, interrupted_bool)."""
-    r.send('c')
-    ready,_,_=select.select([r.s],[],[],secs)
-    if ready:
-        return r.read(), False
-    r.s.sendall(b'\x03')
-    return r.read(), True
+def cont_to(r, secs, poll_wait=3.0):
+    """Continue; if no stop within `secs`, send Ctrl-C and reliably read the stop
+    reply. Returns (stop_reply, interrupted_bool). Uses socket timeouts (not
+    select) because read() transparently skips the '+' ack the server sends for
+    the 'c' packet -- select would fire on that ack and read() would then block
+    on the not-yet-arrived stop packet (the latent bug the slow park masked).
+    Retries 0x03 with a bounded wait so a mid-batch stub can't wedge the client.
+    Returns (None, True) only if the stub never answers."""
+    old = r.s.gettimeout()
+    try:
+        r.send('c')
+        r.s.settimeout(secs)
+        try:
+            return r.read(), False          # read() skips acks, returns stop pkt
+        except socket.timeout:
+            pass
+        # no breakpoint hit within `secs`: interrupt, retry until answered
+        for _ in range(20):
+            r.s.sendall(b'\x03')
+            r.s.settimeout(poll_wait)
+            try:
+                return r.read(), True
+            except socket.timeout:
+                continue
+        return None, True                   # stub never answered
+    finally:
+        r.s.settimeout(old)

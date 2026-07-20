@@ -35,7 +35,13 @@
 
 #define GDB_NREG      72
 #define GDB_MAXBP     64
-#define GDB_BATCH     2000000ull   /* instrs per continue-batch between socket polls */
+/* Instrs per continue-batch between socket polls. Kept SMALL so a Ctrl-C
+ * (0x03) interrupt is seen within a bounded wall-clock even in the IO-heavy
+ * park (single-step mode runs ~10K instr/s there; a 2M batch would leave a
+ * Ctrl-C unseen for ~200s -- the hang that made the stub unusable, §10.49).
+ * 20000 steps -> worst-case ~2s poll latency in the park, ~15ms in fast code.
+ * Overridable via CT952_GDB_BATCH for tuning. */
+#define GDB_BATCH_DEFAULT 20000ull
 #define PKT_MAX       (16 * 1024)
 
 static const char hexd[] = "0123456789abcdef";
@@ -159,10 +165,16 @@ static void send_stop(int fd, int sig) { char r[8]; sprintf(r, "S%02x", sig & 0x
 static int check_interrupt(int fd)
 {
     unsigned char c;
-    ssize_t r = recv(fd, &c, 1, MSG_DONTWAIT);
-    if (r == 0) return 1;                 /* client closed the connection */
-    if (r == 1 && c == 0x03) return 1;    /* interrupt request */
-    return 0;
+    int got = 0;
+    /* Drain everything currently pending (a client may have queued several
+     * 0x03 retries); any 0x03 -> stop, EOF -> stop. Non-blocking. */
+    for (;;) {
+        ssize_t r = recv(fd, &c, 1, MSG_DONTWAIT);
+        if (r == 0) return 1;                     /* client closed */
+        if (r < 0) break;                         /* EAGAIN: nothing more pending */
+        if (c == 0x03) got = 1;                   /* interrupt (keep draining) */
+    }
+    return got;
 }
 
 /* --- main serve loop ----------------------------------------------------- */
@@ -317,10 +329,14 @@ reaccept:
 
         case 'c': {                        /* continue [addr] */
             if (pkt[1]) m->cpu.pc = (uint32_t)strtoul(pkt + 1, NULL, 16);
+            static uint64_t batch = 0;
+            if (!batch) { const char *e = getenv("CT952_GDB_BATCH");
+                          batch = e ? strtoull(e, NULL, 0) : GDB_BATCH_DEFAULT;
+                          if (!batch) batch = GDB_BATCH_DEFAULT; }
             int sig = 5, stopped = 0;
             while (!stopped) {
                 uint64_t ran = 0;
-                int rc = machine_step_bp(m, bp, nbp, GDB_BATCH, &ran);
+                int rc = machine_step_bp(m, bp, nbp, batch, &ran);
                 if (rc == 1) { sig = 5; break; }            /* breakpoint */
                 if (rc < 0)  { sig = 5; break; }            /* halted */
                 if (check_interrupt(fd)) { sig = 2; break; }/* Ctrl-C */

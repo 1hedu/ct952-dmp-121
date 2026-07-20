@@ -3845,3 +3845,26 @@ POWER_ON`, off) / all `_POWERONMENU_EnterPhotoMode` callers user-input (§12.26)
 photo via its own decoder. Verified addresses/tools: mode table `0x40024c20`; `__bChooseMedia
 0x40031b9c` (=`MEDIA_SELECT_END`=3 at park); event queue `0x400329FC`; decode-done mirror
 `0x40039cd0`/handshake machine.c:72,506,881; probe `scratchpad/pstate.py` (live mode/gate dump).
+
+### 12.28 THE AUTO-SLIDESHOW IS THE OSDSS SCREENSAVER — user hardware knowledge was right (event-system fully reversed)
+
+Prompted by the user's real-hardware observation ("my other Coby frame boots, then the slideshow launches after a settings timer, default 15s"), re-examined the screensaver path — which §12.25/12.26 and the first event-system pass had wrongly dismissed. **The user is correct: there IS a keyless auto-launching slideshow.**
+
+**It is the OSDSS JPEG screensaver, and it plays the built-in SPI photos:**
+- `SUPPORT_ENCODE_JPG_PICTURE` is **defined** (`Winav.h:1589`), so `_OSDSS_PictureUpdate` (`osdss.c:122`) takes the SPI branch: `__SF_SourceGBL[0].bSourceIndex = SOURCE_SPI; UTL_PlayItem(bIdx+1,0); UTL_ShowJPEG_Slide(...)` (`osdss.c:177-211`). The screensaver **is** the built-in-photo slideshow (advances every `COUNT_5_SEC`, `osdss.c:560/583`).
+- Enter delay: `OSDSS_ENTER_TIME = COUNT_10_SEC*2` ≈ **20 s** for `CT950_STYLE` (`osdss.h:18-20`). (The user's 15 s was a different chip — same mechanism, near-identical timing.)
+- Default ON: `SETUP_DEFAULT_SCREEN_SAVER = SETUP_SCREEN_SAVER_ON` (`dvdsetup.h:1623`).
+- Gate (`OSDSS_Monitor`, `osdss.c:320-327`): fires `OSDSS_Entry()` when idle `> OSDSS_ENTER_TIME` **AND** `__bPOWERONMENUInitial && __bCLOCKShowClock==FALSE && __bAlarmState==ALARM_NONE`.
+
+So the real-device flow is: **boot → power-on state machine completes → `POWERONMENU_Initial()` sets `__bPOWERONMENUInitial=TRUE` → ~20 s idle → OSDSS screensaver auto-plays the built-in SPI-photo slideshow.** This is the "screensaver = slideshow" behavior common to these frames.
+
+**Why the emulator doesn't show it (the precise gap), from the 4-agent event-system reversal:**
+The emulated boot **parks in the power-on-status "page-8" stage** (`0x25ef4`, dispatcher `0xafd8` — NOT `OSD_ChangeUI`, which is the separate `0x4a754`/`osd.c:779`) and never advances to `POWERONMENU_Initial`, so `__bPOWERONMENUInitial` stays **0** and the screensaver gate never opens (verified: probe reads `0x40023a10=0` through 130M). The stage advances only when an event is **delivered** into the power-on event path:
+- The "advance" predicate is `0x12e18` reading the registered-monitor descriptor block at `[0x40021db8]`, gated behind the **CC-event request/done flag pair** F_REQ `0x40026e9c` / F_DONE `0x40026ea4` serviced by a worker thread `0x6748` (bit `0x80` = "fetch/deliver next message" via worker→`0x12f10`; bit `0x1000` = periodic monitor pulse via worker→`0x11d94`). **These acks are never starved** — the worker cycles them every frame.
+- What IS starved is the **upstream message producer**: nothing enqueues a completion message at power-on. On real silicon that message is posted by the **decoder/media DSR** (interrupt) when the JPEG-still / servo datapath reaches decode-done (posters at flash `0x7f0c4`/`0x830ac` → bits `0x10`/`0x100`; media-present via `0x6130` → bits `0x2`/`0x4`; msg-bearing `0x40`/`0x80`/`0x800`). Page-8's park guard is `byte[0x40022f81]` (VarB, "advance-event pending"), set to 1 only when such an event is delivered.
+
+**The decisive reconciliation with §12.27:** the emulator now completes the decode **datapath** (real pixels written, poll-status mirror `0x40039cd0`→`0x10`, §12.27) but **never raises the decode-completion INTERRUPT** whose DSR posts the completion message. Decode finishes → no IRQ → DSR never runs → no message enqueued → VarB never set → page-8 parks → `__bPOWERONMENUInitial` never set → screensaver never arms. This is exactly why every prior flag/countdown/status poke failed (§10.21-10.24): those poke *acks the worker already produces*; the missing thing is the *upstream DSR-posted message*.
+
+**THE FAITHFUL FIX (converged, all 4 agents + hardware behavior):** on JPU/decode completion (`machine_maybe_jpeg_decode`), raise the **decode-completion interrupt** so the firmware's decoder DSR (`0x7f0c4`/`0x830ac`) runs and posts the completion event. That advances INITIAL_PowerONStatus → `POWERONMENU_Initial` → `__bPOWERONMENUInitial=TRUE` → (~20 s idle) → `OSDSS_Entry` → built-in SPI-photo slideshow. This is the single upstream unlock; it is faithful (real HW raises this IRQ on every decode), not a flag fake.
+
+**Corrections folded in:** (1) `0xafd8` is a page/stage dispatcher, NOT `OSD_ChangeUI` (=`0x4a754`); its IDs are a stage enum, not `osd.h OSD_UI_*`. (2) `0x6670` = WaitCCEvent (blocking), not a poster; real setter `0x59610`=`OS_SetFlag`. (3) CC event flag is a PAIR (F_REQ `0x40026e9c` + F_DONE `0x40026ea4`) + worker `0x6748`. (4) `bAutoPlayPhoto` factory-defaults **ON** (`dvdsetup.h:1528`; the OFF at `dvdsetup_op.h:22` is inside a `/*…*/` comment). (5) `0x1d170` decrements `0x4003275e`, not `0x40022F5E` (a phase byte). (6) The auto-slideshow is the screensaver, NOT the POWERONMENU photo-player — the player still needs a key; the screensaver does not.

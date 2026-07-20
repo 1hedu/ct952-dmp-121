@@ -10,3 +10,5 @@ demo_run
 romv_out.bin
 *.ppm
 dram.bin
+*.snap
+*.err

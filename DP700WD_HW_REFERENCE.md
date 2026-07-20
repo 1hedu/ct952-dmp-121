@@ -3794,3 +3794,54 @@ the photo icon, or ships/settings-set an auto-enter this build's defaults don't 
 without user input on this photo-frame build — the `IMAGE_FRAME` media-decision that turns "5 photos
 detected" into "enter the slideshow". That transition (mode 8 → photo player), not POWERON_MENU, is the
 last gap. Tools: `CT952_OSDUITRACE` (every ChangeUI call), `CT952_DECODE_STACK` (decode caller chain).
+
+### 12.27 BREAKTHROUGH (empirical, crutch-free) — raw boot decodes the splash AND the first built-in album photo on its own
+
+Fresh full re-trace this session with **zero logic crutches** (only `CT952_TICK_MULT` as a
+time-accelerant, which scales the tick rate but changes no logic). First: confirmed
+`CT952_VDEC_DONE` is **inert dead code** — it is read *nowhere* in machine.c; the faithful
+decode-done handshake (`m->vdec_frame_done=1` at machine.c:72 and :506, mirror `0x40039cd0`→`0x10`
+at :881) is already **always-on**. So prior runs that passed it were unknowingly measuring the
+plain build.
+
+**What the raw boot actually does (verified live, snapshot-chained):**
+1. The power-on state machine advances on its own timers to the **mode-8** power-on/media state
+   (`0x25ef4`) by ~90M icount and parks there. Live OSD mode table dumped from
+   `0x40024c20` (14 records): mode `0x08`→`0x25ef4`, `0x07`(POWERON_MENU)→`0x61cf8`,
+   `0x09..0x0e`→`0x26294/2646c/26638/26070/1f484/67c28`, etc. `activeUI 0x40020ec8`=`0x40024ce0`
+   (the mode-8 record).
+2. `__bChooseMedia` (`0x40031b9c`) cycles `0`(DVD)→**`3`**. For this build (`SUPPORT_STB` **off**,
+   media.h else-branch) the enum is `DVD=0, USB=1, CARD_READER=2, END=3, UNKNOW=4` — so **`3` =
+   `MEDIA_SELECT_END`**, i.e. the media auto-scan ran through every physical source (DVD→USB→card)
+   and reached the "no external media anywhere" sentinel. Correct: only internal-flash photos exist.
+   (Earlier probe mislabeled `3` as STB — STB isn't in this build's enum.)
+3. **The firmware's own JPU pipeline decodes TWO images, crutch-free:**
+   ```
+   [ct952emu] JPEG decode #1: 480x270 from 0x401dc000     (COBY boot splash / logo)
+   [ct952emu] JPEG decode #2: 640x360 from 0x401dc000     (first built-in album photo)
+   ```
+   Both firmware-staged at `0x401dc000` (firmware re-stages a *different* JFIF at the same buffer →
+   it advanced from splash to the first photo). De-tiling the video plane
+   (`Y@0x40065000`/`C@0x400b3c00`, `videoplane.py`) after decode #2 renders the real **640×360
+   album photo (zebra butterfly on lantana), Y-plane 90% populated** — sent to the user. This is
+   the same photo family recovered in §12.12, now reached by the *natural* boot with no
+   media-select flip.
+
+**Where it parks:** after decode #2 the machine sits back in mode 8 with event queue `0x400329FC`
+**empty** (`qcount=0`), `ccflag 0x40026EA4=0`, `__bPOWERONMENUInitial=0`. No decode #3 appears
+through 110M. So the boot displays the **first** photo but does **not** cycle the slideshow — it is
+the §10.23 event-starvation park (state-8 advances only on a queued event), reached one photo later
+than previously understood.
+
+**Reconciliation with §12.24/§12.26:** §12.24 said "both boot decodes share the LOGO path, no
+slideshow loop." Refined: decode #1 is the logo path; **decode #2 is genuinely the first *album
+photo*** (640×360, not the 480×270 logo), i.e. the firmware did begin the photo display, then
+parked. The last gap is unchanged in kind (mode-8 → cycling photo player), but the boot gets one
+real photo further on its own than the notes claimed. The player-entry gate remains
+`bAutoPlayPhoto` (default OFF) / `MM_PlayPhotoInFlash` (only inside `SUPPORT_PLAY_MEDIA_DIRECTLY_
+POWER_ON`, off) / all `_POWERONMENU_EnterPhotoMode` callers user-input (§12.26).
+
+**Net:** with no logic crutches the retail firmware boots to and displays the first built-in album
+photo via its own decoder. Verified addresses/tools: mode table `0x40024c20`; `__bChooseMedia
+0x40031b9c` (=`MEDIA_SELECT_END`=3 at park); event queue `0x400329FC`; decode-done mirror
+`0x40039cd0`/handshake machine.c:72,506,881; probe `scratchpad/pstate.py` (live mode/gate dump).

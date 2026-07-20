@@ -693,6 +693,20 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
 {
     *fault = 0;
 
+    /* CT952_OSDUITRACE: OSD_ChangeUI (0xafd8) reads the active-UI latch at 0xafe0
+     * with the mode arg in i0; catch that read to log every ChangeUI(mode) call +
+     * whether it's declined (activeUI != 0). Per-access, so it fires mid-chunk. */
+    { static int on = -1; if (on < 0) on = getenv("CT952_OSDUITRACE") ? 1 : 0;
+      if (on && addr == 0x40020ec8u && m->cpu.pc >= 0xafd8u && m->cpu.pc <= 0xaff8u) {
+        uint8_t *p = machine_dram_ptr(m, 0x40020ec8u);
+        uint32_t au = p ? ((uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3]) : 0;
+        fprintf(stderr, "[OSDUI] ChangeUI(mode=%u) activeUI=%08x %s caller=%08x icount=%llu\n",
+                sparc_get_reg(&m->cpu, 24) & 0xff, au,        /* i0 = reg 24 = mode */
+                au ? "DECLINED" : "enters", sparc_get_reg(&m->cpu, 31),
+                (unsigned long long)m->cpu.icount);
+      }
+    }
+
     /* DRAM data-region read-frequency histogram (CT952_DRAMHIST=<icount>):
      * counts reads to the BSS/data window past a threshold and dumps the
      * hottest addresses at exit -- pinpoints hot status vars like JPEG_Status

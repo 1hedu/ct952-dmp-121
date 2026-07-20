@@ -3763,3 +3763,34 @@ and find why its `OSD_ChangeUI(POWERON_MENU)` doesn't enter mode 7 at boot — i
 (`activeUI != 0` at that instant), does the function bail before that call, or does it use a mode number
 we've mis-identified? That single answer unblocks the menu → and thence the (user-selected or
 screensaver) slideshow.
+
+### 12.26 KEY CORRECTION — POWERON_MENU is NEVER attempted at boot; mode 8 (media present) is correct
+
+Added `CT952_OSDUITRACE` (machine.c bus_rd): logs every `OSD_ChangeUI(mode)` at its entry
+(reads activeUI `0x40020ec8` at pc~0xafe0, mode in i0), with the live latch + caller.
+
+**Through 45M there is exactly ONE OSD_ChangeUI call:**
+```
+[OSDUI] ChangeUI(mode=8) activeUI=00000000 enters caller=0x41b34 icount=27003289
+```
+**`OSD_ChangeUI(POWERON_MENU / mode 7) is NEVER called at boot.** Only mode 8 (media UI) is entered.
+And `0x418f0`'s logic is `OSD_ChangeUI(8); if(ret==0) OSD_ChangeUI(7)` — mode 8 **succeeds** (the 5
+photos are present, §12.15) so mode 7 (POWERON_MENU) is the **no-media fallback**, correctly skipped.
+
+**This corrects §12.20–12.25.** `__bPOWERONMENUInitial` staying 0 is NOT a bug — POWERON_MENU is the
+UI you get with **no** playable media; with the built-in album present the device is correctly in the
+**media/photo UI (mode 8)**. The OSDSS screensaver (gated on `__bPOWERONMENUInitial`, §12.21) is the
+**menu-idle** path, not the media-present path. So the screensaver chase was the wrong branch.
+
+**The real gap (re-stated correctly):** the boot enters mode 8 with 5 photos detected, decodes one
+(via the logo/background path, §12.24), and idles. On a photo frame it should **play/slideshow** those
+photos from here. Entering the actual photo player is `_POWERONMENU_EnterPhotoMode/EnterPhotoMusicMode`
+→ `MEDIA_USB()`, whose auto-advance is gated by `bAutoPlayPhoto` (default **OFF**, dvdsetup_op.c). All
+its callers are user-input (photo icon / KEY_PHOTO), and `SUPPORT_PLAY_MEDIA_DIRECTLY_POWER_ON` is off,
+so with factory defaults nothing auto-enters the player on boot — a real unit either has the user pick
+the photo icon, or ships/settings-set an auto-enter this build's defaults don't provide.
+
+**Next:** determine what, in the mode-8 (media-present) state, is meant to start the photo player
+without user input on this photo-frame build — the `IMAGE_FRAME` media-decision that turns "5 photos
+detected" into "enter the slideshow". That transition (mode 8 → photo player), not POWERON_MENU, is the
+last gap. Tools: `CT952_OSDUITRACE` (every ChangeUI call), `CT952_DECODE_STACK` (decode caller chain).

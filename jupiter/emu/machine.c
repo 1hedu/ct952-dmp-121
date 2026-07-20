@@ -39,6 +39,11 @@ static void machine_maybe_jpeg_decode(machine_t *m)
     int w = 0, h = 0;
 
     m->jpeg_done = 1;                 /* decoder reports ready once armed */
+    /* CT952_NODECODE: skip the (slow) functional picojpeg decode but keep the
+     * decode-done semantics. For live-tracing after --restore, the repeated
+     * JPU_GO writes in the park cycle would otherwise re-run a ~100ms 640x360
+     * decode each time and crawl the run; we don't need pixels to single-step. */
+    if (getenv("CT952_NODECODE")) { m->vdec_frame_done = 1; m->biu_drained = 1; return; }
     /* Built-in-photo staging (CT952_STAGE_PHOTO="<flash_off>"): copy a built-in
      * JPEG from flash (photo album section "0001" @0x160000/0x170000/0x180000)
      * into the staging buffer so the firmware's own working decode+display path

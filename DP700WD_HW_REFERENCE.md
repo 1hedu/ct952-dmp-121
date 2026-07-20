@@ -3030,3 +3030,44 @@ enormous virtual time, so there IS still a real terminal wall past USB init; but
 have the firmware's own narration to walk right up to it. Next: drain the ring
 continuously (inject `DBG_INT`, or grow `DBG_MAX_IDX`) to get the full chronological log
 through to wherever it finally stops, and read the last thing it says.
+
+### 12.7 THE WALL, NAMED BY THE FIRMWARE ITSELF — USB root-hub enumeration (unmodeled HC)
+
+Drained the debug ring continuously (efficient single-`m` bulk read per step,
+`probe_drain2.py`) to get the full chronological boot log up to where it stops. The
+firmware's own last words:
+```
+TVMode / TVE setting out of range / TFT_Change source[FF ->13] / BackLight_ON
+starting usb stack...            reaper thread handle:40041208 / Blk dev: Init
+thread handle:401FCEE8 / 401FB9E8 / 401FACE8         (usb worker threads spun up)
+ehci_local0: EHCI version 0000.0000, with 0000 ports
+ehci_local0: USB revision 2.0
+ehci_local0: new device port=0000 depth=0000 speed=high
+uhub0: vendor 0x0006 Generic Root Hub, class 9/0, rev 0.11/af.00, addr 1
+uhub0: 00C0 ports with 00C0 removable, bus powered      <-- garbage: 192 ports
+```
+Then **nothing** — 90 s of continued virtual time (tick advancing) produces no new
+message. The boot is stuck in **USB host-stack / root-hub bring-up**, and the values are
+garbage: `EHCI version 0000`, `0000 ports`, then a root hub claiming `0x00C0` (192)
+ports. Root cause is direct and already flagged in `machine.c` itself (comments ~L799):
+**the emu has NO USB/EHCI host-controller model** — the USB register space reads 0 / drops
+writes, so the Jungo USB stack reads nonsense and hangs enumerating phantom ports. This
+also explains §12.5's "abnormal virtual-time burn": the USB workers spin on bogus port
+status.
+
+**Why this is the (or a) terminal wall:** the DMP power-on flow starts the USB stack
+during init (`starting usb stack...`); with the HC unmodeled the enumeration never
+converges, and the boot never advances to draw the menu (3e9-instr run still OSD-off).
+Note initial.c:690 masks `INIT_SRC_THREAD_USB_DONE` OUT of the power-on thread barrier
+(`#if 0`), so USB is not *required* by that barrier — meaning the USB spin is either
+starving/holding a resource the menu path needs, or the menu path waits on a USB-init
+signal downstream. The fix distinguishes these.
+
+**FAITHFUL NEXT STEP (concrete, in the emulator):** model the USB EHCI host controller +
+root hub minimally — enough that enumeration *completes with zero devices attached*:
+report a sane capability/version, `0 ports` (or 1 port, disconnected), and terminate the
+enumeration loop. Then re-run and read the narration past `uhub0` — if the menu draws,
+USB was the wall; if it stalls again, the firmware will name the next thing. Either way we
+now have the firmware narrating each step, so progress is observable directly. (Tooling:
+`probe_drain2.py` bulk-reads the ring at `0x4004c000`; `patch_dbg_fw.py [--live]` builds
+the debug fw.)

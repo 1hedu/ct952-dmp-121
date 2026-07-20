@@ -3233,3 +3233,51 @@ video framebuffer — the firmware's own JPU pipeline then completes and display
 That is the through-line to the built-in slideshow, and it replaces `LOGODECODE` rather
 than adding a crutch. (Menu/OSD-icon draw, §12.9/12.10, is a separate GDI question and does
 not depend on the JPU decode.)
+
+### 12.12 §10.8 implemented — faithful JPU decode replaces the LOGODECODE crutch (verified)
+
+Implemented the §10.8/§12.11 plan: the built-in JPU/MCU-BIU decode now completes on the
+**firmware's own decode-op**, with `CT952_LOGODECODE` retired from the decode path.
+
+**The five changes (machine.c / machine.h):**
+1. `machine.h`: new `int biu_drained` — the MCU BIU bit-stream read-channel "drained /
+   macroblock stream ready" flag.
+2. `io_write R_GPU_CTL0` (JPU op branch): call `machine_maybe_jpeg_decode(m)` **unconditionally**
+   (was gated behind `CT952_LOGODECODE`) and set `biu_drained = 1`. The JPU decode-op the
+   driver issues now functionally decodes the staged frame every time.
+3. `io_write 0x2a20` (BCR08, read-channel source): wire `m->jpeg_src = v` for DRAM pointers
+   (`(v & 0xF0000000)==0x40000000`) and clear `biu_drained` — a new source means a new fill
+   is in flight, so BCR0A bit 12 must read 0 until the JPU kick drains it.
+4. `io_read 0x2a28` (BCR0A, read-channel status): return `... | (biu_drained ? 0x1000 : 0)` —
+   the worker's poll at `0x4001fe90` for bit 12 now retires instead of spinning the
+   decode-wait timeout.
+5. `io_read 0xc10` (decoder progress): auto-arm on `jpeg_decode_en || biu_drained`; and the
+   macroblock-tiled-YUV write-back into the video framebuffer (`Y@0x40065000`,
+   `C@0x400B3C00`, stride `0x2D00`) is **un-gated** from `CT952_LOGODECODE` — it always runs
+   after a successful decode (this is the MCU-BIU write-channel output the real block does).
+
+**Verified (raw boot, no crutch env):** `dp700wd_ring.bin`, `CT952_TICK_MULT=64`, EHCI + the
+`ADCGLB=0xFF` no-key model, **no `CT952_LOGODECODE`**. The firmware's own boot path fired:
+```
+[ct952emu] JPEG decode #1: 480x270 from 0x401dc000
+[ct952emu] JPU MCU-BIU wrote 480x270 tiled YUV to 0x40065000/0x400b3c00
+```
+i.e. the driver's own `GPU_CTL0` JPU decode-op triggered the decode → `biu_drained` →
+`0x2a28` bit 12 retired the worker poll → the splash logo decoded and tiled-YUV pixels
+landed in the video framebuffer, all without a crutch. This is the crutch-retirement the
+§11.x "faithful boot" arc calls for, applied to the JPU decode.
+
+**Boot state after this change (unchanged wall, re-confirmed):** the boot continues to the
+steady CC event loop — narration through `starting usb stack` → EHCI enumeration →
+`HCD: EHCI host controller added`, then the RTOS parks in its normal idle poll. Disassembly
+of the parked loop (`0x59838` getter → eCos helper `0x4001dee8`, looped from `0x59850`) shows
+it polling flag **`0x400398f8`** — the same *missing-event-post* park documented in §10.51 /
+§11.4-11.6 (a thread waiting on an event that no producer posts). That gap — the screensaver
+trigger (`OSDSS_Monitor` on event bit `0x80`) — is the next faithful target and is
+independent of the now-working JPU decode.
+
+**Tooling added:** `machine.c` `pcsamp_window_dump` — a *windowed periodic* PC/stack
+histogram (`CT952_PCSAMP_WIN=<icount>`, default 200M) that prints the live hot loop every
+window and resets, so a long run the sandbox kills before the atexit `pcsamp_dump` still
+leaves the current spin in its log. `jupiter/emu/seg.sh` chains `--restore/--run-to/--snapshot`
+to advance the boot in sandbox-sized segments when continuous long runs are throttled.

@@ -141,6 +141,15 @@ typedef struct machine {
 
     uint64_t jpu_active_until;   /* cycles: JPU decode recently kicked (diag gating) */
 
+    /* MCU BIU bit-stream read-channel drained flag (faithful JPU pipeline,
+     * DP700WD_HW_REFERENCE.md 10.8). The JPEG worker (0x4001fe90) programs the
+     * bit-stream source into BCR08 (io 0x2a20), then polls BCR0A (io 0x2a28)
+     * for bit 12 (0x1000) = "read channel drained / macroblock stream ready".
+     * We set biu_drained when the JPU GPU_CTL0 kick has functionally decoded
+     * the staged frame, so the poll retires and the worker advances to
+     * HALJPEG_Display instead of spinning out the decode-wait timeout. */
+    int biu_drained;
+
     /* No-media model: stand in for the USBSRC worker thread so the firmware's
      * media-detect loop resolves to "no removable media". (Crutch removed §11.3;
      * field retained for ABI/layout stability of snapshots.) */

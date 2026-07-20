@@ -93,12 +93,16 @@ static void machine_maybe_jpeg_decode(machine_t *m)
     m->jpeg_w = w;
     m->jpeg_h = h;
 
-    /* P1 (CT952_LOGODECODE): write the decoded frame into the firmware's video
-     * frame buffer as macroblock-tiled YUV 4:2:0 (§10.2/§10.10), so the hardware
-     * decode the driver kicked "produces" real pixels -- what §10.33 showed is
-     * missing (Y buffer 0x40065000 was all-zero). Y at DS_FRAMEBUF_ST_SLIDESHOW
-     * (0x40065000), C at +0x4EC00 (0x400B3C00); strip=0x2D00 (720-wide buffer). */
-    if (getenv("CT952_LOGODECODE")) {
+    /* Faithful JPU MCU-BIU output (§10.8/§10.2/§10.10): write the decoded frame
+     * into the firmware's video frame buffer as macroblock-tiled YUV 4:2:0, so
+     * the hardware decode the driver kicked "produces" real pixels in the buffer
+     * the scan-out reads. This is the MCU-BIU write-back the real block would do
+     * as it drained the reconstructed macroblocks; §10.33 showed the Y buffer
+     * (0x40065000) was all-zero without it. Y at DS_FRAMEBUF_ST_SLIDESHOW
+     * (0x40065000), C at +0x4EC00 (0x400B3C00); strip=0x2D00 (720-wide buffer).
+     * Formerly gated behind CT952_LOGODECODE (crutch); now unconditional so the
+     * firmware's own decode path renders real pixels. */
+    {
         const uint32_t YBASE = 0x40065000u, CBASE = 0x400B3C00u, strip = 0x2D00u;
         uint8_t *yb = machine_dram_ptr(m, YBASE);
         uint8_t *cb = machine_dram_ptr(m, CBASE);
@@ -121,7 +125,7 @@ static void machine_maybe_jpeg_decode(machine_t *m)
                     cb[co + 128] = (uint8_t)(V < 0 ? 0 : V > 255 ? 255 : V);
                 }
             }
-            fprintf(stderr, "[LOGODECODE] wrote %dx%d tiled YUV to 0x%08x/0x%08x\n",
+            fprintf(stderr, "[ct952emu] JPU MCU-BIU wrote %dx%d tiled YUV to 0x%08x/0x%08x\n",
                     w, h, YBASE, CBASE);
         }
     }
@@ -310,12 +314,20 @@ static uint32_t io_read(machine_t *m, uint32_t off)
          * looks alive. (Not the current menu blocker -- that is a config-apply
          * callback loop -- but correct modelling regardless.) */
         return (uint32_t)((~(m->cycles >> 6)) & 0x00FFFFFCu) | 4u;
+    case 0x2a28:
+        /* MCU BIU bit-stream read-channel status (BCR0A, §10.8). The JPEG worker
+         * (0x4001fe90) polls bit 12 (0x1000) = "read channel drained / macroblock
+         * stream consumed" before advancing to HALJPEG_Display. The JPU decode
+         * kick (R_GPU_CTL0 JPU op) sets m->biu_drained once the frame has been
+         * functionally decoded; present that as bit 12 so the poll retires
+         * instead of spinning out the decode-wait timeout. */
+        return io_get(m, 0x2a28) | (m->biu_drained ? 0x1000u : 0u);
     case 0xc10:
         /* Decoder progress/state word. The firmware's wait loop (flash
          * 0x72810) polls bits[20:16] for >=7. This is driven by the hardware
-         * JPEG decoder consuming the staged bitstream; with the functional
-         * decode armed, run it here (once) and then report >=7 (done). */
-        if (m->jpeg_decode_en) {
+         * JPEG decoder consuming the staged bitstream; once the functional
+         * decode has run (biu_drained) or the legacy arm is set, report >=7. */
+        if (m->jpeg_decode_en || m->biu_drained) {
             machine_maybe_jpeg_decode(m);
             return (io_get(m, 0xc10) & ~0x001f0000u) | 0x00070000u;
         }
@@ -484,11 +496,27 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
              * the boot decoder-stop handshake (which runs before any decode), so
              * gate-3's 0x11 is unaffected. */
             m->vdec_frame_done = 1;
-            /* P1: on the JPU decode kick, functionally decode the staged JPEG
-             * and emit the tiled-YUV frame the real hardware would produce
-             * (CT952_LOGODECODE). Guarded by jpeg_sig so it decodes once/frame. */
-            if (getenv("CT952_LOGODECODE")) machine_maybe_jpeg_decode(m);
+            /* Faithful JPU decode (§10.8): on the JPU decode kick, functionally
+             * decode the staged JPEG and emit the tiled-YUV frame the real MCU-BIU
+             * write-channel would produce. Guarded by jpeg_sig so it decodes
+             * once/frame. Then mark the MCU-BIU read channel drained so the
+             * worker's BCR0A poll (io 0x2a28 bit 12) retires and it advances to
+             * HALJPEG_Display. Formerly gated behind CT952_LOGODECODE (crutch). */
+            machine_maybe_jpeg_decode(m);
+            m->biu_drained = 1;
         }
+        return;
+    case 0x2a20:
+        /* MCU BIU bit-stream read-channel source (BCR08, §10.8). The JPEG worker
+         * (0x4001fe90) programs the bit-stream base here before kicking the JPU.
+         * Wire it to the functional decoder's source so the decode reads exactly
+         * the bitstream the firmware staged, and reset the drained flag: a new
+         * source means a new fill is in flight, so BCR0A bit 12 must read 0 until
+         * the JPU kick drains it. Only DRAM pointers (0x4xxxxxxx) are meaningful
+         * as a bit-stream base; ignore other writes (control/config aliases). */
+        if ((v & 0xF0000000u) == 0x40000000u) m->jpeg_src = v;
+        m->biu_drained = 0;
+        io_set(m, off, v);
         return;
     case R_GPU_FONT_IDX:
         if (m->gpu_fontn < 1024) m->gpu_fontq[m->gpu_fontn++] = (uint16_t)v;
@@ -1445,6 +1473,37 @@ static void pcsamp_hit(uint32_t pc)
         if (g_pcsamp_pc[k] == pc) { g_pcsamp_ct[k]++; return; }
     }
 }
+/* Windowed periodic dump (CT952_PCSAMP_WIN=<icount window>, default 200M): print
+ * the hottest PCs/stacks for the CURRENT window and reset the histograms, so a
+ * long run that the sandbox kills before atexit still leaves the live spin loop
+ * in its log. Distinct from pcsamp_dump (cumulative, atexit). */
+static uint64_t g_pcsamp_lastdump = 0;
+static uint64_t g_pcsamp_win = 0;
+static void pcsamp_window_dump(uint64_t icount)
+{
+    int i, j;
+    fprintf(stderr, "[PCSAMP @%lluM] window top PCs:\n",
+            (unsigned long long)(icount / 1000000));
+    for (j = 0; j < 10; j++) {
+        int best = -1; uint32_t bc = 0;
+        for (i = 0; i < PCSAMP_N; i++)
+            if (g_pcsamp_ct[i] > bc) { bc = g_pcsamp_ct[i]; best = i; }
+        if (best < 0 || !bc) break;
+        fprintf(stderr, "   pc=%08x  %u\n", g_pcsamp_pc[best], bc);
+        g_pcsamp_ct[best] = 0;
+    }
+    for (j = 0; j < 4; j++) {
+        int best = -1; uint32_t bc = 0;
+        for (i = 0; i < 256; i++)
+            if (g_spsamp_ct[i] > bc) { bc = g_spsamp_ct[i]; best = i; }
+        if (best < 0 || !bc) break;
+        fprintf(stderr, "   sp~%08x  %u\n", g_spsamp_sp[best], bc);
+        g_spsamp_ct[best] = 0;
+    }
+    /* full reset so the next window is clean */
+    for (i = 0; i < PCSAMP_N; i++) { g_pcsamp_ct[i] = 0; }
+    for (i = 0; i < 256; i++) { g_spsamp_ct[i] = 0; }
+}
 
 uint64_t machine_run(machine_t *m, uint64_t n)
 {
@@ -1452,7 +1511,9 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     if (g_pcsamp_on < 0) {
         const char *e = getenv("CT952_PCSAMP");
         g_pcsamp_on = e ? 1 : 0;
-        if (e) { g_pcsamp_thresh = strtoull(e, NULL, 0); atexit(pcsamp_dump); }
+        if (e) { g_pcsamp_thresh = strtoull(e, NULL, 0); atexit(pcsamp_dump);
+            const char *w = getenv("CT952_PCSAMP_WIN");
+            g_pcsamp_win = w ? strtoull(w, NULL, 0) : 200000000ull; }
     }
     static int g_reach = -1;
     static uint64_t ccev = 0; static int ccev_done = 0;
@@ -1575,6 +1636,10 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                 if (getenv("CT952_PCSAMP_O7") && pc >= 0xd3900u && pc <= 0xd39a4u)
                     pc = sparc_get_reg(&m->cpu, 15);
                 pcsamp_hit(pc);
+            }
+            if (g_pcsamp_win && m->cpu.icount - g_pcsamp_lastdump >= g_pcsamp_win) {
+                g_pcsamp_lastdump = m->cpu.icount;
+                pcsamp_window_dump(m->cpu.icount);
             }
         }
         /* Faithful panel-config build (opt-in): at the first fetch of the

@@ -1007,6 +1007,13 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         if (addr == 0x40023a10u)
             fprintf(stderr, "[UITRACE] __bPOWERONMENUInitial <- %02x pc=%08x icount=%llu\n",
                     val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        /* mode-8 (media UI) stay-flag + its media-event trigger (§12.14/12.15) */
+        if (addr == 0x40032b3bu)
+            fprintf(stderr, "[UITRACE] mode8_stayflag(32b3b) <- %02x pc=%08x icount=%llu\n",
+                    val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        if (addr == 0x40032b0du)
+            fprintf(stderr, "[UITRACE] media_evt(32b0d) <- %02x pc=%08x icount=%llu\n",
+                    val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
       }
     }
 

@@ -3379,3 +3379,52 @@ run)? Likely a media/playback/dialog UI whose "should I be shown?" predicate is 
 faithful model says it shouldn't be — i.e. the door is mode 8's accept condition. Candidates to
 trace next (live, via a PC hook on `0xafd8`/`0x25ef4`): the input `i1` to `OSD_ChangeUI(8)` and the
 branch inside `0x25ef4` that decides its return value. Tooling: `CT952_UITRACE` (machine.c).
+
+### 12.15 MODE 8 SOLVED — it's the media/source UI; it latches on a non-empty source list
+
+Ran the latch to ground (disassembly of the mode-8 enter handler + its predicate, plus
+`CT952_UITRACE` live on the deciding flags, snapshot-chained).
+
+**What mode 8 is.** Its enter handler is **`0x25ef4`**. It prints the exact `"usb no playable
+file"` (`0xe7668`) and `"no SD card"` (`0xe7698`) strings §12.8 saw, and sits beside
+`KH_COMMON_QueryIfExistPlayableFile` / `File Manager: Mount device` — so **mode 8 = the
+media / source-scan + auto-decision UI** (SRCFTR / File-Manager multivolume). On ENTER it
+scans the removable sources for a playable file.
+
+**The exact latch — one flag.** After the scan, `0x25ef4` calls predicate **`0x272a8`** and
+`if (ret != 0) stay-in-mode-8 (return 1)` else `OSD_ChangeUI(mode 7 = POWERON_MENU)`.
+`0x272a8` is a single gate, verified on every return path:
+- `*(0x40032b3b) == 0`  → returns **0** → mode 8 declines → **`OSD_ChangeUI(POWERON_MENU)`** runs.
+- `*(0x40032b3b) != 0`  → returns **1** → **mode 8 latches** (does display setup, `0x2743c`/`0x69d48`).
+
+**Why the flag is non-zero.** `0x40032b3b` is set by a count-loop (`0x299f0..0x29a5c`) that
+walks the **active-volume list at `0x40032ab8`** to its `0xFF` terminator. Read live from the
+snapshot: `0x40032ab8 = [01 02 03 04 ff fe fe …]` → **4 volumes → count 5** → `0x40032b3b = 5`
+→ latch. That list is **loaded from config setting `0xa3`** (`0x33ca4(0xa3, 0x40032ab8, 10)`)
+— the device's stored source list, not a per-boot media probe.
+
+**So the chain, end to end:** boot `0x418f0` → `OSD_ChangeUI(8)` → `0x25ef4` scans (finds no
+removable media, prints the two messages) → `0x272a8` sees the **configured** source list is
+non-empty (`0x40032b3b=5`) → **stays in mode 8** → POWERON_MENU (mode 7) never entered →
+`__bPOWERONMENUInitial` never set → menu never draws AND screensaver never arms (§12.14).
+
+**Live evidence (`CT952_UITRACE`, chained):**
+```
+mode8_stayflag(32b3b) <- 05  pc=0x29a5c  icount~10.5M   (source count from setting 0xa3 list)
+activeUI -> rec id=8          pc=0x41b34  icount~32M     (mode 8 entered, latches)
+__bPOWERONMENUInitial         never written to 1
+```
+
+**The fork for the fix (next investigation).** The latch is gated on "are sources
+*configured*" (`0x40032b3b`, from setting `0xa3`), NOT on "is media *present*". Two candidate
+truths, to be settled next:
+1. **Mode 8 is meant to yield here** and the count should reflect *present* media (0 on a
+   no-media boot) — i.e. a faithful "no playable media" path should drive `0x40032b3b→0`.
+2. **Mode 8 is meant to STAY and PLAY** — its return-1 path (`0x27344`→`0x2743c`/`0x69d48`)
+   is playback setup, and the built-in flash photo album is one of volumes `[1,2,3,4]`; the
+   slideshow should start here and the real gap is that playback doesn't render (reconnecting
+   to the decode/display path §12.12). This fits the DMP's actual job (play built-in photos).
+
+Next step: trace mode 8's return-1 path (`0x27344`→`0x2743c`/`0x69d48`) live — is it starting
+playback of a built-in volume, and if so where does it stall? That distinguishes (1) vs (2).
+Diag: `CT952_UITRACE` now also logs `0x40032b3b` / `0x40032b0d`.

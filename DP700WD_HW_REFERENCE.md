@@ -3554,3 +3554,30 @@ literal; UIs that render purely from the OSD string-index table are opaque to st
 Naming the rest reliably requires either the retail `osd.c` UI-registration source (not in the
 tree) or driving the firmware into each mode and reading the on-screen OSD text (`CT952_UITRACE`
 + key injection), past the mode-8 latch.
+
+### 12.19 MILESTONE — the built-in album photo renders to the video plane, faithfully
+
+Following the insight that `0x40032b3b`=5 is the **5 built-in photos** (§12.15's open question
+resolved: the count is real, not phantom — mode 8 correctly stays because there IS content):
+verified the whole photo path works on a crutch-free boot (snapshot-chained via `seg.sh`).
+
+At icount ~42M (boot parked in mode 8, `dp700wd_ring.bin`, TICK_MULT=64, no display crutches):
+- **A real internal album JPEG is staged** at `0x401dc000`: a 640×360 JFIF, Exif
+  `software=Adobe Photoshop CS Windows datetime=2009:06:18`. The **"0001" album section**
+  (flash `0x160000`) is read by the firmware.
+- The firmware's **own JPU decode-op** runs it (§12.12): `JPEG decode #2: 640x360 from 0x401dc000`.
+- The **video plane is 90%+ populated** with the reconstructed frame: Y@`0x40065000` = 90%,
+  C@`0x400B3C00` = 92% non-zero. De-tiling the macroblock YUV (`videoplane.py`) reproduces the
+  photo — so the MCU-BIU tiled-YUV writeback lands correct pixels in the scan-out buffer.
+
+**Net:** the faithful boot finds the built-in album, stages the real photos, and the JPU decodes
+them into the video framebuffer on its own — the core demo/slideshow render path is FUNCTIONAL.
+`_bOSDSSScreenSaverMode` is still 0, so this render is via **mode 8's media display** (photos
+present → stay & show), not the OSDSS idle screensaver.
+
+Tools: `videoplane.py` de-tiles the video plane from a snapshot to PNG (Y@0x40065000 /
+C@0x400B3C00 / strip 0x2D00, YUV 4:2:0).
+
+**Open next:** (1) confirm the emu scan-out composites the video plane (its `--fb-out` targets the
+OSD plane `0x4005F000`; add a video-plane path). (2) confirm the slideshow **advances** through all
+5 photos on the photo-interval timer (chain further, count distinct decodes).

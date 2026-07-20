@@ -512,6 +512,23 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
              * HALJPEG_Display. Formerly gated behind CT952_LOGODECODE (crutch). */
             machine_maybe_jpeg_decode(m);
             m->biu_drained = 1;
+            /* EXPERIMENT (CT952_DECIRQ=<P1_2ND bit mask>): raise a PROC1-2nd
+             * decoder/BIU interrupt (BIU=0x10, MCU_BSRD=0x20, ...) on JPU
+             * completion + unmask it, to run the firmware's decoder DSR.
+             * RESULT (§12.29): NEGATIVE -- bits 0x10..0x1f0 delivered 68x each
+             * do NOT advance the boot. The power-on stage does not gate on a
+             * decode IRQ; it gates on a decode-STATUS POLL (0x36ff0->0x375a0
+             * action 3) over the decode handle 0x40022f88, which is NULL (its
+             * setup at ~0x55bd0 never runs). Kept env-gated as a documented
+             * negative probe. */
+            { const char *e = getenv("CT952_DECIRQ");
+              if (e) { uint32_t bit = (uint32_t)strtoul(e, NULL, 0);
+                io_set(m, R_P1_2ND_MASK, io_get(m, R_P1_2ND_MASK) | bit);
+                io_set(m, R_P1_2ND_PEND, io_get(m, R_P1_2ND_PEND) | bit);
+                if (getenv("CT952_DECIRQ_TRACE"))
+                    fprintf(stderr, "[DECIRQ] raised P1_2ND bit 0x%x (mask now %08x) icount=%llu\n",
+                            bit, io_get(m, R_P1_2ND_MASK), (unsigned long long)m->cpu.icount);
+              } }
         }
         return;
     case 0x2a20:
@@ -904,6 +921,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             if (pr && addr == 0x40022F5Eu && size == 1 && m->cpu.icount > 30000000ull)
                 return 2;
         }
+        /* (CT952_FORCEADV probe removed §12.29: proven inert -- forcing the
+         * page-8 guard VarB=1 does not advance, because by the time a photo has
+         * decoded the page-8 enter handler has already latched/returned; the
+         * real park is one layer deeper, the decode-status poll 0x36ff0 spinning
+         * on the NULL decode handle 0x40022f88.) */
         /* (CT952_NOMEDIA crutch removed §11.3: proven inert past POWERONMENU --
          * it faked the USBSRC worker's CHECK_DEVICE->NO_MEDIA result without
          * waking the real (asleep) USB source thread, so it changed nothing.
@@ -1036,6 +1058,13 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         if (addr == 0x40032b0du)
             fprintf(stderr, "[UITRACE] media_evt(32b0d) <- %02x pc=%08x icount=%llu\n",
                     val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        /* page-8 advance-event guard VarB (§12.28): set to 1 only when a
+         * completion/UI event is delivered; if this never fires the stage
+         * parks showing the first photo and never reaches POWERONMENU. */
+        if (addr == 0x40022f81u)
+            fprintf(stderr, "[UITRACE] VarB(22f81) <- %02x pc=%08x i7=%08x icount=%llu\n",
+                    val & 0xff, m->cpu.pc, sparc_get_reg(&m->cpu, 31),
+                    (unsigned long long)m->cpu.icount);
         /* OSDSS idle-timer activity counter (§12.21 gate C): whatever writes this
          * during the idle is the phantom-activity source that resets the
          * screensaver's idle window. Log the writing PC to name it. */
@@ -1670,8 +1699,10 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                 {0x00012f10u,"PostEvent->list(F)"}, {0x00006eecu,"EvtDispatch_bit80(F)"},
                 {0x00061170u,"UTL_ShowJPEG_Slide(F)"}, {0x000591b4u,"OSDSS_Monitor(F)"},
                 {0x00059108u,"OSDSS_Entry(F)"}, {0x00059004u,"_OSDSS_PictureUpdate(F)"},
+                {0x0007f0c4u,"DecoderDSR_A(F)"}, {0x000830acu,"DecoderDSR_B(F)"},
+                {0x00006130u,"MediaPresentPost(F)"}, {0x00045660u,"MonitorThrottle(F)"},
             };
-            static uint8_t hit[16];
+            static uint8_t hit[24];
             int wi;
             for (wi = 0; wi < (int)(sizeof(wl)/sizeof(wl[0])); wi++)
                 if (!hit[wi] && m->cpu.pc == wl[wi].pc) {

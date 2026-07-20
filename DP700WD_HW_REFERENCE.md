@@ -3474,3 +3474,49 @@ photo album once the media path yields to it. Modes 8–12 are one media/source 
 handlers); the low-address dialogs (0x0f/0x10/0x11/0x12) and menu-module 0x06/0x0e are the
 remaining unnamed UIs — precise names need the retail `osd.c` (absent from the tree) or live
 per-mode observation via `CT952_UITRACE`.
+
+### 12.17 Mode-map refinement — the retail enum ≈ osd.h with POWERON_MENU(7)↔DIGEST(17) swapped
+
+Pushed the naming further (source `OSD_ChangeUI(OSD_UI_*)` correlation + handler evidence).
+Findings, graded by confidence:
+
+**PROVEN:**
+- **mode 7 = POWERON_MENU.** Enter handler `0x61cf8` is the only writer of `__bPOWERONMENUInitial`
+  (`0x40023a10`), read by `OSDSS_Monitor` (`0x591b4`) as the screensaver gate; "Stop
+  playback / Show LOGO / ShowUI"; and it is the **most-dispatched mode by far** (24
+  immediate-arg `OSD_ChangeUI(7)` sites vs 0 for mode 17) — the "home screen" you return to.
+  `osd.h`'s DIGEST=7 could never have 24 call sites.
+- **mode 8 = MEDIA_SELECT_DLG.** "usb no playable file" / "no SD card" scan; the boot latch (§12.15).
+
+**Framework:** modes **8 and 11 match `osd.h` exactly** (MEDIA_SELECT_DLG=8, AUTO_UPGRADE=11),
+and mode 7 is provably POWERON_MENU while mode 17 is never dispatched — so the retail enum is
+**`osd.h` with POWERON_MENU(7) and DIGEST(17) swapped**, everything else as `osd.h`. Applying that:
+
+| mode | enter | name (retail) | basis |
+|------|-------|---------------|-------|
+| 0x06 | 0x65494 | DVD_PROGRAM / video display | osd.h + "Can't find LOGO"/"MPEG thread" |
+| 0x07 | 0x61cf8 | **POWERON_MENU** | PROVEN |
+| 0x08 | 0x25ef4 | **MEDIA_SELECT_DLG** | PROVEN |
+| 0x09 | 0x26294 | PSCAN_PROMPT_DLG | osd.h (media-module cluster) |
+| 0x0a | 0x2646c | BOOKMARK | osd.h (media-module cluster) |
+| 0x0b | 0x26638 | **AUTO_UPGRADE** | "UPG952A.AP" (matches osd.h) |
+| 0x0c | 0x26070 | SCREEN_SAVER | osd.h; handler in the photo module, shares handlers w/ mode 8; OSDSS is the photo slideshow |
+| 0x0d | 0x1f484 | COMMON_DLG | osd.h |
+| 0x0e | 0x67c28 | NAVIGATOR | osd.h |
+| 0x0f | 0x09908 | MAIN_MENU | osd.h |
+| 0x10 | 0x03564 | PASSWORD | osd.h |
+| 0x11 | 0x0ff6c | DIGEST (swapped from 7) | never dispatched; osd.h POWERON slot |
+| 0x12 | 0x048c0 | COPY_DELETE_DLG | osd.h |
+| 0x1f | 0x41154 | **MEDIA/PHOTO PLAYER** (not in osd.h) | Dec_JPEG/Dec_BMP/Parser/USBSRC — the built-in-photo renderer |
+
+**Lazy registration:** the boot-time table (§12.16) holds only the ~14 modes registered by
+~35M icount. Modes **1–5** (`DISPLAY`, `MEDIA_MANAGER`, `SETUP`, `THUMBNAIL`, `SEARCH`) are
+NOT present at boot — they register when first opened (e.g. entering SETUP from the menu),
+so they'd appear in the table only after that navigation. `OSD_ChangeUI(1)` is seen live
+("MEDIA_Management: Umount File System") so mode 1 = DISPLAY is exercised early.
+
+**For the goal:** the two modes that matter are **0x0c = SCREEN_SAVER** (the built-in photo
+slideshow's OSD mode; gated by the same `0x40032b3b` source-count as the mode-8 latch and by
+`__bPOWERONMENUInitial`) and **0x1f = the JPEG/BMP PLAYER**. Both are behind the mode-8 latch
+(§12.15): break that (POWERON_MENU runs → `__bPOWERONMENUInitial=1`), and the screensaver
+(mode 0x0c) can finally arm and drive the photo player.

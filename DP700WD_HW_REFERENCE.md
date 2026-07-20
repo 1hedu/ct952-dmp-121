@@ -4318,3 +4318,121 @@ unchanged frontier remains the CC-event producer deadlock (§12.42-12.46): no HW
 F_REQ bit `0x80` / re-posts CC mailbox `0x40033830`, and that producer is a media/source DSR
 (not a decode-completion one). This closes the "decode IRQ" class of leads the doc had kept open
 since §12.28.
+
+### 12.49 The media/source producer chain mapped end-to-end; media path RULED OUT as the blocker (source-proven); the CC-loop wake localizes to a display-restart that leaves VSYNC masked
+
+Task: find/name/model the **media/source** producer that should keep the CC event
+system alive (re-post CC mbox `0x40033830` / set F_REQ `0x40026e9c` bit `0x80`) so
+`CC_DVD_MainLoop` cycles, `OSDSS_Monitor` re-runs, and the ~20 s idle screensaver arms.
+Static RE (`dis.sh`, full-image objdump) + the authoritative firmware C sources. Live
+gdbstub is **unusable in this harness** — the sandbox kills any process that opens a
+listening socket (every `--gdb` launch dies before `[gdb] listening`; foreground
+non-gdb `--run-to`/`DUMPFLAGS` runs work and are used below).
+
+**The producer chain, fully mapped (addresses).**
+- **Worker `0x6748`** (created by the thread factory `CreateThreadByType(9)`, §12.48): at
+  startup it `OS_SetFlag(__fThreadInit 0x40038f80, 0x80000)` (`0x6754`), inits the flag
+  pair F_REQ `0x40026e9c` / F_DONE `0x40026ea4` (`0x595e8` ×2), then **dispatches ONE
+  message `(3,0x11)` via `0xad4cc`** (`0x6798`) — the single boot post §12.42 saw — and
+  enters its loop: `OS_WaitFlag(F_REQ 0x40026e9c, mask -1)` at `0x67d4`, then a `btst`
+  ladder over the returned bits (`0x800`→drain msg-queue at `[0x4002f820]`; `0x20`,
+  `0x80`, `0x200`, …). `0xad4cc` is a **command dispatcher** keyed on the 2nd arg
+  (`0x11`→`0xad590`, `0x21`, `0x22`…), not a raw mbox-put.
+- **Bit `0x80` handler `0x6eec`**: `call 0x12f10` (PostEvent) → `ClearFlag(F_REQ,~0x81)` →
+  `SetFlag(F_DONE,0x80)` (ack). So **F_REQ bit `0x80` is the "deliver a UI message /
+  PostEvent" event**; it drives the page-8 advance / OSDSS dispatch.
+- **Poster family** (the functions that SET F_REQ bits): `0x65dc(bit)` = "media-insert"
+  poster — reads `__fThreadInit` bit `0x80000` (returns 0 if USB-src thread not up, it
+  IS up), then `OS_SetFlag(F_REQ 0x40026e9c, bit)`. `0x6634(bit)` = "media-remove". Both
+  are called by **`MediaPresentPost 0x6130`** `(sourceIdx i0, present i1)`: present→
+  `0x65dc(2|4)`, absent→`0x6634(2|4)`, and it stashes `i0` at `0x40026e98`
+  (`MediaInfo[i0].present` at `0x40039b08 + i0*25 + 0x30`). **MediaPresentPost sets F_REQ
+  bits `2`/`4` (media insert/remove), NOT bit `0x80`.** The bit-`0x80` setter is a
+  separate precompiled "post-message" poster.
+
+**Media/source is NOT the direct blocker — the CC-loop poll-calls in that path are all
+non-blocking (source-proven; corrects §12.46's `MEDIA_Management` guess).** Every
+media/source poll `CC_DVD_MainLoop` runs uses flag-peek/-set, never a blocking get:
+- `MEDIA_Management` (media.c:631) and `MEDIA_MonitorStatus` (media.c:1016)→
+  `SrcFilter_TriggerUSBSRCCmd`/`SrcFilter_PeekUSBSRCCmd` (srcfilter.c:1224/1229) →
+  `USBSRC_TriggerCmd`/`USBSRC_PeekCmd` (usbsrc.c:191/239) → **`OS_PeekFlag`/`OS_SetFlag`
+  only** (no mbox-get, no wait). The CHECK_DEVICE handshake with the USBSRC thread is
+  fire-and-forget flags; if the USBSRC thread never answers, the peek just returns FALSE
+  and the loop continues — it does **not** block.
+- `OSD_Trigger` (osd.c:1253) is a message-timeout scanner (`OSDND_Update`/
+  `OSDND_GetMessagePos`), non-blocking.
+So the CC thread's blocking untimed mbox-get on `0x40033830` (§10.50/§12.45/§12.46) is
+**inside the precompiled OSD/event framework** (a callee of `DISP_MonitorVBICtrl` /
+`DBG_Polling` / the CC thread's own top-level command loop), **not** in any media/source
+call. The entire event framework — worker `0x6748`, `PostEvent 0x12f10`, the posters, the
+CC/OSD mbox — has **no counterpart in the `.c` sources** (`grep` for `OS_*Mbox`/`cyg_mbox`
+across every firmware `.c` returns nothing): it is linked from a precompiled library, the
+same wall §12.34/§12.42 hit.
+
+**SOURCE_SPI clarified — the keyless-screensaver source is built-in flash and produces NO
+media event.** `srcfilter.c` handles `SOURCE_SPI` only as a **read-data** source
+(`case SOURCE_SPI:` sets `__dwSFSPIStartAddr = SRCFTR_SPI_ENCODE_ADDR + pos*2048`,
+srcfilter.c:516) — there is no `SOURCE_SPI` insert/detect/mount path and no
+`MediaPresentPost(SOURCE_SPI,…)` anywhere. The built-in album is not "announced" via the
+media-event system; it is played directly by the screensaver (`OSDSS_Entry`→
+`_OSDSS_PictureUpdate`→`UTL_ShowJPEG_Slide`, osdss.c). Its **content** count is set at boot
+by `MM_EncodeFile_Init` (mm_play.c:2402, called from `_INITIAL_...`, initial.c:1326):
+`HAL_ReadStorage(SETUP_ADDR_JPG_ENCODE_MASK)` → if the setup-storage mask ≠
+`MM_JPG_ENCODE_HAVE_DATA` (fresh EEPROM) it sets `__bMMJPGEncodeNum = BUILD_IN_JPG_ENCODE_NUM`
+= **3** (`SUPPORT_BUILD_IN_ENCODE_JPG`, Winav.h:1590/1594); else it counts the stored list.
+`OSDSS_Entry` bails immediately if `__bMMJPGEncodeNum==0` (osdss.c:235). So the screensaver
+**content** is available on a fresh boot, and **arming depends only on the CC loop cycling**
+(so `OSDSS_Monitor` re-runs and the >`OSDSS_ENTER_TIME`≈20 s idle timer accumulates) with
+`__bPOWERONMENUInitial`=1. The media/source system is a red herring for the SPI screensaver;
+the deadlock is purely "the CC loop stops cycling."
+
+**Where the per-frame CC wake really is — VSYNC, gated behind a display-restart the boot
+never performs (refines §12.41; new measurement).** The CC get on `0x40033830` is untimed
+(§12.45), so only a **post** can wake it — i.e. a HW-event producer. At idle (no keys, no
+media insert, no decode, no audio) the **only** recurring HW event is the panel/TG **VSYNC**
+(`P1_1ST` bit0 → LEON 13 → `INT_Proc1_1st_isr`). VSYNC is enabled once by the display-init
+interrupt block **`0x3fac0`** (`st -1,[0x800000b0]`=`P1_1ST_MASK`, ~4.9 M, §12.41), then
+**masked** by the display-STOP routine **`0xa41f0`**: `st 1,[0x800000bc]` (`P1_1ST_MDIS`
+bit0) **and** `ld [0x4002401c]; or 2; st` (sets display-state **bit1 = stopped**) inside a
+PSR-critical section, at ~9.8 M. The display-enable block `0x3fac0` **never re-runs** after
+that — so VSYNC stays masked for the whole park. Measured live (rebuilt emulator,
+`--restore osdss.snap`, `DUMPFLAGS` at the ~90 M park, new fields added this session):
+```
+disp_state(bit1=stopped) @4002401c = 0x00000027   <- bit1 SET: display left STOPPED
+F_REQ(worker wake)       @40026e9c = 0x00000000   <- bit 0x80 never set
+P1_1ST mask@0b0=fffffffe pend@0b4=00000001         <- VSYNC firing (pend=1) but masked (bit0=0)
+__bPOWERONMENUInitial=0   _bOSDSSScreenSaverMode=0
+```
+The emulator **faithfully generates VSYNC** (`P1_1ST_PEND` bit0 set) and **faithfully
+respects the firmware's mask** — so re-arming VSYNC in the model would be a crutch. The real
+gap is that the boot is left **display-STOPPED** (`disp_state`=0x27, bit1) and the
+display-RESTART that would re-run `0x3fac0` (re-arm VSYNC → per-frame CC wake) never fires.
+That restart is itself gated behind the boot advancing (mode-8→mode-7→POWERONMENU→"display
+running"), which is gated behind the very event post that VSYNC would produce — the
+**same event-starvation circle** (§12.33), now pinned to the **display-stop/restart** state
+(`0xa41f0` / `0x3fac0`, flag `0x4002401c`) rather than to any media/source register.
+
+**What was modeled/added (faithful only).** No crutch. Added the two measurable roots to
+`CT952_DUMPFLAGS` (`main.c`): **F_REQ `0x40026e9c`** (worker-wake flag; bit `0x80` = the
+missing event) and the **display-state flag `0x4002401c`** (bit1 = display-STOPPED). These
+make the deadlock's two independent halves — "event never posted" and "display never
+restarted" — measurable at any `--run-to` checkpoint. Measured values recorded above.
+
+**VERDICT / honest gap.** The media/source producer the task asked for is **structurally
+absent for the SPI screensaver**: SOURCE_SPI is built-in flash with no insert event, and the
+media-detect polls (`MEDIA_Management`/`MEDIA_MonitorStatus`/USBSRC-CHECK_DEVICE) are all
+non-blocking flag ops that cannot post the missing message. The genuine missing producer is
+the **VSYNC / per-frame display interrupt**, whose DSR (in the precompiled OSD/event
+framework) re-posts the CC/OSD mbox each frame on real hardware; in emulation it is masked
+because the boot is left display-STOPPED and the display-restart (`0x3fac0`) never runs — a
+circle that closes only when the CC event fires. There is **no single unmodeled register**
+whose faithful modeling breaks the circle from the HW side (VSYNC is already generated and
+correctly masked; the media path is already satisfied). Breaking it requires either
+(a) reversing the precompiled display state-machine to find the specific
+poll/HW-completion that gates the display-restart after the boot's still-photo display
+(`0x4002401c` producers, `0xa41f0`↔`0x3fac0`), or (b) a live tracer that can breakpoint the
+`0x40033830` mbox-get and read the caller — impossible in this harness (listeners are
+killed). **Precise next step:** in a live-capable environment, break on the `0x40033830`
+get, read `%i7` to name the precompiled poll-call that blocks, and break on writes to
+`0x4002401c` to catch whether/when the display-restart runs. New instrumentation:
+`CT952_DUMPFLAGS` now dumps `F_REQ 0x40026e9c` + `disp_state 0x4002401c`.

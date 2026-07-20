@@ -202,6 +202,18 @@ int main(int argc, char **argv)
             {0x400239c0u, 4, "OSDSS_activity_token"},
             {0x400239ccu, 1, "__bOSDSSPicIdx"},
             {0x40026ea4u, 4, "event_flag(0x80 bit)"},
+            /* CC-event worker F_REQ (0x40026e9c): the flag the worker 0x6748
+             * waits on; bit 0x80 -> dispatcher 0x6eec -> PostEvent 0x12f10 ->
+             * re-post the CC/OSD event mbox -> CC loop cycles. NEVER set (§12.43,
+             * §12.49). Its low byte 0x40026e98 is MediaPresentPost's last source
+             * index (0x6130). */
+            {0x40026e9cu, 4, "F_REQ(worker wake;bit0x80)"},
+            /* Display-stop state flag (0x4002401c): the display-STOP routine
+             * 0xa41f0 sets bit1 and masks VSYNC (P1_1ST bit0 MDIS) at ~9.8M; the
+             * display-ENABLE block 0x3fac0 (which re-arms VSYNC, the natural
+             * per-frame CC-loop wake) never re-runs, so bit1 stays set and the
+             * boot is left display-STOPPED. See §12.49. */
+            {0x4002401cu, 4, "disp_state(bit1=stopped)"},
         };
         unsigned k;
         fprintf(stderr, "[DUMPFLAGS] pc=0x%08x icount=%llu\n",

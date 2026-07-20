@@ -3900,3 +3900,48 @@ Rigorous re-verification (I had built §12.29 on two mistakes; correcting the re
 - The decode-completion IRQ (`CT952_DECIRQ`, §12.29) remains NEGATIVE.
 
 **Honest state of the gap.** The stage displays the first built-in photo and idles, correctly per agent C's model (`if displayed_ok && VarB==0 → PARK`). `VarB` is set only when a UI/media **event is delivered** (via the CC-event worker, §12.28). No such event is produced at idle boot. The open question — unchanged and now stripped of the false leads — is **what event source (media-parse-complete, a power-on timeout, or a key) delivers the message that sets `VarB` and lets the stage advance to POWERONMENU → screensaver**. On the user's real hardware this happens keylessly and the screensaver slideshow starts ~15-20 s in; in the emulator it does not, and neither a forced `VarB` (wrong layer, §12.29) nor a decode IRQ (§12.29) nor higher time-compression reproduces it. This is genuinely the multi-source event-starvation frontier of §10.40, not yet closed.
+
+### 12.31 VarB backward trace complete — the advance chain is fully mapped; the block is event-buffer infrastructure never initialized
+
+Traced the page-8 advance guard `VarB (0x40022f81)` backward to its full setter chain (all execution-verified, indirect calls resolved):
+
+```
+VarB=1  set in  0x237dc  (conditionally, at 0x2384c)
+   ^ called by  0x21868   (snapshots the event buffer, then calls 0x237dc unless
+   |                        [0x4002fb52] bit 0x400 is set -- verified CLEAR at park)
+   ^ called by  0x2183c (gate [0x40022f61]==0, verified 0) and 0x1f5c0 (gate
+   |            [0x40022f63]==0 -> at park =0 so it SKIPS 0x21868)
+   ^ called by  stage handlers 0x1f378 / 0x27454 / 0x2743c -- reached only
+                INDIRECTLY through the OSD mode-handler table (no direct callers)
+```
+
+`0x21868` processes an **event message** out of the buffer at `[0x400328b8]` (agent A's
+`0x400306a6`). **At the park `[0x400328b8] = 0x00000000` (NULL)** — the event-buffer
+infrastructure was never installed. Its initializer is `0x1f634` (writes
+`0x400328b8 = 0x40030400|0x2a6 = 0x400306a6` at `0x1f6f4`), called from `0x23750`
+(inside fn `0x2374c`), called from `0x24ec8` — part of the modal-wait/stage machinery
+(`0x24d0c` family, §12 agent C). That init path never executes at idle boot.
+
+**So the advance is event-driven, and both the event AND the buffer that would carry it
+are absent:** no message is produced at idle (no key/IR, and the internal producers —
+media-parse / USB-source DSRs — don't fire because the USBSRC/source worker is parked in
+unmodeled card/USB HW, §10.40/§11.3), and the event-buffer init (`0x1f634`) hasn't run
+either. `VarB` therefore stays 0 and the stage parks showing the first photo.
+
+**Candid assessment of this frontier.** This is the multi-source event-starvation core
+§10.40 flagged, now mapped in full but not cracked. Static tracing keeps hitting
+*interdependent uninitialized state* (NULL handles `0x40022f88`, NULL event buffer
+`0x400328b8`, unset `VarB`) — several of which turned out to be *normal-null* or symptoms
+of the park rather than the root (see the §12.29→§12.30 retraction). The honest root, as
+in §10.40, is upstream: **the USB/card source worker never runs to produce a media event,
+and no key is injected** — so the event system has nothing to deliver and never initializes
+its delivery buffer. Closing this needs the source/media host-controller modelled well
+enough that the USBSRC worker completes CHECK_DEVICE and posts a media event (the faithful
+path), OR a single injected key/IR event (models the one user action) — both of which then
+flow through the now-fully-mapped chain above to set `VarB` → advance → POWERONMENU →
+`__bPOWERONMENUInitial=1` → idle → OSDSS screensaver slideshow.
+
+Verified anchors: `VarB 0x40022f81`; setter `0x237dc`(@`0x2384c`); event-proc `0x21868`
+(bail bit `0x4002fb52`&0x400, buffer `[0x400328b8]`); dispatch gates `0x40022f61`/`0x40022f63`;
+stage handlers `0x1f378`/`0x27454`/`0x2743c` (mode-table, indirect); event-buffer init
+`0x1f634`@`0x1f6f4` ← `0x2374c`@`0x23750` ← `0x24ec8`.

@@ -4155,3 +4155,18 @@ Used the hardened live tracer (§12.44) to settle whether the screensaver stall 
 - **Only the eCos scheduler spins** (150 samples, one thread `sp~0x40026000`); every firmware thread is blocked.
 
 **Conclusion (fork resolved).** The timer/clock subsystem is fully alive — this is NOT a frozen-tick or dead-alarm problem. `OSDSS_Monitor` runs exactly once because the CC main loop (`CC_DVD_MainLoop`, which calls it, cc.c:1396) is blocked in an untimed mbox-get on `0x40033830`, and nothing posts the message that would cycle it. The producer is a hardware-event DSR (media/decode/monitor-tick class, §12.42/12.43) that never fires in emulation — the correctly-scoped (a) frontier. Next: enumerate each blocked thread's wait object live, and identify which modeled-but-undelivered (or unmodeled) HW interrupt should drive the producer that posts to `0x40033830` / sets F_REQ bit 0x80. Tooling: reliable gdbstub (§12.44).
+
+### 12.46 Phase (a) cont. — CC_DVD_MainLoop is a POLL loop that shouldn't block; a poll-call is stuck in mbox-get (multi-thread deadlock)
+
+Live-traced (hardened stub) plus the authoritative source (`cc.c`):
+
+**`CC_DVD_MainLoop` (cc.c:836) is a `while(1)` busy-poll loop** — `MONITOR_CheckWatchDog`, `DBG_Polling`, `DSR_IR` (poll mode), `CC_MainProcessKey`, timed `OS_GetSysTimer` housekeeping (volume/keyscan), then a series of non-blocking `*_Trigger` polls (`PANEL/TFT/AUTOPWR/ALARM/GAMEMAIN`), `MEDIA_Management`, `SETUP_Trigger`, `OSDPROMPT_Trigger`, and finally **`OSDSS_Monitor()` at line 1004**. By design it never blocks; each iteration must reach line 1004 to advance the screensaver idle. `OSDSS_Monitor` ran exactly once (`__dwOSDSSCheckTime` stamped) → the loop completed one iteration, then on the next iteration **blocked inside one of its poll-calls in an mbox-get** — a call that is supposed to poll is instead sleeping. That is the concrete faithful bug: a poll waiting on a subsystem that never answers.
+
+**Multiple threads are deadlocked, each on its own input mbox (blocked-thread stacks read from m8b.snap):**
+- **CC thread** (thread struct `0x40035928`): sleeping in mbox-get on `0x40033830` (§10.50), reached from inside the `CC_DVD_MainLoop` poll body.
+- **Parser/InfoFilter thread `0x83098`**: on entry sets `__fThreadInit |= 0x100` (INIT_PARSER_THREAD_DONE, via `OS_SetFlag 0x59610` at `0x830ac`), then loops and sleeps in mbox-get on `0x4003cc00` (`call 0x5969c` at `0x841f4`, gated `if [fp-68]==0`) — waiting for parse jobs that never come.
+- Only the eCos scheduler runs (§12.44); every firmware thread is parked on an input queue.
+
+So the stall is a **producer/consumer deadlock across the media pipeline**: each worker sleeps waiting for a message from the previous stage, and the pipeline is never primed because the source-stage HW event (media/decode) never fires (§12.42/12.43). `OSDSS_Monitor` is collateral — it can't re-run because its host loop (`CC_DVD_MainLoop`) is stuck in a sibling poll-call's mbox-get.
+
+**Clean next step (avoids fragile stack-scraping):** boot fresh to mode-7 under the live stub, breakpoint mbox-get `0x5969c`, and catch the CC thread the FIRST time it enters the blocking get — read `%i7`/`%o7` live to name the exact `CC_DVD_MainLoop` poll-call that blocks (candidate: `MEDIA_Management`), then trace what that call waits for. That names the precise unmodeled HW response. Caveat recorded: manual stack-walks here hit stale/`0x5a5a5a5a`-fill words — trust `%fp`-chain / live regs, not value-shaped scans.

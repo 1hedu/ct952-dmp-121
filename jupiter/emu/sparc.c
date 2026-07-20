@@ -616,12 +616,35 @@ static int step(sparc_t *c)
     return 0;
 }
 
+/* Full-speed execution-PC watch (CT952_PCHIT): §12.42 -- log if/when any of the
+ * CC-mailbox event producers / PostEvent execute, and their caller. A handful of
+ * integer compares per instruction; no single-stepping. Reliable where the
+ * gdbstub's Ctrl-C interrupt is not (10.49). */
 uint64_t sparc_run(sparc_t *c, uint64_t n)
 {
     uint64_t i;
+    static int pchit = -1;
+    static const uint32_t WL[] = {
+        0x00012f10u, /* PostEvent->list */   0x00006eecu, /* EvtDispatch_bit80 */
+        0x00006430u, 0x00006798u, 0x000075d0u, /* mbox-post wrappers */
+        0x000ad4ccu,                           /* 0xad4cc mbox-put */
+        0x00061cf8u, /* mode-7 handler (flag setter) */
+    };
+    static uint8_t hit[8];
+    if (pchit < 0) pchit = getenv("CT952_PCHIT") ? 1 : 0;
     for (i = 0; i < n; i++) {
         if (c->halted) break;
         if (c->brk_pc && c->pc == c->brk_pc) break;   /* stop AT the bp, don't execute it */
+        if (pchit) {
+            uint32_t pc = c->pc;
+            for (unsigned k = 0; k < sizeof(WL)/sizeof(WL[0]); k++)
+                if (pc == WL[k] && !hit[k]) {
+                    hit[k] = 1;
+                    fprintf(stderr, "[PCHIT] %08x reached  caller o7=%08x i7=%08x sp=%08x icount=%llu\n",
+                            pc, sparc_get_reg(c, 15), sparc_get_reg(c, 31),
+                            sparc_get_reg(c, 14), (unsigned long long)c->icount);
+                }
+        }
         if (step(c)) break;
     }
     return i;

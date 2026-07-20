@@ -1131,6 +1131,30 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
       }
     }
 
+    /* CT952_FREQTRACE (§12.43): full-speed watch on the CC-event flag PAIR
+     * F_REQ 0x40026e9c / F_DONE 0x40026ea4. OS_SetFlag/ClearFlag write the whole
+     * word; log the new value + which bit(s) and the PC. The question: is bit 0x80
+     * (message-delivery -> 0x6eec -> PostEvent -> page-8/OSDSS) EVER set in F_REQ,
+     * and by whom? bit 0x1000 = per-frame redraw pulse (expected frequent). */
+    { static int fq = -1; if (fq < 0) fq = getenv("CT952_FREQTRACE") ? 1 : 0;
+      if (fq && (addr == 0x40026e9cu || addr == 0x40026ea4u)) {
+          static uint32_t prev_req = 0, prev_done = 0;
+          uint32_t *pp = (addr == 0x40026e9cu) ? &prev_req : &prev_done;
+          uint32_t newly = val & ~*pp;
+          const char *nm = (addr == 0x40026e9cu) ? "F_REQ " : "F_DONE";
+          /* always announce a bit-0x80 set; otherwise cap the (frequent) 0x1000 spam */
+          static int cap = 0;
+          if ((newly & 0x80u) || cap < 120) {
+              if (!(newly & 0x80u)) cap++;
+              fprintf(stderr, "[FREQ] %s <- %08x newly=%08x%s pc=%08x i7=%08x icount=%llu\n",
+                      nm, val, newly, (newly & 0x80u) ? "  <==BIT80!" : "",
+                      m->cpu.pc, sparc_get_reg(&m->cpu, 31),
+                      (unsigned long long)m->cpu.icount);
+          }
+          *pp = val;
+      }
+    }
+
     /* CT952_MONTRACE (§12.33): dynamic watch on the registered-monitor list head
      * (0x40032180/84) and the monitor callback table (0x40024980..0x40024b00).
      * page-8 advances only when 0x11f48 finds a monitor with a pending count in

@@ -988,6 +988,28 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
 {
     *fault = 0;
 
+    /* CT952_UITRACE: watch the OSD active-UI-record pointer (0x40020ec8) and the
+     * __bPOWERONMENUInitial gate (0x40023a10). Logs every UI-mode transition and
+     * every set/clear of the gate with the writing PC -- so the boot's UI path is
+     * visible (does it ever attempt POWERON_MENU / run the 0x61cf8 setter?).
+     * DP700WD_HW_REFERENCE.md 12.13. */
+    { static int uit = -1; if (uit < 0) uit = getenv("CT952_UITRACE") ? 1 : 0;
+      if (uit) {
+        if (addr == 0x40020ec8u) {
+            uint32_t rec = val, id = 0;
+            if (rec >= 0x40000000u && rec < 0x40000000u + MACH_DRAM_SIZE)
+                id = *(uint32_t *)(m->dram + (rec - 0x40000000u)); /* first word = mode id (BE host read below) */
+            fprintf(stderr, "[UITRACE] activeUI -> rec=%08x (id?=%08x) pc=%08x i7=%08x o7=%08x icount=%llu\n",
+                    val, __builtin_bswap32(id), m->cpu.pc,
+                    sparc_get_reg(&m->cpu, 31), sparc_get_reg(&m->cpu, 15),
+                    (unsigned long long)m->cpu.icount);
+        }
+        if (addr == 0x40023a10u)
+            fprintf(stderr, "[UITRACE] __bPOWERONMENUInitial <- %02x pc=%08x icount=%llu\n",
+                    val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+      }
+    }
+
     /* Count PROC2-reset asserts regardless of the PROC2 feature gate: the
      * config-callback-walk loop hammers 0x80000324 whether or not we model the
      * second core, so this measures the loop directly (diagnostic). */

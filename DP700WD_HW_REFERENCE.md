@@ -3333,3 +3333,49 @@ the door to both the menu and the screensaver.
 
 Tooling added this pass: `CT952_DUMPFLAGS` (main.c) prints the POWERONMENU/OSDSS gate
 flags at a `--run-to` checkpoint; `seg.sh` now dumps them per segment.
+
+### 12.14 ROOT MECHANISM FOUND — the UI latches in mode 8, so POWERON_MENU (mode 7) is never entered
+
+Traced the boot's OSD UI transitions live (`CT952_UITRACE` on the active-UI-record
+pointer `0x40020ec8` + `__bPOWERONMENUInitial` `0x40023a10`, snapshot-chained via `seg.sh`).
+The complete mechanism behind §12.13's "`__bPOWERONMENUInitial` stays 0":
+
+**Observed UI path (chained boot):**
+- `~2.4M` (pc 0x2be4, an init routine): `activeUI(0x40020ec8) = 0` (NONE), `__bPOWERONMENUInitial` cleared.
+- `~32M` (pc 0xb038, inside `OSD_ChangeUI`, **called from 0x41b34**): `activeUI -> record id=8`.
+- Steady state through 60M+: **activeUI stays id=8; never transitions; `__bPOWERONMENUInitial` never written to 1.**
+
+**Why POWERON_MENU never runs — decoded from the disassembly:**
+- `OSD_ChangeUI` is at **`0xafd8`**. Its mode→record lookup `0xae50` scans the runtime table
+  `0x40024c20..0x40024e00` (0x20-byte records) matching `mode == record[0]`, and `OSD_ChangeUI`
+  calls the enter handler at `record+4`. This **proves mode 7's handler is `0x61cf8`** (the sole
+  `__bPOWERONMENUInitial` setter, §12.13) — i.e. **mode 7 = POWERON_MENU in the retail build**.
+  ⚠️ `osd.h` (`OSD_UI_POWERON_MENU=17`, `MEDIA_SELECT_DLG=8`) is the **wrong SDK enum** for this
+  image — do not trust its OSD_UI numbers; the retail table is mode 7 = POWERON_MENU.
+- **`OSD_ChangeUI` returns 0 (declines) whenever `activeUI != 0`** (`0xafec: bne 0xb030`). It only
+  enters a mode (writes `activeUI`, returns 1) when `activeUI==0` AND the mode's enter handler
+  accepts (returns ≠0 or is null).
+- The UI-(re)build function **`0x418f0`** (called `0x418f0(0)` on the boot path from `0xadc4`; it
+  first runs the thread-init-flag `0x301` check — the same `0x301` as the boot narration "Some
+  thread not initial done. Desired: 00000301, Current: 00000100") does, at `0x41b34`:
+  ```
+  OSD_ChangeUI(8, ENTER);        // mode 8, handler 0x25ef4
+  if (ret != 0) goto done;       // 0x41b44 bne -> skip the fallback
+  OSD_ChangeUI(7, ENTER);        // 0x41b50: mode 7 = POWERON_MENU (would set __bPOWERONMENUInitial)
+  ```
+  Mode 8's handler `0x25ef4` **accepts** (returns ≠0), so `activeUI` latches to mode 8 and the
+  POWERON_MENU fallback is skipped.
+
+**The latch is self-perpetuating.** Once `activeUI = mode 8`, *every* subsequent
+`OSD_ChangeUI(7)` (there are 24 mode-7 call sites) returns 0 immediately (`activeUI != 0`),
+so POWERON_MENU can never be entered until something **exits** mode 8 (`OSD_ChangeUI` exit path
+`0xb04c` clears `activeUI`). Nothing does. Net: `__bPOWERONMENUInitial` stays 0 → menu never
+draws AND screensaver never arms — one latch, both symptoms. This supersedes the "missing event
+post / routing gap" framing (§11.5-11.7): the live mechanism is a **UI-mode latch**, not a lost message.
+
+**Open (the next chain link):** what is retail mode 8 (handler `0x25ef4`), and why does its enter
+handler accept on the no-media boot instead of declining (which would let the fallback POWERON_MENU
+run)? Likely a media/playback/dialog UI whose "should I be shown?" predicate is true when the
+faithful model says it shouldn't be — i.e. the door is mode 8's accept condition. Candidates to
+trace next (live, via a PC hook on `0xafd8`/`0x25ef4`): the input `i1` to `OSD_ChangeUI(8)` and the
+branch inside `0x25ef4` that decides its return value. Tooling: `CT952_UITRACE` (machine.c).

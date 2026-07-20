@@ -9,7 +9,7 @@ SNAP=seg.snap
 RESTORE="--restore $SNAP"
 [ "$2" = "first" ] && RESTORE=""
 for try in 1 2 3; do
-  env CT952_TICK_MULT=64 CT952_DUMPFLAGS=1 \
+  env CT952_TICK_MULT=64 CT952_DUMPFLAGS=1 CT952_UITRACE=1 \
     ./ct952emu dp700wd_ring.bin $RESTORE --run-to $STEP --snapshot ${SNAP}.new 2>seg.err >/dev/null
   rc=$?
   if [ $rc -eq 0 ] && [ -s ${SNAP}.new ]; then mv ${SNAP}.new $SNAP; break; fi
@@ -17,5 +17,7 @@ for try in 1 2 3; do
 done
 grep -aoE "reached icount=[0-9]+ pc=0x[0-9a-f]+" seg.err | tail -1
 grep -aE "@4002|DUMPFLAGS" seg.err
+echo "--- UI transitions this segment ---"
+grep -aE "\[UITRACE\]" seg.err | tail -25
 echo "--- milestones ---"
 grep -aoE "starting usb stack|EHCI version|HCD: EHCI host controller added|usb no playable|no SD card|KEY_DOWN|POWERONMENU" seg.err | sort -u

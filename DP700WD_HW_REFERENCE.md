@@ -3071,3 +3071,48 @@ USB was the wall; if it stalls again, the firmware will name the next thing. Eit
 now have the firmware narrating each step, so progress is observable directly. (Tooling:
 `probe_drain2.py` bulk-reads the ring at `0x4004c000`; `patch_dbg_fw.py [--live]` builds
 the debug fw.)
+
+### 12.8 STAGE 1 DONE — EHCI model unblocks USB; the CC main event loop is ALIVE
+
+Built a minimal EHCI host-controller model in the emu and the boot **broke through the
+USB wall into the main loop**. Details:
+
+**EHCI base = `0xa0000100`** (found live: `probe_ehci.py` breakpoints `ehci_init`'s
+CAPLENGTH read `0xb0260`, reads the bus_space handle `[tag+8]`). This is the `0xa000xxxx`
+region that logged 5.4M unmapped reads = the USB stack thrashing.
+
+**Model (`machine.c` `ehci_read/ehci_write`, region `0xA0000100..0x0200`):**
+- Caps: word0 `0x01000010` (fw byte/half accessor extracts CAPLENGTH=`0x10`,
+  HCIVERSION=`0x0100`), HCSPARAMS=`1` (N_PORTS=1), HCCPARAMS=0.
+- Op regs (at base+CAPLENGTH=`0xa0000110`): USBCMD (HCRESET self-clears), USBSTS
+  (HCHalted = !RUN), USBINTR, FRINDEX (advances w/ cycles), PERIODIC/ASYNC/CTRLDSS,
+  CONFIGFLAG, PORTSC[0]. PORTSC reports **no device** (CCS=0); writes drop the W1C
+  change bits. State fields added to `machine_t`. Trace: `CT952_EHCITRACE=1`.
+
+**Verified live** — the retail EHCI driver does a clean bring-up: reads caps, resets
+(USBCMD `0x2`→self-clears), programs PERIODICLISTBASE/ASYNCLISTADDR, runs
+(USBCMD=`0x20011`), CONFIGFLAG=1, powers the port (PORTSC=`0x1000`), sees CCS=0. Then
+**EHCI activity STOPS (31 accesses total, vs 5.4M before)** — enumeration converged.
+
+**Narration past the old wall (fw's own words, `probe_drain2.py`):**
+```
+ehci_local0: EHCI version 0001.0000, with 0001 ports      (was 0000/0000)
+uhub0: 0001 port with 0001 removable, self powered        (was 00C0 = 192 phantom)
+HCD: EHCI host controller added                            <-- HC added, enum done
+usb no playable file      /   no SD card                   <-- media scan: empty (correct)
+__dwSupportFeature=04
+-------O --- (KEY_DOWN)                                     <-- CC_DVD_MainLoop UI/key path!
+```
+That last line is the milestone: the CC thread is in **`CC_DVD_MainLoop`** processing
+key/UI events — it cleared ALL of power-on init (the thing that looked "stuck/dead" for
+prior sessions). The RTOS is alive in its steady event loop. `OSDSS_Monitor` (cc.c:1004)
+is now on the critical path each iteration, so the screensaver acceptance-test is finally
+reachable through the normal loop rather than injection.
+
+**Note on debug builds:** `dp700wd_dbg.bin` (`--live`) streams DBG straight to UART and
+so leaves the DRAM ring empty — use `dp700wd_ring.bin` (patch-1 only, `patch_dbg_fw.py`
+without `--live`) when reading narration from the ring via `probe_drain2.py`.
+
+**Next:** confirm the OSD/menu actually draws now (end-to-end `--fb-out`), then Stage 2 —
+attach a virtual USB mass-storage device (FAT image w/ the 5 album JPEGs) so "usb no
+playable file" becomes a real photo source, i.e. the DMP's actual function.

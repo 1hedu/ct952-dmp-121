@@ -594,6 +594,57 @@ static uint8_t proc2_ack_of(uint8_t cmd)
     }
 }
 
+/* ---- EHCI USB host controller model (base 0xa0000100) ------------------------
+ * Stage 1 goal: let the retail Jungo/BSD EHCI driver's init + root-hub scan
+ * COMPLETE with zero devices attached, so the boot advances past USB init.
+ * Layout: capability regs packed at base (CAPLENGTH byte0 + HCIVERSION bytes2-3
+ * in word 0; HCSPARAMS word 1); operational regs at base+CAPLENGTH(0x10). The
+ * fw's byte/half accessor extracts LE lanes from word 0, so word 0 must read
+ * back as 0x01000010 (CAPLENGTH=0x10, HCIVERSION=0x0100). Word regs are raw.
+ * Offsets below are relative to EHCI_BASE. */
+#define EHCI_BASE     0xA0000100u
+#define EHCI_END      0xA0000200u
+#define EHCI_NPORTS   1u
+
+static uint32_t ehci_read(machine_t *m, uint32_t off)
+{
+    switch (off) {
+    case 0x00: return 0x01000010u;              /* HCIVERSION<<16 | rsvd | CAPLENGTH */
+    case 0x04: return EHCI_NPORTS;              /* HCSPARAMS: N_PORTS in [3:0]        */
+    case 0x08: return 0x00000000u;              /* HCCPARAMS: 32-bit, no EECP         */
+    case 0x0C: return 0x00000000u;              /* HCSP_PORTROUTE                     */
+    /* operational registers at base+CAPLENGTH (0x10) */
+    case 0x10: return m->ehci_usbcmd & ~0x2u;   /* USBCMD (HCRESET self-clears)       */
+    case 0x14:                                  /* USBSTS: HCHalted(0x1000)=!running  */
+        return (m->ehci_usbcmd & 1u) ? (m->ehci_usbsts & ~0x1000u)
+                                     : (m->ehci_usbsts | 0x1000u);
+    case 0x18: return m->ehci_usbintr;          /* USBINTR                            */
+    case 0x1C: return (uint32_t)((m->cycles >> 10) & 0x3FFFu); /* FRINDEX advancing   */
+    case 0x20: return m->ehci_ctrldss;          /* CTRLDSSEGMENT                      */
+    case 0x24: return m->ehci_periodic;         /* PERIODICLISTBASE                   */
+    case 0x28: return m->ehci_async;            /* ASYNCLISTADDR                      */
+    case 0x50: return m->ehci_configflag;       /* CONFIGFLAG                         */
+    case 0x54: return m->ehci_portsc[0];        /* PORTSC[0]: no connect -> 0         */
+    default:   return 0;
+    }
+}
+
+static void ehci_write(machine_t *m, uint32_t off, uint32_t val)
+{
+    switch (off) {
+    case 0x10: m->ehci_usbcmd = val & ~0x2u; break;      /* reset completes instantly */
+    case 0x14: m->ehci_usbsts &= ~(val & 0x3Fu); break;  /* W1C interrupt bits         */
+    case 0x18: m->ehci_usbintr = val; break;
+    case 0x1C: m->ehci_frindex = val; break;
+    case 0x20: m->ehci_ctrldss = val; break;
+    case 0x24: m->ehci_periodic = val; break;
+    case 0x28: m->ehci_async = val; break;
+    case 0x50: m->ehci_configflag = val; break;
+    case 0x54: m->ehci_portsc[0] = val & ~0x2Au; break;  /* drop W1C change bits; no dev */
+    default: break;
+    }
+}
+
 static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
 {
     *fault = 0;
@@ -857,6 +908,16 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
     }
     if (addr >= 0x90000000u && addr < 0x90010000u)
         return 0;                        /* DSU stub */
+    if (addr >= EHCI_BASE && addr < EHCI_END) {
+        uint32_t off = (addr - EHCI_BASE) & ~3u;
+        uint32_t v = ehci_read(m, off);
+        if (getenv("CT952_EHCITRACE"))
+            fprintf(stderr, "[ehci] rd 0x%08x off 0x%02x -> 0x%08x (pc=0x%08x)\n",
+                    addr, off, v, m->cpu.pc);
+        if (size == 4) return v;
+        if (size == 1) return (v >> ((3 - (addr & 3)) * 8)) & 0xFF;
+        return (v >> ((addr & 2) ? 0 : 16)) & 0xFFFF;
+    }
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 0, 0);
         return 0;                        /* FCR/SDC/NFC stub */
@@ -1039,6 +1100,14 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
     }
     if (addr >= 0x90000000u && addr < 0x90010000u)
         return;
+    if (addr >= EHCI_BASE && addr < EHCI_END) {
+        uint32_t off = (addr - EHCI_BASE) & ~3u;
+        if (getenv("CT952_EHCITRACE"))
+            fprintf(stderr, "[ehci] wr 0x%08x off 0x%02x <- 0x%08x (pc=0x%08x)\n",
+                    addr, off, val, m->cpu.pc);
+        ehci_write(m, off, val);
+        return;
+    }
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 1, val);
         return;

@@ -156,6 +156,13 @@ typedef struct machine {
     int log_n;
     uint32_t unmapped_reads, unmapped_writes;
 
+    /* EHCI USB host controller (base 0xa0000100). Stage 1: bring-up + empty
+     * root hub (no device attached) so the retail USB enumeration completes and
+     * the boot advances past "starting usb stack". */
+    uint32_t ehci_usbcmd, ehci_usbsts, ehci_usbintr, ehci_frindex;
+    uint32_t ehci_ctrldss, ehci_periodic, ehci_async, ehci_configflag;
+    uint32_t ehci_portsc[4];
+
     uint64_t cycles;
     int watchdog_fired;
 } machine_t;

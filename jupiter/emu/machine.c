@@ -1081,6 +1081,24 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
       }
     }
 
+    /* CT952_MONTRACE (§12.33): dynamic watch on the registered-monitor list head
+     * (0x40032180/84) and the monitor callback table (0x40024980..0x40024b00).
+     * page-8 advances only when 0x11f48 finds a monitor with a pending count in
+     * this list (§10.24), and the list is empty at the park. Log every write here
+     * -- catches the computed-pointer registrations static disasm can't annotate,
+     * so we can see WHO registers a monitor (the event producer) or confirm none. */
+    {
+        static int mt = -1;
+        if (mt < 0) mt = getenv("CT952_MONTRACE") ? 1 : 0;
+        if (mt && addr >= 0x40032180u && addr <= 0x4003218cu &&
+            m->cpu.icount > 5000000ull) {
+            static int n; if (n < 120) { n++;
+            fprintf(stderr, "[MON] %08x <- %08x pc=%08x i7=%08x o7=%08x icount=%llu\n",
+                    addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 31),
+                    sparc_get_reg(&m->cpu, 15), (unsigned long long)m->cpu.icount); }
+        }
+    }
+
     /* Count PROC2-reset asserts regardless of the PROC2 feature gate: the
      * config-callback-walk loop hammers 0x80000324 whether or not we model the
      * second core, so this measures the loop directly (diagnostic). */

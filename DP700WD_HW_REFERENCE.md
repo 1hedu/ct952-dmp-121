@@ -3149,3 +3149,39 @@ the draw path is entered and where it bails; (2) **Stage 2** — attach a virtua
 mass-storage device (FAT + the 5 album JPEGs); the DMP is a photo frame and `usb no
 playable file`/`no SD card` suggest it may simply be idling for media, in which case
 giving it media is the real unblock (and the actual product function).
+
+### 12.10 Menu-draw chase — PROC2 ruled OUT (again); it's the POWERONMENU draw path
+
+Chased the display-enable handshake with the boot reliably reaching the idle main loop
+(EHCI + ADC fixes in place). Findings:
+
+**PROC2/video is NOT the blocker (refreshed §8.1/8.2/10.7/10.8):** this image is CT909P →
+JPEG decode is **hardware** (JPU/VLD/MCU-BIU), not PROC2 microcode; and PROC2 is
+*deliberately* held in reset at the menu (released only in `HAL_ReloadAudioDecoder`, a
+media-playback-thread call). **The power-on menu is designed to draw with PROC2 in
+reset.** So the missing `MPEG_DEC` thread bit is expected, and the slideshow's JPEG path
+is modeled. Do not chase PROC2 for the menu.
+
+**The OSD is never enabled AND the menu is never drawn (not just an enable bug):**
+- OSD framebuffer = `0x4005F000` (§4), sampled ~all-zero at the idle state → no icons.
+- `DISPTRACE`: OSD region regs (`0x1a48/50/54`) are written ONLY at ticks 0x4–0x29
+  (~5M icount); `DISP_OSD_EN` (bit28 of `0x1a54`) is **never** set; palette (`0x1c00`)
+  never loaded.
+- Unwound each early OSD-config write (bp `0xa331c/0xa56bc/0xa41ac`): the ~5M writes come
+  from a **decoder/display worker thread** (thread entry `0x497ac`, which reads PROC2
+  reset-ctl `0x8000031c`) and the early-init path `0x418xx`/`0xa8bb4` — **not** from
+  `POWERONMENU`. After ~5M the only OSD-register touches are the per-frame **compositor**
+  (`~0xa685c`, chain via `0x61378`) doing its `andn …,0x10000000` OSD_EN clear.
+- So `POWERONMENU_ConfigOSDRegion`/`_POWERONMENU_ShowIcon` never run → `POWERONMENU_Initial`
+  bails **before** `_POWERONMENU_DrawAllUI`'s icon draw.
+
+**Candidate bail points (poweronmenu.c):** (a) the early return `if (__bPOWERONMENUInitial)
+return;` at line 384 — set TRUE by a prior/racing `POWERONMENU_Initial` call (it's called
+from cc.c:1320 AND media.c:1577/the USBSRC thread AND cc.c:925/3139); or (b) inside
+`_POWERONMENU_DrawAllUI`, the `if (Disable_Init_Menu()) return;` at line 457 (returns
+`DisInitMenuFlag`) which sits AFTER `POWERONMENU_ConfigOSDRegion` (453) but BEFORE
+`_POWERONMENU_ShowIcon` (461) — though the config-write traces argue the menu path isn't
+even reaching 453. **Next: pin `POWERONMENU_Initial`'s real dp700wd.bin address (DVD909.sym
+is wrong per §10.7) and breakpoint it — count calls, threads, and whether each reaches the
+draw or early-returns on the flag.** The continuous-UART narration (`--live` build,
+`_dwUartPort`→`0x80000070`, now verified working) is the live commentary for this.

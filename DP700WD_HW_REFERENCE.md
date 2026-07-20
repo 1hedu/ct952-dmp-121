@@ -4101,3 +4101,23 @@ Chased the §12.40 "CC loop runs OSDSS_Monitor once then stops" blocker along th
 2. **Keep the CC loop cycling** so `OSDSS_Monitor` runs each frame and the idle timer accumulates. Gated by the CC-thread mbox-get block on mailbox `0x40033830` (§10.50) — confirmed still present at the mode-7 state (`[+3c]=0`, thread on waitlist). `OSDSS_Monitor` ran exactly once (`__dwOSDSSCheckTime` frozen 100M→300M).
 
 Both are the **same event-starvation core** (§12.33): a periodic message/event producer that a live system posts and the emulator does not. Ruled out this session and prior: VSYNC (faithfully masked, §12.41), decode-completion IRQ (§12.29 negative), IIC/RTC (benign, §12.39), config-read (§12.35), forced flag (§12.38 confounded). The producer posts to mbox `0x40033830` via `0xad4cc`←`0x6430/0x6798/0x75d0`, all indirectly dispatched with **no static caller or memory pointer** (same wall as `0x7efdc` §12.34 and the mode-table handlers). The one tool that could name it live — a breakpoint on `PostEvent 0x12f10` / the posters — needs a gdbstub that survives backgrounding; the current stub's Ctrl-C interrupt is unreliable in the slow park (§10.49). Making that trace reliable, or reversing the eCos interrupt-vector registration that installs the producer DSR, is the next concrete step. New diagnostics: `machine_io_get`+IRQ `DUMPFLAGS`, `CT952_VSMTRACE`.
+
+### 12.42 PROVEN by full-speed PC trace — the CC mailbox is posted exactly ONCE at boot; the bit-0x80 event dispatch never runs
+
+Added `CT952_PCHIT` (sparc.c `sparc_run`): a full-speed execution-PC watch (a few integer compares per instruction, no single-stepping) — reliable where the gdbstub's Ctrl-C interrupt is not (§10.49). Watched the CC-mailbox posters, `PostEvent`, the bit-0x80 dispatcher, and the mode-7 flag handler over a full 120M crutch-free boot. This converts §12.33's event-starvation from inference to **hard fact**:
+
+```
+0x6798 (CC-mbox post -> 0xad4cc)   fires EXACTLY ONCE  @ icount 25.97M  (from worker 0x6748, under 0x4001ea60)
+0x12f10 (PostEvent)                NEVER fires (0 hits / 120M)
+0x6eec  (EvtDispatch_bit80)        NEVER fires
+0x61cf8 (mode-7 flag setter)       NEVER fires
+0x6430, 0x75d0 (other posters)     NEVER fire
+```
+
+**The two channels, disentangled:**
+- **CC mailbox `0x40033830`** (mbox-put via `0xad4cc`) — the CC thread's command queue. Posted **once** at 25.97M by worker `0x6748` (a message `(3, 0x11)`; `0x6748` also sets thread-init flag `0x80000` and touches the F_REQ/F_DONE pair). The CC thread wakes once, processes it, then sleeps in mbox-get forever (§10.50 confirmed).
+- **Event flag pair F_REQ `0x40026e9c` / F_DONE `0x40026ea4`** — the bit-0x80 monitor/event dispatch. Handler `0x6eec` clears F_REQ bit 0x80, sets F_DONE bit 0x80 (ack), calls `PostEvent 0x12f10` (populates the registered-monitor descriptor → page-8 advance / `OSDSS_Monitor` dispatch), drains a message queue at `[base+0x220]`. `0x6eec` runs only when a **producer sets F_REQ bit 0x80** — which **never happens** in the whole boot. So the OSDSS/page-8 event dispatch is dead at the producer.
+
+**Dispatch structure (why it's unresolvable statically):** `0x6748` (worker) and `0x6eec` (dispatcher) both have **no direct caller and no memory pointer** — eCos thread bodies / indirectly-registered handlers, same wall as `0x7efdc` (§12.34) and the mode-table handlers. `PostEvent 0x12f10` is called only from `0x6eec`.
+
+**Net.** The boot is definitively event-starved after 25.97M: one CC-mailbox post, then nothing sets F_REQ bit 0x80, so `0x6eec`→`PostEvent`→(page-8 advance / OSDSS dispatch) never runs and mode-7 (`0x61cf8`) never enters. The faithful unlock is the producer that should set F_REQ bit 0x80 (and/or re-post the CC mailbox) periodically — an interrupt/timer-driven eCos handler whose trigger the emulator doesn't deliver. Next lever: determine whether worker `0x6748` is a thread meant to LOOP (and blocks after one post) vs. a one-shot, and what HW event feeds the bit-0x80 producer. New diagnostic: `CT952_PCHIT` (sparc.c).

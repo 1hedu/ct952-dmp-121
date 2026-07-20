@@ -630,7 +630,7 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
         0x000ad4ccu,                           /* 0xad4cc mbox-put */
         0x00061cf8u, /* mode-7 handler (flag setter) */
     };
-    static uint8_t hit[8];
+    static uint16_t hit[8];
     if (pchit < 0) pchit = getenv("CT952_PCHIT") ? 1 : 0;
     for (i = 0; i < n; i++) {
         if (c->halted) break;
@@ -638,10 +638,10 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
         if (pchit) {
             uint32_t pc = c->pc;
             for (unsigned k = 0; k < sizeof(WL)/sizeof(WL[0]); k++)
-                if (pc == WL[k] && !hit[k]) {
-                    hit[k] = 1;
-                    fprintf(stderr, "[PCHIT] %08x reached  caller o7=%08x i7=%08x sp=%08x icount=%llu\n",
-                            pc, sparc_get_reg(c, 15), sparc_get_reg(c, 31),
+                if (pc == WL[k] && hit[k] < 60) {
+                    hit[k]++;
+                    fprintf(stderr, "[PCHIT] %08x #%u  o7=%08x i7=%08x sp=%08x icount=%llu\n",
+                            pc, hit[k], sparc_get_reg(c, 15), sparc_get_reg(c, 31),
                             sparc_get_reg(c, 14), (unsigned long long)c->icount);
                 }
         }

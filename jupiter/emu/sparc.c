@@ -636,12 +636,13 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
      * mbox-get wrapper 0x5969c with its caller-site (%o7) and object arg (%o0),
      * past the park window. The FINAL non-returning get names the CC_DVD_MainLoop
      * poll-call that blocks (§12.46). */
-    static int mbt = -1; static uint32_t mbtn = 0;
-    if (mbt < 0) mbt = getenv("CT952_MBOXTRACE") ? 1 : 0;
+    static int mbt = -1; static uint32_t mbtn = 0; static uint64_t mbfrom = 0;
+    if (mbt < 0) { mbt = getenv("CT952_MBOXTRACE") ? 1 : 0;
+        const char *e = getenv("CT952_MBOX_FROM"); mbfrom = e ? strtoull(e,NULL,0) : 34000000ull; }
     for (i = 0; i < n; i++) {
         if (c->halted) break;
         if (c->brk_pc && c->pc == c->brk_pc) break;   /* stop AT the bp, don't execute it */
-        if (mbt && c->pc == 0x5969cu && c->icount > 34000000ull && mbtn < 2000) {
+        if (mbt && c->pc == 0x5969cu && c->icount > mbfrom && mbtn < 2000) {
             mbtn++;
             fprintf(stderr, "[MBOX] get caller o7=%08x arg o0=%08x icount=%llu\n",
                     sparc_get_reg(c, 15), sparc_get_reg(c, 8),

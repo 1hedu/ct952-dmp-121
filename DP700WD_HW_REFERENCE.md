@@ -3581,3 +3581,40 @@ C@0x400B3C00 / strip 0x2D00, YUV 4:2:0).
 **Open next:** (1) confirm the emu scan-out composites the video plane (its `--fb-out` targets the
 OSD plane `0x4005F000`; add a video-plane path). (2) confirm the slideshow **advances** through all
 5 photos on the photo-interval timer (chain further, count distinct decodes).
+
+### 12.20 Photo renders but the slideshow does NOT auto-advance — the screensaver is gated out
+
+Chained the crutch-free boot far past the first album decode and characterised the steady state:
+
+- **Decodes:** #1 = 480×270 (splash logo), #2 = 640×360 (a real album photo, §12.19). Chaining
+  **42M → 122M (80M instructions) produced NO further decode** — the slideshow does not cycle.
+- **Where it idles:** bounded PCSAMP on the 82M snapshot shows the hot loop is the **steady idle
+  delay loop** `0x5983c–0x5984c` + eCos helper `0x4001deec` (§12.14) — i.e. alive and idling, NOT
+  stuck. The park at `0x62500` seen at a checkpoint is incidental.
+- **`0x62500` is the I2C RTC driver.** Register block `0x8000420c` (read-data-ready) / `0x4210`
+  (cmd) / `0x4214` (data); strings *"Wait for RTC Initialization timeout"*, *"RTC Key(0x55AA)
+  Error"*. The emu models the CMD busy-clear but NOT `0x420c` data-ready, so RTC I2C **reads time
+  out**. This is a real unmodeled peripheral (an I2C RTC chip) but PCSAMP shows it is **incidental**
+  to the idle — hit 1–2× per window, not the slideshow blocker.
+
+**Why no slideshow (the gate, from the flags at steady state):**
+- `_bOSDSSScreenSaverMode` = 0 (screensaver not entered), `__bOSDSSPicIdx` = 0.
+- `__dwOSDSSCheckTime` **advances** (0x1771→0x33fe→…) ⇒ `OSDSS_Monitor` IS running and calling
+  `OSDSS_ResetTime` on activity — the monitor is live.
+- `__bPOWERONMENUInitial` = **0** ⇒ OSDSS step-5 hard gate unmet (§10.44). The screensaver
+  (the auto photo-slideshow) can't enter.
+
+So the render path is proven (a real album photo is decoded to the video plane), but the
+**auto-slideshow is the OSDSS screensaver, which is gated on `__bPOWERONMENUInitial`** — set only
+by mode 7 (POWERON_MENU), which the **mode-8 latch skips** (§12.14/12.15). The chain closes:
+`mode-8 latches (5 photos → stay) → POWERON_MENU never runs → __bPOWERONMENUInitial stays 0 →
+OSDSS screensaver never enters → no cycling slideshow`, even though single-photo render works.
+
+**Open decision (needs the real device's behaviour):** on a DMP with built-in photos, does mode 8
+itself cycle the album (then the gap is a mode-8 slideshow-advance timer), or does it hand off to
+the OSDSS screensaver (then `__bPOWERONMENUInitial` must get set — i.e. POWERON_MENU must run
+alongside/after mode 8)? A quick diagnostic: force `__bPOWERONMENUInitial=1` at the mode-8 idle and
+see whether OSDSS then cycles the 5 photos — proving the screensaver path end-to-end.
+
+Unmodeled-peripheral backlog (faithful TODO): the **I2C RTC** (`0x8000420c` data-ready + the RTC
+register map / valid time) — not the slideshow blocker, but required for a truly "normal" boot.

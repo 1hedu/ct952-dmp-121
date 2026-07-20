@@ -3520,3 +3520,37 @@ slideshow's OSD mode; gated by the same `0x40032b3b` source-count as the mode-8 
 `__bPOWERONMENUInitial`) and **0x1f = the JPEG/BMP PLAYER**. Both are behind the mode-8 latch
 (§12.15): break that (POWERON_MENU runs → `__bPOWERONMENUInitial=1`), and the screensaver
 (mode 0x0c) can finally arm and drive the photo player.
+
+### 12.18 CORRECTION — osd.h names do NOT transfer; retract the inferred labels (§12.17)
+
+Prompted by "what is mode 0x10 = PASSWORD?" — it isn't. Verified:
+- `OSD_UI_PASSWORD` is a **DVD parental-lock dialog** (osd.c: "DVD Password Dialog"). This is
+  a photo frame: there are **zero** `password`/`PIN`/`parental` strings anywhere in the image,
+  and **no `OSD_ChangeUI(0x10)` call site** exists. Mode 0x10's handler `0x03564` just does
+  OSD-region setup (calls poweronmenu.c's OSD-frame allocator `0x61fb8`) — **not a password UI.**
+- So the §12.17 "retail = osd.h with 7↔17 swap" framework is **wrong as a naming source.** The
+  DVD-SDK `osd.h` enum does NOT transfer to this DMP build. The matches that looked like osd.h
+  (8, 11) were established by **independent evidence**, not by osd.h — so they stand; the purely
+  osd.h-*inferred* labels (modes 9,10,12,13,14,15,16,17,18) are **retracted as unverified.**
+- **The screensaver is NOT a table mode.** `OSDSS_Entry` (`0x59108`) does not call `OSD_ChangeUI`
+  at all — it calls `_OSDSS_PictureUpdate` (`0x59004`) directly, and no mode-table handler lives
+  in the OSDSS module (`0x59xxx`). OSDSS (osdss.c) is a **separate direct-draw subsystem**, so the
+  earlier "mode 0x0c = SCREEN_SAVER" is also retracted.
+
+**What actually stands (evidence-based only):**
+
+| mode | enter | identity | evidence |
+|------|-------|----------|----------|
+| 0x07 | 0x61cf8 | **POWERON_MENU** | sets `__bPOWERONMENUInitial` read by OSDSS_Monitor; 24 dispatch sites; "Stop playback/Show LOGO/ShowUI" — PROVEN |
+| 0x08 | 0x25ef4 | **MEDIA / SOURCE-SCAN UI** (the boot latch) | "usb no playable file"/"no SD card", `KH_COMMON_QueryIfExistPlayableFile` — PROVEN |
+| 0x0b | 0x26638 | **FIRMWARE AUTO-UPGRADE** | references `UPG952A.AP` |
+| 0x1f | 0x41154 | **JPEG/BMP MEDIA PLAYER** (the photo renderer) | `Dec_JPEG`/`Dec_BMP`/`Parser`/`USBSRC`/`/ROOT`/`fatfs` |
+| 0x06 | 0x65494 | **VIDEO / LOGO display** | "Can't find LOGO data", "MPEG thread not initial done" |
+| 0x08–0x0c | 0x25xxx/0x26xxx | **media/photo UI family** | one module; 0x0c shares exit(+8)/key(+14) handlers with mode 8 |
+| 0x09,0x0a,0x0d,0x0e,0x0f,0x10,0x11,0x12 | — | **UNIDENTIFIED** | draw via OSD string-table indices, no literals; names need the retail `osd.c` (absent) or live per-mode observation |
+
+**Method note:** handler string-scanning names a mode only when its handler emits a DBG/text
+literal; UIs that render purely from the OSD string-index table are opaque to static scanning.
+Naming the rest reliably requires either the retail `osd.c` UI-registration source (not in the
+tree) or driving the firmware into each mode and reading the on-screen OSD text (`CT952_UITRACE`
++ key injection), past the mode-8 latch.

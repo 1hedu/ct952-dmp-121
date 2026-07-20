@@ -3731,3 +3731,35 @@ the thumbnail/OSDSS path) never starts.
 — i.e. the auto-play-on-boot decision (`IMAGE_FRAME_SETUP` / `POWERONMENU_PowerOnPlayMediaDirectly` /
 the thumbnail auto-enter) — and why it isn't taken. That decision, not the render, is the last gap.
 Tools this pass: `CT952_DECODE_STACK` (decode caller chain), `seg.sh` now sets it.
+
+### 12.25 GAP CLOSED (design level): this build does NOT auto-play on boot — it's menu + screensaver
+
+Traced the actual boot decision in `cc.c Thread_CTKDVD` and the photo-play entry points. Definitive:
+
+- **`SUPPORT_PLAY_MEDIA_DIRECTLY_POWER_ON` is commented out** (`//#define`, Winav.h:1559). So
+  `POWERONMENU_PowerOnPlayMediaDirectly()` (Thread_CTKDVD:1372) is NOT compiled.
+- Our build takes the `#ifndef` branch: **Thread_CTKDVD:1320 calls `POWERONMENU_Initial()`** (show the
+  power-on menu) → `MEDIA_DecidetMedia()` → `CC_DVD_MainLoop()`.
+- The photo slideshow entry `_POWERONMENU_EnterPhotoMusicMode` / `_POWERONMENU_EnterPhotoMode` has
+  **only user-input callers**: `KEY_PHOTO`/`KEY_PHOTO_MUSIC` shortcuts (poweronmenu.c:484,492) and the
+  POWERON_MENU **photo-icon selection** (`_POWERONMENU_ProcessIcon`, :1309/1319) and in-menu keys
+  (:1489/1495). There is **no automatic boot-time slideshow call** in this build.
+
+**So the "boot straight into the slideshow" premise does not hold for THIS firmware.** The real
+"normal running" behaviour is: boot → **POWERON_MENU** (with a photo icon, since built-in playable
+files exist, `_bPOWERONMENUShowPlayableFile`) → the user selects the photo icon to start the slideshow,
+OR after ~1 min idle (§12.23) the **OSDSS screensaver** plays the album on its own. Both paths need the
+menu reached first.
+
+**The single remaining blocker (everything reduces to this):** `POWERONMENU_Initial()` IS called at
+boot (Thread_CTKDVD:1320) but **POWERON_MENU never fully enters** — `__bPOWERONMENUInitial` stays 0, i.e.
+mode-7's enter handler `0x61cf8` (the sole flag-setter) is **never executed**, and `activeUI` never
+becomes mode 7 (UITRACE: NONE→mode 8 only). So `OSD_ChangeUI(POWERON_MENU)` inside `POWERONMENU_Initial`
+never dispatches the mode-7 handler. Every downstream goal (photo icon to select, screensaver gate E,
+menu draw §12.9) hangs off this one point.
+
+**Next (the actual last gap):** disassemble the retail `POWERONMENU_Initial` (called from Thread_CTKDVD)
+and find why its `OSD_ChangeUI(POWERON_MENU)` doesn't enter mode 7 at boot — is it declined
+(`activeUI != 0` at that instant), does the function bail before that call, or does it use a mode number
+we've mis-identified? That single answer unblocks the menu → and thence the (user-selected or
+screensaver) slideshow.

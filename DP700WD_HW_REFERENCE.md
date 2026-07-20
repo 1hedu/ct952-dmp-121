@@ -3677,7 +3677,7 @@ So three independent conditions block the boot slideshow:
    change makes `__dwOSDSSCheckNOData != __dwTimeNow` → `OSDSS_ResetTime` → idle never accrues.
    (Diagnostic §12.21 proved this: forcing `__bPOWERONMENUInitial=1` still didn't enter — the
    `__dwTimeNow` reset fired.)
-3. **`OSDSS_ENTER_TIME` (~10 min)** idle must elapse.
+3. **`OSDSS_ENTER_TIME` = 60000 ticks ≈ ~1 min** (see §12.23 correction) idle must elapse.
 
 **Interpretation / open product question:** either (a) the boot slideshow is a *separate* mode-8 /
 ImageFrame photo player that cycles on `bPhotoIntervalTime` (~5 s, `IMAGE_FRAME_SETUP`) — NOT the
@@ -3686,3 +3686,17 @@ or (b) it IS the OSDSS screensaver and all three gates above must pass. The sing
 proven either way (§12.19). Leaning (a) per the product logic ("boots into it", not "wait 10 min").
 **Next:** find the mode-8/ImageFrame per-photo advance (driven by `bPhotoIntervalTime`) and why it
 doesn't fire, distinct from the OSDSS idle path. Diag: `CT952_UITRACE` now also logs `0x40031abc`.
+
+### 12.23 CORRECTION — the system tick is ~1 kHz (not 100 Hz); the screensaver idle is ~1 min
+
+I asserted "100 Hz / 10 min" for the OSDSS idle. That was an unverified back-calc from the osdss.h
+*"10 minutes"* comment. The real timer config (hsystem.c) pins it:
+```
+REG_PLAT_PRESCALER_RELOAD = ((SysClk/1e6)-1)/2 = (133-1)/2 = 66   → timer clk = 133MHz/67 ≈ 1.985 MHz
+REG_PLAT_TIMER1_RELOAD    = (1000*SYSTEM_TICK)-1 = 1999           (SYSTEM_TICK=2, Winav.h SPARC branch)
+system tick = (1999+1)/1.985MHz ≈ 1.0 ms  → ~1000 Hz
+```
+So the eCos system tick (what `OS_GetSysTimer` counts) is **~1 ms (~1 kHz)**, not 100 Hz. Therefore
+`OSDSS_ENTER_TIME` = `0xEA60` = **60000 ticks ≈ ~60 s (~1 min; ≤2 min within the prescaler factor-of-2
+uncertainty)** — NOT 10 minutes. The "10 minutes" source comment is from the original SDK's slower
+tick; this 950/952 build's faster tick makes the same tick-count ~1 min. (Corrects §12.21/§12.22.)

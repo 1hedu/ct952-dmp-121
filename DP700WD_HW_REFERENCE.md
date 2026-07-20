@@ -4015,3 +4015,22 @@ Applying the sibling project's "find the handoff" technique surfaced the real bo
 **Address-label correction:** the inherited REACH label `POWERONMENU_Initial = 0x4b808` is WRONG — `0x4b808` reads/writes no `__bPOWERONMENUInitial` and is an OSD array-init helper. `__bPOWERONMENUInitial` (`0x40023a10`) is read at `0x59250`/`0x61bf0`/`0x61ebc` (the real POWERONMENU code lives at `0x61xxx`), and its set (line 434) is a computed-pointer store (no annotated `stb`), which is why static search missed it and UITRACE only ever caught the bss-init 0.
 
 **Reframed frontier:** the boot reaches the menu handoff and stalls in the **menu/logo DISPLAY** (`UTL_ShowLogo`/`OSD_ChangeUI`), before completing POWERONMENU init — analogous to the sibling frame's DE/display investigation. Since the decode-status poll is *satisfied* (§12.30, mirror=0x10), the block is a **different wait in the display path** — most likely a display-engine/panel/VSYNC completion the emulator doesn't drive. That is the new, better-localized target: reverse what `UTL_ShowLogo`/`OSD_ChangeUI(POWERON_MENU)` waits on after 13.4M. Diagnostic added: `CT952_UISTACK`.
+
+### 12.37 Live stack unwind at the park — EEPROM/IIC read nested under the display/media machine
+
+Got a clean 14-frame `%fp`-chain unwind from a 40M snapshot (static, from the CC-thread stack at `sp~0x40036aa8`) — the first reliable live call-stack this session (gdbstub exits on client-detach in this env; the static unwind sidesteps it).
+
+**Call stack (outer→inner):**
+```
+thread-entry → 0x4001ea40 → 0x4001ea60 (media/display machine, 0x1exxx)
+  → 0xade0 → 0xa780 → 0xa6bc → 0xa690 (OSD/boot layer, 0xaxxx)
+  → 0x31a8 (fn 0x3170: gated on flags 0x4002f7c7/0x4002fb58) → 0x627c0
+  → 0x62a48 → 0x624d8 → 0x62514 (IIC/EEPROM config-read WAIT loop)
+  → 0x59848 → 0x4001d4c0 → 0x4001dab0 (OS timer/delay)
+```
+
+**The park instant is the IIC/EEPROM config read** (`0x62514`, the `~1000-tick` bit-4 poll on the 0x80004200 EEPROM master — emulator-stubbed to `0xAA55`), called from a flag-gated monitor `0x3170` nested under the `0xaxxx` OSD layer and the `0x1exxx` media/display state machine.
+
+**This conflicts with two earlier reads, and the conflict IS the finding:** pcsamp (58-66M) said the hot loop is `0x36ff0` (decode-poll); §12.36's UISTK write said POWERONMENU OSD helpers ran at 13.4M; this unwind (40M) says the EEPROM read. Reconciliation: the CC thread is in a **complex multi-phase steady state** — it cycles through OSD/menu draw, a periodic EEPROM/RTC monitor (`0x3170`), and the decode-status poll (`0x36ff0`), none of which is a single clean hang. `__bPOWERONMENUInitial` stays 0 because POWERONMENU_Initial never *completes* (it's threaded through this cycle), not because one call blocks forever. So §12.36's "park is one specific display wait" was too clean — it's a cycle, and the unwind caught the EEPROM phase.
+
+**Concrete lever surfaced:** the `0x80004200` IIC/EEPROM master is **stubbed to `0xAA55`** (machine.c:200-213), yet it sits in the live boot stack under the display/OSD layer. On these SoCs that EEPROM commonly holds **panel/board config** — directly relevant to the sibling frame's DE/panel dive. If the boot validates the EEPROM contents (checksum at `0x62a04-0x62a38`) and the `0xAA55` stub fails that check, the display/menu init would keep re-reading/retrying — a faithful-modeling gap. Next: reverse `0x627c0`/`0x3170` — what the EEPROM read returns, whether its result is checksum-validated, and whether a stub-mismatch drives the re-read cycle. Tooling note: static `%fp`-unwind from a snapshot works where the gdbstub doesn't in this env.

@@ -209,6 +209,14 @@ int main(int argc, char **argv)
                 fprintf(stderr, "  %-24s @%08x = 0x%08x\n", fl[k].n, fl[k].a, v);
             }
         }
+        /* Interrupt state (VSYNC/timer delivery diagnosis, §12.41): is the
+         * per-frame VSYNC line (PROC1-1st bit0 -> LEON 13) unmasked & delivered,
+         * or is it stuck pending because the firmware never unmasked it? */
+        fprintf(stderr, "  IRQ: LEON_MASK@090=%08x PENDING@094=%08x  "
+                "P1_1ST mask@0b0=%08x pend@0b4=%08x  P1_2ND mask@0d0=%08x pend@0d4=%08x\n",
+                machine_io_get(m, 0x090), machine_io_get(m, 0x094),
+                machine_io_get(m, 0x0b0), machine_io_get(m, 0x0b4),
+                machine_io_get(m, 0x0d0), machine_io_get(m, 0x0d4));
     }
     if (snap_out) {
         if (machine_snapshot(m, snap_out) != 0)

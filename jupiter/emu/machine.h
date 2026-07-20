@@ -224,6 +224,7 @@ int machine_restore(machine_t *m, const char *path);
 /* Direct DRAM helpers (addr in 0x40000000 space). */
 uint32_t machine_dram_rd(machine_t *m, uint32_t addr, int size);
 uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr);
+uint32_t machine_io_get(machine_t *m, uint32_t off);
 
 /* Parse the flash section table and stage every DRAM-resident section:
  * raw sections are copied, zip-flagged sections are decompressed by

@@ -591,7 +591,19 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
         return;
     case R_P1_1ST_MDIS:
         /* secondary MASK_DISABLE: clear the named enable bits */
+        if (getenv("CT952_VSMTRACE"))
+            fprintf(stderr, "[VSM] MDIS clear %08x  mask %08x->%08x  vsync(bit0)%s  pc=%08x icount=%llu\n",
+                    v, io_get(m, R_P1_1ST_MASK), io_get(m, R_P1_1ST_MASK) & ~v,
+                    (v & 1) ? " CLEARED" : "", m->cpu.pc, (unsigned long long)m->cpu.icount);
         io_set(m, R_P1_1ST_MASK, io_get(m, R_P1_1ST_MASK) & ~v);
+        return;
+    case R_P1_1ST_MASK:
+        /* direct MASK_ENABLE write (VSYNC-mask trace, §12.41) */
+        if (getenv("CT952_VSMTRACE"))
+            fprintf(stderr, "[VSM] MASK<-%08x  vsync(bit0)%s  pc=%08x icount=%llu\n",
+                    v, (v & 1) ? " ENABLED" : " off", m->cpu.pc,
+                    (unsigned long long)m->cpu.icount);
+        io_set(m, R_P1_1ST_MASK, v);
         return;
     case R_P1_2ND_STCL:
         /* PROC1-2nd CLEAR: write-1-to-clear pending bits */
@@ -1999,6 +2011,9 @@ uint8_t *machine_dram_ptr(machine_t *m, uint32_t addr)
         return m->dram + (addr - 0x40000000u);
     return NULL;
 }
+
+/* Public accessor for an IO register (offset from 0x80000000), for diagnostics. */
+uint32_t machine_io_get(machine_t *m, uint32_t off) { return io_get(m, off); }
 
 /* ---- Stock-ROM section loader (mask-ROM equivalent) ---- */
 

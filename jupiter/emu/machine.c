@@ -1097,6 +1097,18 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
                     addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 31),
                     sparc_get_reg(&m->cpu, 15), (unsigned long long)m->cpu.icount); }
         }
+        /* CT952_UISTACK (§12.36): watch the REAL OSD_ChangeUI (0x4a754) UI stack
+         * (0x400391d8) + index (0x40039509) -- detects whether POWERONMENU_Initial
+         * (poweronmenu.c:409 OSD_ChangeUI(POWERON_MENU)) ever runs, i.e. whether
+         * the block is in page-8 or downstream in POWERONMENU_Initial's display. */
+        if (getenv("CT952_UISTACK") &&
+            ((addr >= 0x400391d8u && addr <= 0x400391f8u) || addr == 0x40039509u) &&
+            m->cpu.icount > 5000000ull) {
+            static int n; if (n < 80) { n++;
+            fprintf(stderr, "[UISTK] %08x <- %08x pc=%08x o7=%08x icount=%llu\n",
+                    addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 15),
+                    (unsigned long long)m->cpu.icount); }
+        }
     }
 
     /* Count PROC2-reset asserts regardless of the PROC2 feature gate: the

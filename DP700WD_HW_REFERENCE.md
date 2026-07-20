@@ -3995,3 +3995,23 @@ Prompted by a sibling project (different Coby frame, AM7338/µC-OS) whose persis
 **The settings ARE read correctly.** The retail settings live in the flash **SETD section @ `0x1000`** (ROMLD table entry at flash 0x10; size 0x1000), read via `SPF_ReadData` = `lduba [addr] ASI 0x7` (spflash.c:959), which the emulator's SPARC core routes to a normal bus read (sparc.c:513-529) → the mapped flash image. Verified live: the SETD byte signature `43 00 01 0d 03 01 05 7d 01 03 01 01 22 b8 00` is present in DRAM at **`0x400325a0`** (`__SetupInfo`, a copy at `0x40033318`) after boot — so the config load works. Decoded: magic `0x43`, UIStyle 0, brightness 1, contrast 0x0d, aspect 3, TVSystem 1, videoOut 5, OSDLang 0x7d, password 0x0103, defaultType 1, lastMode 1. The IIC/EEPROM board-config (0x80004204/10/14) is separately stubbed to `0xAA55` by the emulator, but that is a board EEPROM, not the user settings.
 
 **So the config-gating explanation is ruled out** — the boot is not being steered wrong by a bad settings read. This is the same place the sibling project's investigation landed: **not a config issue, but a never-posted app/subsystem boot-complete handoff** (their gui_close ≈ our page-8 advance event). Both frames, different chips/OSes, converge on the identical root: an event/message that a higher layer is supposed to post when it reaches "ready," which never fires in emulation. Our frontier is unchanged: identify the producer of the page-8 advance event (§12.33) — now with config-read positively excluded as the cause.
+
+### 12.36 MAJOR RELOCATION — the park is in POWERONMENU_Initial's display path, NOT page-8
+
+Applying the sibling project's "find the handoff" technique surfaced the real boot structure and relocated the park.
+
+**Boot handoff structure (cc.c:1312-1396, Thread_CTKDVD):**
+```
+1312  INITIAL_System(...)
+1315  INITIAL_PowerONStatus(...)   -- runs the page-8 stage, then RETURNS
+1320  POWERONMENU_Initial()        -- the boot->menu handoff
+1396  CC_DVD_MainLoop()            -- media scan + OSDSS screensaver
+```
+
+**INITIAL_PowerONStatus returns** — page-8 is a transient, not the park. Its enter handler's modal wait `0x24d0c` returns 0 when the monitor list is empty (path `0x24d0c`→`0x24e4c`→ret, NOT a loop), so page-8 falls through to ADVANCE→PARK (return 1), ChangePage(8) returns, and `INITIAL_PowerONStatus` returns at `0x41b58`. So control reaches **`POWERONMENU_Initial` (line 1320)**.
+
+**POWERONMENU_Initial IS running — proven live.** Watching the real `OSD_ChangeUI` UI-stack (`0x400391d8`/index `0x40039509`, `CT952_UISTACK`): OSD-stack writes fire at **pc `0x4b844`/`0x4b964` at icount 13.4M** — OSD-region-setup helpers (`0x4b6xx-0x4b8xx`) called from the POWERONMENU code at `0x61xxx` (`0x61e98`→`0x4b67c`). So the menu bring-up runs, then **blocks before `__bPOWERONMENUInitial=TRUE` (poweronmenu.c:434)** — that flag stays 0 forever. The pcsamp park (`0x36ff0` decode-poll + `0x59850` delay) is the **logo/menu display path** (`OSD_ChangeUI(POWERON_MENU)` line 409 / `UTL_ShowLogo` line 419), executed by POWERONMENU_Initial *before* line 434.
+
+**Address-label correction:** the inherited REACH label `POWERONMENU_Initial = 0x4b808` is WRONG — `0x4b808` reads/writes no `__bPOWERONMENUInitial` and is an OSD array-init helper. `__bPOWERONMENUInitial` (`0x40023a10`) is read at `0x59250`/`0x61bf0`/`0x61ebc` (the real POWERONMENU code lives at `0x61xxx`), and its set (line 434) is a computed-pointer store (no annotated `stb`), which is why static search missed it and UITRACE only ever caught the bss-init 0.
+
+**Reframed frontier:** the boot reaches the menu handoff and stalls in the **menu/logo DISPLAY** (`UTL_ShowLogo`/`OSD_ChangeUI`), before completing POWERONMENU init — analogous to the sibling frame's DE/display investigation. Since the decode-status poll is *satisfied* (§12.30, mirror=0x10), the block is a **different wait in the display path** — most likely a display-engine/panel/VSYNC completion the emulator doesn't drive. That is the new, better-localized target: reverse what `UTL_ShowLogo`/`OSD_ChangeUI(POWERON_MENU)` waits on after 13.4M. Diagnostic added: `CT952_UISTACK`.

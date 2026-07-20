@@ -871,6 +871,20 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         }
         if (m->skip_panelcfg && addr == 0x4002f770u)
             return 0xFFFFFFFFu;   /* desc+0x14 = -1: take the skip path */
+        /* MODE-8 DECLINE test (CT952_MODE8DECLINE): §12.40 -- the mode-8 media/
+         * source UI latch is gated by predicate 0x272a8's `ldub [0x40032b3b]; be`
+         * = the CONFIGURED-source count (setting 0xa3), NOT present media (§12.15).
+         * Present that count as 0 so the predicate declines -> 0x418f0's fallback
+         * OSD_ChangeUI(POWERON_MENU/mode 7) runs -> mode-7 handler 0x61cf8 sets
+         * __bPOWERONMENUInitial NATURALLY -> tests whether the OSDSS screensaver
+         * then arms. This forces an UPSTREAM condition (source count) and lets the
+         * real code flow set the flag -- it is NOT the confounded FORCEPOM (which
+         * forced the flag's own read and tripped its setter's guard). */
+        if (addr == 0x40032b3bu && size == 1) {
+            static int m8 = -1;
+            if (m8 < 0) m8 = getenv("CT952_MODE8DECLINE") ? 1 : 0;
+            if (m8) return 0;
+        }
         /* (CT952_CHOOSEMEDIA crutch removed §11.3: proven inert once decode is
          * faithful -- the raw boot reaches POWERONMENU without forcing the
          * __bChooseMedia byte.) */

@@ -4229,3 +4229,92 @@ be the blocker: the MPEG decoder thread is not created, so nothing waits on MPEG
 hardware at boot, and bit `0x1` is architecturally unsettable in this build. This is the
 honest outcome (b) of the investigation. The real, unchanged boot frontier is the
 event-starvation producer deadlock (§12.42-12.46), which is unrelated to MPEG decode.
+
+### 12.48 SOFT JPEG DECODER RULED OUT + decode-completion "DSR" 0x7efdc reframed as a non-boot codec thread; both decode-IRQ paths now measured NEGATIVE
+
+Pursued the standing hypothesis (§12.28/§12.34) that a *decode-completion interrupt* whose DSR
+is flash `0x7efdc` (sets `__fThreadInit 0x40038f80` bit `0x10`) is the missing boot producer.
+Two independent results, both decisive.
+
+**(A) There is NO software (PROC2-code) JPEG decoder in this build — preprocessor-proven.**
+`SUPPORT_JPEGDEC_ON_PROC2` is defined **only** inside `#ifdef CT909R_IC_SYSTEM`
+(`Winav.h:1075-1077`); this image is `CT909P_IC_SYSTEM` (`platform.h:26-27`, CT909R commented
+out), so the macro is **undefined**. Confirmed downstream: the PROC1→PROC2 JPEG handoff via
+`REG_AIU_GR(2..17)` in `HAL_ReloadAudioDecoder` (`chips.c:1372-1381`) is `#ifdef
+SUPPORT_JPEGDEC_ON_PROC2` and compiles **out**; `CT909R_JPEG_AND_MP3` is in the `#else` of the
+909P branch (`Winav.h:1630-1633`), also **off**. The `chips.c:1313` "LOGO (JPEG code) → play
+MP3+JPEG" comment describes the *CT909R* DMP flow, not this build. So the logo/photo JPEG decode
+is the **hardware** JPG/VLD/MCU-BIU block driven by a PROC1 thread — exactly §10.8's conclusion.
+This **retires the task premise** (that `Winav.h:1076` enables PROC2 JPEG for this image; the
+`#ifdef` guard was misread). The emulator's `machine_maybe_jpeg_decode` (host picojpeg in the
+`JPU_GO` handler) correctly models that HW block and correctly does **not** run PROC2 code for
+JPEG; PROC2 (`cpu2`, `proc2_on`) is the audio-DSP stand-in only.
+
+**(B) `0x7efdc` is NOT a "decode-completion DSR" — it is a codec decoder THREAD the boot never
+creates (static-proven).** The address `0x7efdc` has **zero** `call` sites and **zero** pointer
+words in flash (confirmed), but it *is* materialized once — at `0x41d04/0x41d10` (`sethi
+%hi(0x7ec00); or ,0x3dc`) — inside `CreateThreadByType(type)` (`0x41b60`), a `%i0`-indexed
+thread factory. It builds a thread descriptor {entry=`0x7efdc`, prio 3, stack `0x40037378`,
+size `0x1c00`} and calls the create/resume wrappers `0x596f4`/`0x596e0`. So **`0x7efdc` is a
+thread body**, structurally identical to the JPEG decoder thread `0x7007c` (same prologue: read
+channel byte `0x40039d2c`, build per-channel callback tables, then `OS_SetFlag(0x40038f80,
+<initbit>)`). Its `OS_SetFlag(0x40038f80, 0x10)` at `0x7f0c4` is its **thread-init-done flag**,
+not a completion post.
+
+The factory's type→thread→init-bit map (verified):
+
+| CreateThreadByType | entry | init bit | role |
+|--------------------|-------|----------|------|
+| 2 | `0x83098` | `0x100` | Parser/InfoFilter (§12.46) |
+| 9 | `0x6748` | `0x80000`(+) | CC-event worker (§12.42) |
+| 5 | `0x7007c` | `0x2` | **JPEG decoder** (`INIT_DEC_THREAD_JPEG_DONE`) |
+| 11 | `0x7efdc` | `0x10` | a **non-JPEG codec** decoder |
+
+`CreateThreadByType(11)` (→`0x7efdc`) is reached from **one** site, `0x5a7a4`, inside
+`HALDEC_CreateThread(decoderType)` (`~0x5a660`): case `type==4` creates it and waits on bit
+`0x10`; `type==0`→JPEG(`0x7007c`,bit`0x2`), `type==1`→MPEG(bit`0x1`), `type==2`→DivX(bit`0x4`).
+The decoder type is chosen from the media codec (`0x400399f0` vs `0x96/0x97/0x98`, live `=0`).
+**The keyless photo boot only ever needs the JPEG decoder (type 0 → `0x7007c`), so
+`HALDEC_CreateThread(4)` is never called, `0x7efdc` is never created, and bit `0x10` never
+sets** — same category of finding as §12.47 (MPEG thread never created). Bit `0x10` isn't even
+in the power-on thread-sync mask `0x301` (§12.32); its only waiter is its own creator at
+`0x5a790-0x5a7d0`. **Forcing bit `0x10` / running `0x7efdc` would be a crutch** (spawning a codec
+thread the firmware deliberately doesn't). §12.28's "raise the decode-completion IRQ so
+`0x7f0c4` posts the completion message" is therefore built on a **misidentification** and is
+struck.
+
+**Live confirmation (osdss.snap, icount 44.99M, gdb):** `__fThreadInit=0x00080102` — bit `0x2`
+(JPEG `0x7007c`) **SET** (that thread ran and completed init), bit `0x10` (`0x7efdc`) **CLEAR**;
+codec selector `0x400399f0=0`. The JPEG decoder thread is alive and the two boot photos decode
+and render (§12.27/§12.30) — the JPEG decode-completion is **already faithful and poll-based**
+(§10.8: VLD/JPU/BIU polls, all modeled and satisfied). Nothing about JPEG completion is missing.
+
+**Both decode-completion INTERRUPT paths are now measured NEGATIVE.** New env-probe
+`CT952_DECDONE` (machine.c, `JPU_GO` handler) raises the PROC1-**1st** decode-done sources
+`RL_DONE 0x20 | MC_DONE 0x40 | INT_16L 0x80` (LEON line **13**) on each *actual* new-frame
+completion (never VSYNC bit0, which the firmware masks faithfully §12.41). §12.41 proved these
+bits are unmasked at the park and line 13 is enabled, so the raise really cascades to
+`INT_Proc1_1st_isr`. Result over a crutch-free boot (`TICK_MULT=256`, `--run-to 90M`):
+
+```
+JPEG decode #1: 480x270 ; DECDONE frame#1 -> P1_1ST 0xe0 (mask fffffffe) @11.2M
+JPEG decode #2: 640x360 ; DECDONE frame#2 -> P1_1ST 0xe0 (mask fffffffe) @40.3M
+DUMPFLAGS @90M: __fThreadInit=0x00080102  __bPOWERONMENUInitial=0  _bOSDSSScreenSaverMode=0
+```
+
+No advance: the line-13 display/decode ISR clears the decode-done bits (display housekeeping)
+without posting a CC-event completion. Together with §12.29's **PROC1-2nd** (line 10, BIU/MCU)
+negative, **every decode-completion interrupt line is now tested negative** — line 7
+(`INT_PROC2_1ST`, base+`0x1b0`) is audio-only (its sources are MIC/PCM/SPDIF underflows,
+`ctkav_platform.h:193-200`), so it is not a decode-completion line either. `CT952_DECDONE` kept
+env-gated as a documented-negative probe alongside `CT952_DECIRQ`.
+
+**VERDICT — the soft-decoder + decode-completion-IRQ is NOT the boot blocker.** (1) No PROC2
+software JPEG decoder exists in this build. (2) The JPEG decode-completion is already faithful
+(thread `0x7007c`, poll-satisfied, photos render). (3) `0x7efdc`/bit-`0x10` is a non-boot codec
+thread, not a completion DSR — forcing it is a crutch, and it is not in any boot wait. (4) Both
+decode-completion IRQ paths (line 10 §12.29, line 13 §12.48) are measured negative. The real,
+unchanged frontier remains the CC-event producer deadlock (§12.42-12.46): no HW event sets
+F_REQ bit `0x80` / re-posts CC mailbox `0x40033830`, and that producer is a media/source DSR
+(not a decode-completion one). This closes the "decode IRQ" class of leads the doc had kept open
+since §12.28.

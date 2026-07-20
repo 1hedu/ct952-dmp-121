@@ -515,8 +515,27 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
              * once/frame. Then mark the MCU-BIU read channel drained so the
              * worker's BCR0A poll (io 0x2a28 bit 12) retires and it advances to
              * HALJPEG_Display. Formerly gated behind CT952_LOGODECODE (crutch). */
-            machine_maybe_jpeg_decode(m);
-            m->biu_drained = 1;
+            { uint32_t jc_before = m->jpeg_count;
+              machine_maybe_jpeg_decode(m);
+              m->biu_drained = 1;
+            /* EXPERIMENT (CT952_DECDONE): on an ACTUAL new-frame completion
+             * (jpeg_count advanced), raise the PROC1-1st DECODE-DONE interrupt
+             * -- RL_DONE(0x20)/MC_DONE(0x40)/INT_16L(0x80) the MCU-BIU write-
+             * channel asserts as it drains reconstructed macroblocks. §12.29
+             * tested only PROC1-2nd (line 10) BIU/MCU sources -- NEGATIVE; this
+             * is the untested faithful variant on line 13 (which §12.41 proved
+             * is unmasked at the park). Never touches VSYNC (bit0), which the
+             * firmware masks deliberately (§12.41). Probes whether the display/
+             * decode ISR's DSR posts the CC-event completion the boot starves on. */
+              if (getenv("CT952_DECDONE") && m->jpeg_count != jc_before) {
+                uint32_t bit = 0xE0u;   /* RL_DONE|MC_DONE|INT_16L */
+                io_set(m, R_P1_1ST_MASK, io_get(m, R_P1_1ST_MASK) | bit);
+                io_set(m, R_P1_1ST_PEND, io_get(m, R_P1_1ST_PEND) | bit);
+                if (getenv("CT952_DECIRQ_TRACE"))
+                    fprintf(stderr, "[DECDONE] frame#%d -> P1_1ST bit 0x%x (mask %08x) icount=%llu\n",
+                            m->jpeg_count, bit, io_get(m, R_P1_1ST_MASK),
+                            (unsigned long long)m->cpu.icount);
+              } }
             /* EXPERIMENT (CT952_DECIRQ=<P1_2ND bit mask>): raise a PROC1-2nd
              * decoder/BIU interrupt (BIU=0x10, MCU_BSRD=0x20, ...) on JPU
              * completion + unmask it, to run the firmware's decoder DSR.

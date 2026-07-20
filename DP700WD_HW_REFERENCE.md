@@ -3618,3 +3618,34 @@ see whether OSDSS then cycles the 5 photos — proving the screensaver path end-
 
 Unmodeled-peripheral backlog (faithful TODO): the **I2C RTC** (`0x8000420c` data-ready + the RTC
 register map / valid time) — not the slideshow blocker, but required for a truly "normal" boot.
+
+### 12.21 Diagnostic — forcing __bPOWERONMENUInitial=1 is NOT enough; the screensaver has a 2nd gate
+
+Ran the §12.20 diagnostic: patched the mode-8-idle snapshot to `__bPOWERONMENUInitial=1` and
+`__dwOSDSSCheckTime=0`, then ran forward. **The screensaver still did not enter** —
+`_bOSDSSScreenSaverMode` stayed 0, no photo cycling, and `__dwOSDSSCheckTime` was **reset from 0
+back to 0x33fe** within the run.
+
+Disassembled `OSDSS_Monitor` (`0x591b4`) fully — it has a chain of gates, in order:
+- **A** `0x4002fb58 == 0` (else return)
+- **B** `_bOSDSSScreenSaverMode == 0` (not already saving)
+- **C** `*(0x400239c0) == *(0x40031abc)` — the **saved activity token == the live activity
+  counter**. If they differ (activity happened), it **resets `__dwOSDSSCheckTime` to now** and
+  returns. ← this is what fired in the diagnostic.
+- **D** `(now − __dwOSDSSCheckTime) > 0xe260` (57952-tick idle timeout)
+- **E** `__bPOWERONMENUInitial != 0`  (the gate the patch satisfied)
+- **F/G** `0x40020ff4 == 0`, `0x4002f7c6 == 0`
+- → `call OSDSS_Entry (0x59108)`
+
+So `__bPOWERONMENUInitial` is only **gate E**. Gate **C/D** is the real remaining wall: the **live
+activity counter `0x40031abc` keeps changing**, so the monitor resets the idle timer every pass and
+the 57952-tick idle never accrues. `0x40031abc` has 12 writers (input/event/OSD-update handlers at
+`0xc590/0xd140/0x4230c/0x42dc8/0x5b5e8/0x5b658/0x5bfac/0x5d768/0x5d934/0x5dd44/0x60764/0x60794`) —
+one of them fires during the mode-8 idle (a phantom-activity source, akin to the ADC key §12.9).
+
+**Conclusion:** the auto-slideshow = OSDSS idle screensaver, gated by BOTH `__bPOWERONMENUInitial`
+(blocked by the mode-8 latch) AND a quiet-idle window on `0x40031abc` (blocked by continuous
+activity). This matches the deeply-explored §10.44–11.7 screensaver-trigger difficulty. **Next
+lead:** live-watch writes to `0x40031abc` during the mode-8 idle to name the phantom-activity
+source, then model/silence it faithfully so idle accrues. (Open question still stands: is the demo
+the idle screensaver at all, or an immediate auto-play mode that bypasses the idle timeout?)

@@ -3649,3 +3649,40 @@ activity). This matches the deeply-explored §10.44–11.7 screensaver-trigger d
 lead:** live-watch writes to `0x40031abc` during the mode-8 idle to name the phantom-activity
 source, then model/silence it faithfully so idle accrues. (Open question still stands: is the demo
 the idle screensaver at all, or an immediate auto-play mode that bypasses the idle timeout?)
+
+### 12.22 The auto-slideshow = OSDSS idle screensaver; its gate chain fully decoded (product framing)
+
+Product reasoning (user): a photo frame with built-in photos and no removable media shouldn't sit
+on a menu for the full timeout — it should play the photos. And the screensaver wait is a settings
+value (**~10 min default**). Confirmed technically: gate D's threshold **`0xe260` = 57952 ticks ≈
+9.7 min @100Hz** — that IS the "10 minutes".
+
+**There is only ONE photo-slideshow renderer:** `UTL_ShowJPEG_Slide` (utl.c), driven by
+`OSDSS_Entry` → `_OSDSS_PictureUpdate`. osdss.c has no separate immediate-boot-play; the slideshow
+IS the OSDSS screensaver. Full `OSDSS_Monitor` gate (source + `0x591b4` disasm):
+```
+if (__dwOSDSSCheckTime == -1) { __dwOSDSSCheckTime = now; return; }      // first-init
+if (!_bOSDSSScreenSaverMode)
+  if (__dwOSDSSCheckNOData == __dwTimeNow)                    // 0x400239c0 == 0x40031abc
+     if ((now - __dwOSDSSCheckTime) > OSDSS_ENTER_TIME/*0xe260*/)   // ~10-min idle
+        if (__bPOWERONMENUInitial && !__bCLOCKShowClock && __bAlarmState==NONE)
+             OSDSS_Entry();            // <-- play the photos
+        else OSDSS_ResetTime();
+  else OSDSS_ResetTime();             // __dwTimeNow changed -> reset idle
+```
+So three independent conditions block the boot slideshow:
+1. **`__bPOWERONMENUInitial`** = 0 — the mode-8 latch never lets POWERON_MENU run (§12.14/12.15).
+2. **`__dwTimeNow` (`0x40031abc`) keeps changing** — updated by `0x5bf88` (`__dwTimeNow = 0x85a68()`
+   when it crosses a threshold; `0x85a68` reads a `0x14`-byte-entry table at `0x40039b08`). Each
+   change makes `__dwOSDSSCheckNOData != __dwTimeNow` → `OSDSS_ResetTime` → idle never accrues.
+   (Diagnostic §12.21 proved this: forcing `__bPOWERONMENUInitial=1` still didn't enter — the
+   `__dwTimeNow` reset fired.)
+3. **`OSDSS_ENTER_TIME` (~10 min)** idle must elapse.
+
+**Interpretation / open product question:** either (a) the boot slideshow is a *separate* mode-8 /
+ImageFrame photo player that cycles on `bPhotoIntervalTime` (~5 s, `IMAGE_FRAME_SETUP`) — NOT the
+10-min OSDSS screensaver — and the gap is that per-photo advance not firing (only decode #2 ran);
+or (b) it IS the OSDSS screensaver and all three gates above must pass. The single-photo RENDER is
+proven either way (§12.19). Leaning (a) per the product logic ("boots into it", not "wait 10 min").
+**Next:** find the mode-8/ImageFrame per-photo advance (driven by `bPhotoIntervalTime`) and why it
+doesn't fire, distinct from the OSDSS idle path. Diag: `CT952_UITRACE` now also logs `0x40031abc`.

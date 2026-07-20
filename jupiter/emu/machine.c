@@ -1014,6 +1014,15 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         if (addr == 0x40032b0du)
             fprintf(stderr, "[UITRACE] media_evt(32b0d) <- %02x pc=%08x icount=%llu\n",
                     val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        /* OSDSS idle-timer activity counter (§12.21 gate C): whatever writes this
+         * during the idle is the phantom-activity source that resets the
+         * screensaver's idle window. Log the writing PC to name it. */
+        if (addr == 0x40031abcu) {
+            static int n; if (n < 60) { n++;
+            fprintf(stderr, "[UITRACE] activity(31abc) <- %08x pc=%08x i7=%08x icount=%llu\n",
+                    val, m->cpu.pc, sparc_get_reg(&m->cpu, 31),
+                    (unsigned long long)m->cpu.icount); }
+        }
       }
     }
 

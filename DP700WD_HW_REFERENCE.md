@@ -2984,3 +2984,49 @@ huge virtual time." That is a concrete, faithful-boot target (model the HW those
 need — likely PROC2), and the firmware can be made to narrate its own progress via the
 DBG addresses above. New probe scripts: `probe_stall/stack2/posts/flags/dbg/narrate/
 ring/ladder.py` in `jupiter/emu/`; full TEXT disasm cached at `/tmp/fulltext.dis`.
+
+### 12.6 MILESTONE — modified firmware boots, and it NARRATES its own boot (1-byte patch)
+
+Two firsts in one, and both matter for the MicroPython endgame: **(a) a modified
+`dp700wd.bin` boots** (the patch→boot loop works), and **(b) the retail firmware now
+prints its own debug log**, which turns the whole investigation from stack-archaeology
+into just reading what the RTOS says it is doing.
+
+**The patch (regenerate with `jupiter/emu/patch_dbg_fw.py`):** a single byte.
+`UTL_Config_DebugMode` (flash `0x11500`, called at boot from initial.c:465 via
+`UTL_DBG_INIT`) sets `_dwDBGMode = 0x11` — DSU1-only, so `DBG_Init` is never called for a
+UART and the log stays silent. At `0x11518` `mov 0x11,%o0` → `mov 0x111,%o0` (byte
+`@0x1151a 0x20→0x21`) adds the UART1_TX nibble, so boot runs
+`DBG_Init(…,HAL_UART1_TX,…)`: `_bDBGEnable=TRUE`, the DRAM debug ring is allocated at
+`_pDBG_Header1=0x4004c000`, and `DBG_Printf` output flows. (XIP code is patchable in place
+— the DATA section is zipped, code sections `TEX2`/`RODA` are `flash/skip`.) Read the ring
+from DRAM: 96-byte descriptors at `0x4004c000`, printable text via a `[\x20-\x7e]{4,}`
+scan (the UART *drain* `DBG_Polling→DBG_INT` only runs in `CC_DVD_MainLoop`, not yet
+reached — but the ring fills from boot regardless).
+
+**What the firmware says (verbatim, crutch-free patched boot, fast-tick):**
+```
+TVMode: 22; HVOffset: 0000,0000            TFT_Change source[FF ->13]
+Some thread not initial done.              TFT_LOCK_Data / TFT_UNLOCK_Data
+   Desired: 00000301, Current: 00000100    BackLight_OFF ... BackLight_ON
+TVE setting out of range                   starting usb stack...
+TVMode: E2; HVOffset: FFA3,FFFE            Blk dev: Init
+                                           ehci_local0: EHCI version .. USB revision 2.0
+                                           ehci_local0: new device port=0 .. speed=high
+                                           uhub0: vendor 0x0006 Generic Root Hub, addr 1
+```
+
+**This rewrites the diagnosis — POSITIVELY.** The RTOS is not wedged; it is methodically
+bringing up TFT panel → backlight (`BackLight_ON`) → **USB EHCI stack** → enumerating the
+root hub. It even confirms §12.5 in its own words ("Some thread not initial done. Desired
+00000301, Current 00000100"). The huge virtual-time cost is real init work (display + a
+full USB stack bring-up), not a spin. Two watch-items surfaced by the log: **"TVE setting
+out of range"** and the still-pending MPEG/Info-Filter thread bits — likely the next
+things to chase, now that the firmware will tell us when they resolve.
+
+**Long-run reality check:** a plain fast-tick run to 3e9 instructions ends with the OSD
+still DISABLED (panel `/tmp/panel_final.ppm`) — the menu is not yet reached even given
+enormous virtual time, so there IS still a real terminal wall past USB init; but we now
+have the firmware's own narration to walk right up to it. Next: drain the ring
+continuously (inject `DBG_INT`, or grow `DBG_MAX_IDX`) to get the full chronological log
+through to wherever it finally stops, and read the last thing it says.

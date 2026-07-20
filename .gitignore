@@ -1,0 +1,3 @@
+
+# debug-enabled firmware build artifact (regenerate with patch_dbg_fw.py)
+jupiter/emu/dp700wd_dbg.bin

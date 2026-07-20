@@ -1,5 +1,25 @@
 # Coby DP700WD / Cheertek CT952 — Verified Hardware & Hacking Reference
 
+> ## ⚑ ORIENTATION — READ FIRST, DO NOT DRIFT FROM THIS
+> - **The chip is CT952A.** `IC_VERSION_ID = IC_VERSION_952A = 0x0041`,
+>   `DECODER_SYSTEM = DMP952A_EVAL`. **We are 952. Full stop.**
+> - **"909" is NEVER the chip.** It is only (a) the *platform-family* define
+>   `CT909P_IC_SYSTEM` that the 952A happens to use, and (b) the *SDK / ROM /
+>   toolchain lineage* (`DVD909.rom`, `extend909.exe`, `Vipor_IIC909P.h`,
+>   `makerom … DVD909.rom`). Seeing "909" in a filename/define does **not** mean
+>   we're a 909 part. If you ever start reasoning "this is a 909…", STOP — re-read
+>   this line.
+> - **Authoritative source = the `950_Files/` overlay** (copied over the project
+>   root to build `dp700wd.bin`; recipe in `950_Files/950_make.txt`; details §12.4).
+>   For any module that exists in `950_Files/`, THAT copy is what shipped — the
+>   root copy is the wrong (DVD-player) variant. Read from `950_Files/` first.
+> - **The 952 update image is `UPG952A.AP`** (1.34 MB, root of tree) — the `.AP`
+>   OTA-reflash package for this exact build (`APPacker … -OP UPG952A.AP`, §5).
+>   `dp700wd.bin` is the unpacked main ROM; `UPG952A.AP` is the shippable update.
+> - **Decoders:** JPEG (photos/splash) = **hardware JPU/VLD/MCU-BIU** on a PROC1
+>   worker (CT909P → `SUPPORT_JPEGDEC_ON_PROC2` is OFF); **PROC2 = MPEG video only**
+>   (`mpg.bin`). The photo path never uses PROC2 (§10.8).
+
 This is the **deep, source-verified** companion to `DP722_FIELD_GUIDE.md`. Where
 the field guide is an orientation, this document is a bring-up manual: every
 register address, command opcode, memory address, and image-format field below
@@ -3185,3 +3205,31 @@ even reaching 453. **Next: pin `POWERONMENU_Initial`'s real dp700wd.bin address 
 is wrong per §10.7) and breakpoint it — count calls, threads, and whether each reaches the
 draw or early-returns on the flag.** The continuous-UART narration (`--live` build,
 `_dwUartPort`→`0x80000070`, now verified working) is the live commentary for this.
+
+### 12.11 Orientation lock-in + PROC2 detour resolved (decode target = MCU BIU channel)
+
+Re-read the doc + git history to stop the recurring "909" drift. Locked the chip
+identity into the top-of-doc ⚑ banner: **CT952A**; "909" is only platform-family /
+SDK lineage; authoritative source is the **`950_Files/` overlay**; the 952 OTA image is
+**`UPG952A.AP`**. Do not re-derive these.
+
+**PROC2 detour resolved.** Chased a theory that the built-in-photo decode runs on PROC2.
+It does not: on this CT909P-platform 952A build, `SUPPORT_JPEGDEC_ON_PROC2` is OFF, so
+**JPEG (photos + splash) decode is the hardware JPU/VLD/MCU-BIU path on a PROC1 worker
+thread** (§10.8). **PROC2 runs `mpg.bin` = MPEG *video* only** — the photo frame never
+uses it. Confirmed operationally: with `CT952_PROC2=1`, the firmware only reset-*asserts*
+PROC2 (`0x80000324` @~5M) and never releases it; `0x40002000` holds no microcode at boot
+(the load+release live in `HAL_ReloadAudioDecoder`, the media-playback path). So there is
+no PROC2 decode to exercise at boot — right conclusion, wrong core.
+
+**The correct faithful decode target is already pinned in §10.8: the MCU BIU bit-stream
+read-channel.** The JPU worker programs `BCR08/09/0A/0C/0D` (`0x80002a20–0x80002a34`) to
+DMA the staged JPEG out of DRAM, then polls it to drain; the emu models the VLD+JPU polls
+but never advances that channel → `VDRemainder` wait times out → `JPEG_Status=UNFINISH` →
+`HALJPEG_Display` never fires → no photo. **This is exactly what the `LOGODECODE` crutch
+faked.** Faithful fix (per §10.8): advance the read-channel on decode-kick, auto-arm the
+`0x80000C10` progress gate, and write picojpeg output as macroblock-tiled YUV into the
+video framebuffer — the firmware's own JPU pipeline then completes and displays the image.
+That is the through-line to the built-in slideshow, and it replaces `LOGODECODE` rather
+than adding a crutch. (Menu/OSD-icon draw, §12.9/12.10, is a separate GDI question and does
+not depend on the JPU decode.)

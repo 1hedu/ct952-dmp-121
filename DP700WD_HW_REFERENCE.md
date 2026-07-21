@@ -4998,3 +4998,42 @@ would be a crutch (forbidden). The concrete new attack point this opens: the dis
 field/VSYNC state machine — why, with TGEN enabled and VSYNC pending, the display
 state machine (`[0x40039949]`→0xd) never advances. That is the next lever, distinct
 from (and downstream of) the now-solved decoder-DSP handshake.
+
+### 12.60 SYNTHESIS — the whole chain funnels into the display-STOP-at-9.9M / VSYNC-never-re-armed deadlock (§12.49), now proven
+
+Tracing the frozen display sequencer (§12.59, `[0x40039949]` stuck at state 7) to its
+root closes the loop between the decoder handshake (§12.57) and the display-restart
+wall (§12.49):
+
+**The display sequencer is VSYNC-driven, single-source.** The P1_1ST ISR
+(interrupt.c:147) advances the display state machine **only** on
+`INT_PROC1_1ST_VSYNC` (bit0) → `ISR_DISPSaveClearStatus()`. The SCREEN_END(bit2)/
+MAIN_END(bit3)/OSD_END(bit4)/HSYNC(bit1) handlers are **empty** in this build. So the
+sequencer advances one step per delivered VSYNC and by nothing else. (The emulator
+faithfully raises only VSYNC(bit0)+HSYNC(bit1); it correctly does NOT raise the
+end-of-region IRQs, which the firmware ignores anyway — so that is not the gap.)
+
+**VSYNC is enabled, then killed by the display-STOP, and never re-armed**
+(`CT952_VSMTRACE`, with VDEC_IDLE):
+- `4.94M` pc=`0x3fac8` (display-ENABLE block `0x3fac0`): `MASK<-0xffffffff` — VSYNC ENABLED.
+- `9.90M` pc=`0xa4218` (display-STOP routine `0xa41f0`, §12.49): `MDIS 0x1` — VSYNC CLEARED (mask→`0xfffffffe`).
+- never re-enabled through 50M.
+
+So the sequencer advances `0→7` during the enabled window (4.94M–9.9M), then **freezes
+at 7 the instant the display is stopped**, because VSYNC — its only clock — stops
+being delivered. `INITIAL_System`'s handshake (waiting for state `0xd`) therefore
+hangs, `POWERONMENU_Initial` is never reached, and the idle screensaver never arms.
+
+**Unified picture (acceptance test → root):** modeling the decoder-DSP idle playmode
+(§12.57 `CT952_VDEC_IDLE`) removed the FIRST gate; the boot then advances to the
+display bring-up, which **stops the display at 9.9M and cannot restart it** — the
+exact §12.49 deadlock (display-ENABLE `0x3fac0` never re-runs; the restart is gated
+behind the CC event loop that needs the `0x40033830` mbox POST that is itself gated
+behind the stalled display). Every thread we have chased — decoder poll, OSD region
+wait, screensaver gate — funnels into this single display-STOP/no-restart knot.
+
+**Sharpened next lever:** WHY does the firmware STOP the display at 9.9M (pc `0xa4218`,
+routine `0xa41f0`), and what would make it re-run the ENABLE block `0x3fac0`? If the
+stop is a spurious/mis-triggered transition (emulator side), suppressing it is a
+faithful fix; if it is a deliberate reconfigure-stop, the restart trigger is the
+target. That single transition now gates the entire boot.

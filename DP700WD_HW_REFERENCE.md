@@ -4964,3 +4964,37 @@ not the second SPARC. The emulator's SPARC `cpu2` cannot execute `0x40002000`
 Next: model the DSP playmode state machine through the §12.57 handshake chain
 (`0x38f74` etc.) far enough for `INITIAL_System` to return and `Thread_CTKDVD` to
 reach `POWERONMENU_Initial`, opening the idle-screensaver gate.
+
+### 12.59 After the DSP-playmode unblock, the next wall is firmware display-state coordination (not more DSP) — display is partially alive
+
+Continuing the §12.57/§12.58 faithful path: characterized the next handshake past the
+decoder-playmode poll.
+
+**The next wait (`0x38f74`) is firmware inter-thread coordination, not DSP behavior.**
+With `CT952_VDEC_IDLE` on, the INITIAL thread (`0xadc4→…→0x37400→0x38f74`) spins in a
+24-tick bounded CC-mbox wait, gated on a display state machine reaching state `0xd`
+(which sets `0x4003996c` bit `0x20` via `0x5afd8`). `CT952_PCWATCH` shows the
+flag-setter `0x5afd8` **never runs** (0 hits) — so the flag never sets and the wait
+never clears. The status source feeding that state machine (`0x85978`) is a firmware
+data-structure setter (writes a table at `0x4003ce2c`), **not a DSP/hardware
+register** — so this handshake cannot be advanced by DSP-behavior modeling. It is the
+firmware producer/coordination layer (the §12.49-§12.53 CC-mbox wall) reached one
+layer deeper.
+
+**The display block is partially alive.** The main display timing generator IS
+enabled: `R_DISP_TGEN_TOTAL(0x80001a38) = 0x120d035a` (bit28 `DISP_TGEN_EN` set;
+Vtotal=0x20d=525, Htotal=0x35a=858 — NTSC timing). Interrupt state:
+`P1_1ST mask@0b0=fffffffe` (VSYNC bit0 unmasked), `pend@0b4=00000001` (VSYNC pending),
+`LEON_MASK@090=00002d00` (level 13 / VSYNC enabled). So per §12.50 the emulator is
+generating VSYNC fields and they are enabled/pending — the raster side is running —
+yet the display *state machine* that would drive the handshake flag to `0xd` does not
+advance, and `disp_state` still reads bit1 (STOPPED, 0x07).
+
+**Status of the push:** `CT952_VDEC_IDLE` advanced the boot exactly one real,
+faithful step (past the decoder-DSP playmode handshake). The next wall is NOT more
+DSP state — it is the firmware display/CC producer that must drive the OSD/display
+state machine and post the `0x40033830` mbox. Forcing the firmware flags directly
+would be a crutch (forbidden). The concrete new attack point this opens: the display
+field/VSYNC state machine — why, with TGEN enabled and VSYNC pending, the display
+state machine (`[0x40039949]`→0xd) never advances. That is the next lever, distinct
+from (and downstream of) the now-solved decoder-DSP handshake.

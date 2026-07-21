@@ -632,6 +632,16 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
     };
     static uint16_t hit[8];
     if (pchit < 0) pchit = getenv("CT952_PCHIT") ? 1 : 0;
+    /* Configurable PC first-hit tracer (CT952_PCWATCH="0xaaa,0xbbb,..."): log the
+     * first N times execution reaches each listed PC, with %o0/%o1 and icount.
+     * Pinpoints how far a call chain gets (which callee never returns). */
+    static int pw = -1; static uint32_t pwl[16]; static int pwn = 0;
+    static uint16_t pwh[16];
+    if (pw < 0) { pw = 0; const char *e = getenv("CT952_PCWATCH");
+        if (e) { char b[256]; strncpy(b, e, 255); b[255]=0;
+            char *t = strtok(b, ","); while (t && pwn < 16) {
+                pwl[pwn++] = (uint32_t)strtoul(t, NULL, 0); t = strtok(NULL, ","); }
+            pw = pwn ? 1 : 0; } }
     /* mbox-get caller trace (CT952_MBOXTRACE): log every call to the generic
      * mbox-get wrapper 0x5969c with its caller-site (%o7) and object arg (%o0),
      * past the park window. The FINAL non-returning get names the CC_DVD_MainLoop
@@ -654,11 +664,48 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
                     c->pc, sparc_get_reg(c, 15), sparc_get_reg(c, 14),
                     (unsigned long long)c->icount);
         }
+        if (pw) {
+            for (int k = 0; k < pwn; k++)
+                if (c->pc == pwl[k] && pwh[k] < 40) {
+                    pwh[k]++;
+                    fprintf(stderr, "[PW] %08x #%u o0=%08x o1=%08x o7=%08x icount=%llu\n",
+                            c->pc, pwh[k], sparc_get_reg(c, 8), sparc_get_reg(c, 9),
+                            sparc_get_reg(c, 15), (unsigned long long)c->icount);
+                }
+        }
         if (mbt && c->pc == 0x5969cu && c->icount > mbfrom && mbtn < 2000) {
             mbtn++;
             fprintf(stderr, "[MBOX] get caller o7=%08x arg o0=%08x icount=%llu\n",
                     sparc_get_reg(c, 15), sparc_get_reg(c, 8),
                     (unsigned long long)c->icount);
+        }
+        /* Stack-unwind at the bounded-wait mbox poll (CT952_STACKW): when the
+         * 0xa33d8 wait helper (o7=0xa33fc) polls the CC mbox, walk the SPARC
+         * register-window backtrace (saved %i7 at [fp+0x3c], saved %fp at
+         * [fp+0x38]) to name the high-level caller chain -- DISP_DisplayCtrl /
+         * POWERONMENU_Initial if that is the blocked op. Printed a few times. */
+        if (c->pc == 0x5969cu && sparc_get_reg(c, 15) == 0xa33fcu) {
+            static int sw = -1, swn = 0; static uint64_t swfloor = 0;
+            if (sw < 0) { sw = getenv("CT952_STACKW") ? 1 : 0;
+                const char *e = getenv("CT952_STACKW_FROM");
+                swfloor = e ? strtoull(e, NULL, 0) : 0; }
+            if (sw && swn < 12 && c->icount >= swfloor) {
+                swn++;
+                fprintf(stderr, "[STACKW] icount=%llu i7=%08x fp=%08x\n  ",
+                        (unsigned long long)c->icount,
+                        sparc_get_reg(c, 31), sparc_get_reg(c, 30));
+                uint32_t fp = sparc_get_reg(c, 30);
+                for (int d = 0; d < 14 && fp >= 0x40000000u && fp < 0x40800000u; d++) {
+                    int fault = 0;
+                    uint32_t ret = c->bus->read(c->bus, fp + 0x3c, 4, &fault);
+                    uint32_t nfp = c->bus->read(c->bus, fp + 0x38, 4, &fault);
+                    if (fault) break;
+                    fprintf(stderr, "%08x ", ret);
+                    if (nfp <= fp) break;   /* stacks grow down; stop if not */
+                    fp = nfp;
+                }
+                fprintf(stderr, "\n");
+            }
         }
         if (pchit) {
             uint32_t pc = c->pc;

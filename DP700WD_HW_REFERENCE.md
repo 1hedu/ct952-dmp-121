@@ -4845,3 +4845,49 @@ is the *same* missing-event-POST frontier (§12.49-§12.53), now pinned to its
 acceptance-test meaning: **POWERONMENU_Initial cannot finish its display bring-up, so
 `__bPOWERONMENUInitial` never turns TRUE and the idle screensaver machinery never
 starts.** New instrumentation: `CT952_WWATCH`, `CT952_PCSAMPLE`.
+
+### 12.56 The gate is set EARLIER than thought: POWERONMENU_Initial is never CALLED — INITIAL_System hangs on a video-decoder state poll
+
+Correcting the §12.55 working hypothesis ("POWERONMENU_Initial blocks inside
+DISP_DisplayCtrl"): empirically, with the new configurable PC tracer
+(`CT952_PCWATCH`, sparc.c), across a full crutch-free boot (to ~240M instr):
+- `POWERONMENU_Initial` (flash **0x61be8**) — **0 hits**.
+- `DISP_DisplayCtrl` (flash **0x4a754**, 33 callers) — **0 hits**.
+- positive control (0x5969c, 0x70268, 0xa33d8) — hit normally.
+
+So the photo-frame thread **never reaches the power-on-menu setup at all**; the
+earlier logo JPEG decode comes from a *different* `UTL_ShowLogo` path, not
+POWERONMENU_Initial. `cc.c:1320` (the POM call) sits in **`Thread_CTKDVD`**
+(cc.c:1283), *after* `INITIAL_System` (1312) and `INITIAL_PowerONStatus` (1315).
+
+**Where the thread actually is.** A register-window stack-unwinder (`CT952_STACKW`,
+sparc.c) taken at the steady-state mbox poll shows the one running thread's chain:
+thread body (`0xadc4`, which calls the init sequence `0x41614`/`0x416f4`/**`0x418f0`**
+— the `INITIAL_ThreadInit(9),(3),(2)` subsystem-init dispatcher) → … → **`0x5b1e0`**,
+a decoder/display state-machine that calls the **video-decoder playmode getter
+`0x6ef38`** (the `0x6f054/0x6f098` family, §earlier) and then the **24-tick bounded
+mbox wait `0xa33d8`** on the CC event mbox `0x40033830`. It loops here forever: read
+vdec playmode → not the awaited state → wait ≤24 ticks on the mbox → time out →
+retry. `POWERONMENU_Initial` (0x61be8) is *not* on this stack — it is downstream and
+never reached.
+
+**Root cause, tied to PROC2.** The awaited transition is a **video-decoder playmode
+state** driven by PROC2 (`bram[0xB0000190]`), and PROC2 is held in reset (§12.51), so
+the live decoder never reaches the commanded state. The emulator's `bram[0x190]`
+stand-in supplies command *acks* (machine.c:945/1140, `CT952_FORCE_PLAYMODE`) but the
+value it presents does not satisfy this particular init-time poll, so `INITIAL_System`
+never returns.
+
+**Consequence chain (now complete, acceptance-test end to root):**
+`INITIAL_System` decoder-state poll never satisfied → `Thread_CTKDVD` never returns
+from init → `POWERONMENU_Initial` never called → `__bPOWERONMENUInitial` stays FALSE →
+`OSDSS_Monitor` idle machinery never starts → the 20 s no-key screensaver/slideshow
+can never arm. The ADC/no-key idle side is faithful (§12.55); the wall is this
+**early decoder-playmode poll in system init**, gated on PROC2 + the CC mbox POST —
+the same missing-producer frontier, now located at its *earliest* point.
+
+**Actionable next lever:** determine the exact playmode value `0x5b1e0`/`0x6ef38`
+polls for at init time, and make the `bram[0x190]` stand-in present it faithfully
+(what a released PROC2 vdec would report) — candidate to let `INITIAL_System`
+complete. New instrumentation: `CT952_PCWATCH`, `CT952_STACKW`, `CT952_PCSAMPLE`,
+`CT952_WWATCH`.

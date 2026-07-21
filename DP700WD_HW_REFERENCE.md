@@ -4702,3 +4702,47 @@ Disassembled the live DRAM eCos kernel (from m8b.snap) along the CC-thread block
 - get-primitive `0x4001e498`: bumps sched-lock (`0x40024974`), reads mbox `[+0x3c]` (message-count); if `!=0` returns the message, **else dequeues the thread from the ready-list at `0x4002e3f0` and reschedules (`call 0x4001e66c`)** — a plain untimed sleep. No alarm object, no timeout deadline.
 
 So the CC loop blocks until a message is **posted** (put-primitive `0x4001f2e4`/`0x4001de5c`/`0xad4cc` sets `[+0x3c]` and wakes the waiter), not until a timer expires. The eCos clock/alarm subsystem is NOT the gate — a working or broken timeout is irrelevant to an untimed wait. This eliminates the last "kernel-timing" explanation and re-confirms: the stall is a **missing message POST**, and every hardware event source that could drive that post has been ruled out (§12.28-§12.51). The producer is a software post gated, circularly, behind the same loop it would wake.
+
+### 12.53 CT909R correction does NOT reopen a producer thread — §12.47/§12.48's thread reading holds (chip-config-independent)
+
+The CT909R discovery (SUPPORT_JPEGDEC_ON_PROC2 real, correcting §12.48A) raised the
+question: does the corrected chip config reopen a viable event *producer* thread —
+specifically the §12.32 InfoFilter hypothesis (a producer blocked in unmodeled HW
+init, never signaling `__fThreadInit` bit `0x200`)? **Re-verified: no.**
+
+**(1) The thread-creation dispatch is a direct disasm, independent of chip config.**
+`INITIAL_ThreadInit` (flash `0x41b60`) is a `switch(id)` over a subsystem id, valid
+cases **{2, 5, 9, 0xb}** (id 3/4 and >0xb fall through to a bare `ret` at `0x41d50`
+— no-ops). Each case builds a fixed descriptor set and calls the module creator
+`0x41d58` for ids drawn from **{3,4,5,0xa,0xb,0xc,0xd,0xe}**. **Thread/module id 8
+(INFO_FILTER) is not produced by any branch.** This is machine code in the flash
+image — the same bytes regardless of whether the source was compiled CT909P or
+CT909R — so §12.47's "which threads are created" reading stands on the corrected
+footing.
+
+**(2) The runtime ground truth already settles it.** Across every crutch-free boot
+(measured to 90M ticks, §12.51) `__fThreadInit = 0x00080102` = JPEG(`0x2`) +
+Parser(`0x100`) + USB(`0x80000`). **InfoFilter bit `0x200` is never set** — and
+neither is any bit that would correspond to a CC/OSD event producer. Whether the
+InfoFilter thread is "created-but-blocked" or "never-created" is moot: its
+init-complete bit never asserts under any stimulus or time budget we can apply,
+and it is not the consumer/producer of the starved `0x40033830` CC mbox anyway.
+
+**(3) Boot-time dispatch id.** The mode-0 boot path (`0x418f0`) calls
+`INITIAL_ThreadInit(9)`, `(3)` [no-op], `(2)` — i.e. the minimal subsystem set. The
+larger JPEG/photo sets (ids 5, 0xb, creating modules 3..0xe) are reached from the
+later product-init cluster (`0x5a0a4`/`0x5a73c`/`0x5a7a4`/`0x5a80c`/`0x5a87c`), all
+gated behind the same CC command/event framework that is deadlocked in the untimed
+mbox-get (§12.52). Nothing here is an independent producer that runs *before* the
+deadlock and could break it.
+
+**VERDICT — the CT909R correction changes the *decoder* story (PROC2 soft-JPEG is
+real, §12.51) but NOT the *producer* story.** No new event-producing thread is
+opened by the corrected config. The InfoFilter hypothesis (§12.32) is closed on
+correct footing: the bit never asserts, the thread is not the CC-mbox producer, and
+the dispatch that would create the larger subsystem sets is itself downstream of the
+deadlock. **Frontier unchanged: the missing message POST to `0x40033830` / F_REQ bit
+`0x80`, whose every candidate hardware and software source (§12.28-§12.52) has been
+ruled out or shown to be circularly gated behind the same starved loop.** We are at
+the genuine limit of the pure-emulation reproduction: the producer is a software
+post that is, itself, waiting on the loop it would wake.

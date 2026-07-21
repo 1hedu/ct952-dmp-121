@@ -4746,3 +4746,49 @@ deadlock. **Frontier unchanged: the missing message POST to `0x40033830` / F_REQ
 ruled out or shown to be circularly gated behind the same starved loop.** We are at
 the genuine limit of the pure-emulation reproduction: the producer is a software
 post that is, itself, waiting on the loop it would wake.
+
+### 12.54 AUTHORITATIVE pinout from the PF7301 board schematic (CT952A, 128-pin QFP)
+
+User supplied the real board schematic (SHEN ZHEN MTC MULTIMEDIA, model **PF7301**,
+DWG PF7301-YL01-01) — the shipping photo-frame board around the **CT952A** (`U4`,
+128-pin QFP). Full pin↔net map extracted and cross-checked against `hio.c` routing.
+This is ground truth for the physical console and human-input pins.
+
+**Console = UART1, routed on the CARD_READER path** (nets suffixed `_CR`):
+| Signal | Pin | Pad | Net | Firmware (`hio.c`) |
+|---|---|---|---|---|
+| UART1 TX (console out) | **2** | `GPC[7]/SDCMD` | `TX1_CR` | 2137 "USE GPC[7] for TX"; `GPCMux[12]=1`, `SYS_PIN_USE0[12]=1` |
+| UART1 RX (console in)  | **1** | `GPC[8]/SD_D0` | `RX1_CR` | 2213 "USE GPC[8] for RX"; `GPCMux[16]=1`, `SYS_PIN_USE0[8]=1` |
+
+Both emerge on the **SD/card-reader connector**. Emulator captures TX at
+`R_UART1_DATA = 0x80000070` (STAT `0x74`) regardless of pad; RX is a live polled
+input (STAT bit0 → DATA read) — a faithful path for a serial-monitor stimulus.
+
+**Hardware debug port = SPARC DSU, strap-selected by J102/J103**
+(schematic: "J102,J103 SHORT = DSU MODE; OPEN = PROCESS MODE"):
+| Signal | Pin | Pad | Net |
+|---|---|---|---|
+| DSU1 TX | **37** | `GPD[3]/STVD` | `DSU1TX_CR` |
+| DSU1 RX | **1** | `GPC[8]/SD_D0` | `DSU1RX_CR` (shares pin 1 with UART1 RX) |
+
+This is the "DSU1/UART1 shared case (128-pin, ex 909R)" the firmware handles
+explicitly (`hio.c:2061`) — one RX pin (pin 1) feeds either the DSU debugger or the
+UART1 console per strap. **Normal boot = straps OPEN = PROCESS mode** (what the
+emulator models); DSU MODE diverts to the hardware debug unit. The presence of a
+128-pin DSU/UART-shared part independently **corroborates the CT909R-family / 909R
+build** already established from the binary (§12.51).
+
+**Human-input event sources (front panel) — now physically pinned:**
+- **IR receiver → pin 23 (`IR`)**, net `IR_INT` (→ the IR/GPIO int the emulator models).
+- **Analog resistor-ladder keypad** on the KEY_DET ADC inputs: **pin 25
+  `GPC[0]/KS_IN0` (`KEY_DET0`)** and **pin 24 `GPC[5]/KS_IN1` (`KEY_DET1`)**, with
+  documented rail voltages: KEY_DOWN 0V, KEY_UP 0.6V, KEY_LEFT 1.5V, KEY_STOP/
+  KEY_RIGHT 2.2V, KEY_PAUSE_PLAY/KEY_FUNCTION 2.94V.
+These two are the real operator-input producers — the leading remaining candidate for
+a "~20s in, something fires" stimulus that a passive emulator never generates.
+
+**Selected other CT952A pins (for reference):** 22 `/RESET`, 19/20 `XTALI/XTALO`,
+89 `MCLK`, 21 `DFTEN` (test), 12/13 `DN/DP` (USB), 9 `VBUS`, 26-29 `GPA[0..3]/SPI-
+flash SF_CSN/SFCLK/SFDIO/SFD0`, 116-120 `GPG[0..4]` NIM/tuner (unused on photo
+frame), 57 `CVBS`, 59/61/63 `R/G/B`, 66-68 `VOUTB/G/R`. Full 128-pin table archived
+in the extraction script output.

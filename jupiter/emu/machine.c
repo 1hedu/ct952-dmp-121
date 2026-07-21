@@ -1151,6 +1151,20 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
             if (fp < 0) { const char *e = getenv("CT952_FORCE_PLAYMODE");
                           fp = e ? (int)strtoul(e, NULL, 0) : -2; }
             if (fp >= 0) { m->bram[0x190] = (uint8_t)fp; }
+            /* Released-vdec idle playmode (CT952_VDEC_IDLE): a running PROC2
+             * decoder reports MODE_RELEASE_MODE(0x86) as its idle state.
+             * INITIAL_System's decoder-sync poll (flash 0x6f820) must read 0x86
+             * to then command MODE_STOP(0x10) and proceed; otherwise it spins
+             * forever (§12.56). PROC2 is held in reset and cannot post 0x86
+             * itself, so present it while the register is uninitialized
+             * (MODE_NONE). Once the firmware writes a real command the raw value
+             * is non-zero and we respect it (so the immediate re-read of the
+             * commanded 0x10 succeeds). */
+            {
+                static int vr = -1;
+                if (vr < 0) vr = getenv("CT952_VDEC_IDLE") ? 1 : 0;
+                if (vr && m->bram[0x190] == 0x00u) return 0x86u;
+            }
         }
         return mem_read_raw(m->bram + (addr - 0xB0000000u), size);
     }

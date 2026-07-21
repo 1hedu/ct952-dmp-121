@@ -4891,3 +4891,41 @@ polls for at init time, and make the `bram[0x190]` stand-in present it faithfull
 (what a released PROC2 vdec would report) — candidate to let `INITIAL_System`
 complete. New instrumentation: `CT952_PCWATCH`, `CT952_STACKW`, `CT952_PCSAMPLE`,
 `CT952_WWATCH`.
+
+### 12.57 BREAKTHROUGH — modeling the released-vdec idle playmode (0x86) advances the boot past the INITIAL_System decoder poll
+
+Acting on §12.56: decoded the awaited value. The `INITIAL_System` decoder-sync poll
+(flash `0x6f7f0`-`0x6f858`) does:
+```
+read REG_SRAM_PLAYMODE(bram[0xB0000190]);
+if (== 0x86 MODE_RELEASE_MODE) write 0x10 MODE_STOP;
+re-read; if (== 0x10) proceed  else retry forever
+```
+`0x86` = **`MODE_RELEASE_MODE`** and `0x10` = **`MODE_STOP`** (comdec.h `EN_VDEC_CMD`;
+bram[0x190] = `REG_SRAM_PLAYMODE`, ctkav_vdec.h:367). A running PROC2 vdec posts its
+idle playmode here; PROC2 is held in reset (§12.51) so the register stays `0x00`
+(MODE_NONE) and the poll spins (confirmed: `CT952_PMTRACE` shows `b0000190=00` read at
+`0x6f824`/`0x6f84c` every ~200k instr forever).
+
+**Fix + result.** Added `CT952_VDEC_IDLE` (machine.c): present `MODE_RELEASE_MODE`
+(0x86) for reads of an *uninitialized* (raw==0) `bram[0x190]` — the idle state a
+released decoder reports — while respecting firmware writes (so the immediate re-read
+of the commanded `0x10` succeeds). With it on, the poll's **success path `0x6f858` is
+reached at 5.0M** (was never reached), and the boot thread **advances** from the
+`0x5b1e0`/`0x5b264` decoder wait to a *new, later* handshake: stack now
+`0xadc4→0x41a44→0x5a38c→0x61248→0x37400→0x38f74→0xa33d8`. First real forward motion in
+the boot.
+
+**New frontier (one hop further).** The `0x38f74` wait is gated on CC-subsystem state:
+`*0x40023567==1`, `*0x40033274==0`, `*0x4003996c` bit `0x20`, `*0x40033304` vs `0x64`
+— fields another producer (PROC2 completion or a sibling thread) must update. So this
+is a **chain of PROC2/decoder-dependent init handshakes**, each waiting on state a
+live decoder would post. `__bPOWERONMENUInitial` still 0 (POWERONMENU_Initial still
+not reached), but the wall moved.
+
+**Strategic fork (for direction):** either (a) keep modeling each posted decoder/CC
+state value at each handshake (peel the onion), or (b) actually **release and run
+PROC2** (cpu2) with the JPEG/decoder microcode so it drives every handshake
+faithfully in one shot — the firmware stages PROC2 but never releases it (§12.51),
+so the release trigger itself may be gated behind this same init, i.e. a chicken/egg
+the emulator can break by seeding PROC2. New knob: `CT952_VDEC_IDLE`.

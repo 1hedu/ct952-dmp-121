@@ -1613,6 +1613,13 @@ static void machine_cycle(machine_t *m)
         m->disp_hsync_grp = 0;       /* re-arm the N-hsync line counter */
         io_set(m, R_P1_1ST_PEND,
                io_get(m, R_P1_1ST_PEND) | IRQ_P1_1ST_VSYNC);
+        /* DIAGNOSTIC (CT952_VSYNC_KEEP): the display mode-set at ~9.9M disables
+         * the VSYNC interrupt (P1_1ST MDIS bit0) and never re-enables it, freezing
+         * the VSYNC-clocked display sequencer at state 7 (§12.60). Force the mask
+         * bit back on so VSYNC keeps being delivered -- tests whether continuous
+         * VSYNC advances the sequencer to 0xd and unblocks INITIAL_System. */
+        if (getenv("CT952_VSYNC_KEEP"))
+            io_set(m, R_P1_1ST_MASK, io_get(m, R_P1_1ST_MASK) | IRQ_P1_1ST_VSYNC);
     }
     /* Display line interrupt (REG_DISP_N_HSYNC_INT 0x1A6C -> P1_1ST bit1,
      * INT_PROC1_1ST_HSYNC): "interrupt for each N hsyncs" (§12.50). Guarded on

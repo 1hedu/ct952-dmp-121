@@ -5037,3 +5037,36 @@ routine `0xa41f0`), and what would make it re-run the ENABLE block `0x3fac0`? If
 stop is a spurious/mis-triggered transition (emulator side), suppressing it is a
 faithful fix; if it is a deliberate reconfigure-stop, the restart trigger is the
 target. That single transition now gates the entire boot.
+
+### 12.61 VSYNC-KEEP diagnostic — forcing continuous VSYNC clears the display-stopped state and advances the boot to a NEW thread loop (but not yet POWERONMENU)
+
+Tested the §12.60 hypothesis directly with `CT952_VSYNC_KEEP` (machine.c): after each
+VSYNC tick, force the P1_1ST VSYNC mask bit back on, so the sequencer keeps being
+clocked past the 9.9M display-STOP that disables it. With `CT952_VDEC_IDLE` +
+`CT952_VSYNC_KEEP`:
+- `disp_state (0x4002401c)`: **7 → 0** — the display-STOPPED state clears (was stuck
+  at 0x07 for the entire boot). Continuous VSYNC unwinds the stop.
+- New code runs: a **thread main-loop at `0x41a90`** (calls `0x59e90`/`0x59850`/
+  `0x69578`/`0x69510`, near thread-init `0x41b60`) becomes a hot loop (`0xdde98`
+  sampled 40x) — **never executed before**. The boot advanced to a new frontier.
+- Still gated: `POWERONMENU_Initial (0x61be8)` and `DISP_DisplayCtrl (0x4a754)` 0 hits;
+  the `0x38f74` handshake's producer `0x5af60` still never runs; `[0x40039949]` still 7.
+
+**Reading:** VSYNC delivery *is* part of the gate (forcing it demonstrably unwinds
+the display-stop and starts a new thread), confirming §12.60 — but it is not the
+*whole* gate. The boot is a **multi-layer chain of gated states**: `VDEC_IDLE` peeled
+the decoder-playmode layer, `VSYNC_KEEP` peels the display-stop layer, and a further
+thread-coordination layer (`0x41a90` loop, `0x5af60` producer) remains. Each faithful
+(or diagnostic) model advances the boot one measurable layer and reveals the next.
+
+**Caveat on faithfulness:** `VSYNC_KEEP` *overrides* the firmware's explicit VSYNC
+disable, so it is a diagnostic probe, not a final fix. The faithful resolution is to
+make the display **restart** (re-run the ENABLE block `0x3fac0`, which re-enables
+VSYNC on its own) after the 9.9M mode-set stop — i.e. find/model whatever the restart
+waits on — rather than pin VSYNC on. But the probe proves the causal chain: display
+stop → sequencer freeze → init hang, and that unwinding it moves the boot forward.
+
+**Open question for direction:** the boot is converging toward POWERONMENU one gated
+layer at a time, but the number of remaining layers is not yet bounded. Each is a
+distinct producer/handshake. New knobs: `CT952_VDEC_IDLE` (faithful), `CT952_VSYNC_KEEP`
+(diagnostic).

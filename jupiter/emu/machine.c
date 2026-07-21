@@ -366,6 +366,14 @@ static uint32_t io_read(machine_t *m, uint32_t off)
     case R_IIC_CMD:
         /* trigger/busy bit self-clears: transaction done immediately */
         return io_get(m, R_IIC_CMD) & ~IIC_BUSY;
+    case 0x420c:
+        /* IIC data-ready/done status (0x8000420c): the firmware's config-read
+         * poll (flash 0x624f4) waits up to 999 ticks for bit2 (=0x4) to signal
+         * the transfer completed before reading the data. Our IIC model completes
+         * transactions instantly (R_IIC_CMD busy self-clears), so present bit2 set
+         * -- otherwise every EEPROM/config read times out and the late boot stalls
+         * in a 999-tick poll per byte (§12.72). Faithful: done immediately. */
+        return io_get(m, 0x420c) | 0x4u;
     case R_VLD_STATUS:
         /* VLD entropy decode: report macroblock-ready so the JPEG decoder
          * thread's completion poll advances (the real pixels come from the

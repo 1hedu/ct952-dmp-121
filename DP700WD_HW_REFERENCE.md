@@ -5070,3 +5070,41 @@ stop → sequencer freeze → init hang, and that unwinding it moves the boot fo
 layer at a time, but the number of remaining layers is not yet bounded. Each is a
 distinct producer/handshake. New knobs: `CT952_VDEC_IDLE` (faithful), `CT952_VSYNC_KEEP`
 (diagnostic).
+
+### 12.62 COMMON ROOT (option-3 pass) — the CC-event *producer* thread (0x6748) is CREATED but NEVER SCHEDULED
+
+Per the user's "find the common root under all the layers" direction: enumerated the
+eCos threads by watching the create wrapper `0x596f4` (`[desc+4]` = entry, → eCos
+`cyg_thread_create` `0x4001dd5c`). Across the advanced boot (VDEC_IDLE + VSYNC_KEEP,
+to 70M) **exactly 4 threads are created**, and watching each entry PC shows which
+actually execute:
+
+| entry | role | created | RUNS? |
+|---|---|---|---|
+| `0xadb0` | main / INITIAL (Thread_CTKDVD path) | 4.94M | yes (4.94M) |
+| `0x83098` | (parser/decoder helper) | 30.0M | yes (30.0M) |
+| `0x7007c` | decoder thread (id-5 branch) | 33.6M | yes (33.6M) |
+| **`0x6748`** | **CC-event worker (F_REQ/CC-mbox producer, §12.43)** | 30.0M | **NEVER** |
+
+So the producer thread is not *missing* — it is **created and then never runs** (its
+entry `0x6748` is never executed through 70M, while the 3 siblings created alongside
+it do run). The worker body (`0x6748`) would `cyg_flag_wait` on `__fThreadInit`
+(`0x40038f80`) then service the CC event queue and post `F_REQ`/the `0x40033830`
+mbox — the exact producer every stalled handshake (§12.49-§12.61) is waiting on.
+Consistent with this, `CT952_FREQTRACE` shows `F_REQ` only ever written `0x00000000`
+(bit `0x80` never set) — because its producer never executes.
+
+**This is the single common root under the whole layer stack:** decoder poll, display
+sequencer, OSD handshake, screensaver gate — all wait (directly or transitively) on
+events the `0x6748` worker would post, and it is created-but-unscheduled. eCos threads
+start suspended; something must `cyg_thread_resume` the worker, and that resume never
+happens (or happens then the worker never gets the CPU). `0x671c` (called near the
+worker create at `0x11b24`) only *clears* the F_REQ/F_DONE flags — it is not the
+resume.
+
+**Next (option-1 faithful peel from the root):** find who is supposed to
+`cyg_thread_resume` worker `0x6748` and why it doesn't fire (a gated resume, a missed
+priority, or a create that returns a handle nobody resumes). That single resume, once
+faithful, would start the producer and — per §12.60/§12.61 — cascade the whole boot
+forward. Verified producer identity via §12.43 (`0x6748` = the F_REQ worker); confirmed
+non-execution empirically here (`CT952_PCWATCH`).

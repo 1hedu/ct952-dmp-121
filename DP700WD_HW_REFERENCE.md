@@ -5315,3 +5315,35 @@ model, is the bounded target.
 `CT952_DSPTRACE` added. The absolute DSP model is a substantial, well-scoped next
 effort centered on the `0x5abb4(7)` readiness poll (crutches off), NOT the media
 fabric and NOT the PROC1 watchdog. New knob: `CT952_DSPTRACE`.
+
+### 12.71 MAJOR ADVANCE — clock speedup brings the event system ALIVE (deadlock was largely time-starvation); boot plateaus at DISPSTATE=7 / pre-POWERONMENU
+
+Building on §12.70: with `CT952_TICK_FAST_AT=48000000,512` (eCos clock 512× after the
+early gates) + VDEC_IDLE + VSYNC_KEEP, the late boot comes ALIVE:
+- Boot-init completes its `OS_DelayTime`s and **reaches the worker-resume `0x41b04`
+  naturally** (54.8M); **worker `0x6748` runs** (54.86M).
+- **`F_REQ`/`F_DONE` cycle** (`CT952_FREQTRACE`): F_REQ bit `0x1000` (per-frame redraw)
+  at 55.9M, bit `0x04000000` at 60.4M, with matching F_DONE — the CC-event worker is
+  **dispatching events**. `MediaPresentPost` is called. The producer/consumer loop we
+  spent §12.49-69 thinking was structurally deadlocked is **running** — it was
+  time-starved (every firmware delay ate ~133K instr/ms, so test runs died mid-delay).
+
+**But the boot does NOT reach `POWERONMENU_Initial`** through 400M instructions:
+`__bPOWERONMENUInitial` (0x40023a10) never set; `POWERONMENU_Initial` (0x61be8) never
+called; **`DISPSTATE` (0x40039949) frozen at 7** (`CT952_WWATCH`). So with timing and
+the event loop no longer the issue, the remaining gate is the **display state machine
+stuck at event 7** (§12.68: `0x5abb4` only ever receives event 7) and `Thread_CTKDVD`
+not advancing from `INITIAL_System` to `POWERONMENU_Initial`.
+
+**Reframed status (honest, measured):** the great majority of the "circular deadlock"
+was **time-starvation of legitimate firmware delays** — a huge simplification. The
+event fabric, worker, and F_REQ producer all work once given a runnable clock. What
+REMAINS is a genuine gate: the display state machine never advances past event 7, so
+`Thread_CTKDVD` never reaches the power-on menu. That — not the mbox producer, not the
+media fabric, not the DSP registers — is the last wall, and it is bounded to
+`0x5abb4`'s event-7 handling and who would send the next display event.
+
+**Next:** with clock+events alive, trace why `0x5abb4` never receives event >7 (the
+display-advance producer) — and try milder clock multipliers (512× may over-compress
+and derail the display sequencer). New: confirmed time-starvation as the dominant
+cause; event system verified alive via F_REQ cycling.

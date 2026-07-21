@@ -4929,3 +4929,38 @@ PROC2** (cpu2) with the JPEG/decoder microcode so it drives every handshake
 faithfully in one shot — the firmware stages PROC2 but never releases it (§12.51),
 so the release trigger itself may be gated behind this same init, i.e. a chicken/egg
 the emulator can break by seeding PROC2. New knob: `CT952_VDEC_IDLE`.
+
+### 12.58 PIVOTAL — "PROC2" decoder is a DSP (own ISA), NOT the second SPARC; behavioral state-modeling is the faithful path, "run cpu2" is a dead end
+
+Investigating whether to break the §12.57 handshake chain by actually running PROC2:
+traced the release path and dumped the staged region.
+
+**The firmware stages then HOLDS the decoder, never releases it (even at 55M with
+VDEC_IDLE):** `CT952_P2FULL` shows at 4.94M it writes `R_PROC2_SP(0x800007d4)=0x4001cf00`,
+`R_PROC2_START(0x800007d8)=0x40002000`, then `RESET_ENABLE(0x80000324) bit0 = HOLD`.
+The **core-release `0x80000304` bit0 (and DSU2 `0x98000000`) is written 0 times** the
+entire boot — later 0x304/0x324 writes carry bits 0x200000/0x40000/0x800000/0x300
+(other subsystems: VPU/JPU), never bit0.
+
+**The staged entry `0x40002000` is NOT SPARC code.** DRAM dump at 6M, region
+`0x40002000..0x40010000` (14336 words): **0 `save`, 0 `call`, 0 `jmpl/ret`** — vs the
+known PROC1 TEXT (`0x4001d000`) at 118/197/148. The bytes (`02e4056b 02c20593
+04000400 04000400…`, repeated `04000400` tables) are DSP microcode/coefficients. This
+is the "JPEG" section (`_ChangeDSPCode(HAL_VIDEO_JPG)`, hdecoder.c:569) — **DSP
+decoder microcode, a different ISA**, staged into `REG_SRAM_*` space and driven via
+`REG_SRAM_PLAYMODE` (bram[0xB0000190]).
+
+**Conclusion — the fork is resolved:** the video/JPEG decoder is a **DSP/VPU block**,
+not the second SPARC. The emulator's SPARC `cpu2` cannot execute `0x40002000`
+(releasing it would run garbage — the §12.51 warning, now explained). So:
+- "Run PROC2 (cpu2)" to drive the handshakes is **infeasible** (wrong ISA).
+- The **faithful** model of an un-emulated DSP is its **observable interface**: the
+  playmode/handshake state it posts (bram[0x190] + the CC/OSD status fields). The
+  pixel decode is already covered by the picojpeg JPU stand-in; what remained
+  unmodeled is the DSP's **playmode state machine**, which `CT952_VDEC_IDLE` (§12.57)
+  began modeling. Continuing that — modeling each decoder-posted state the init
+  handshakes expect — IS the correct faithful path, not a crutch.
+
+Next: model the DSP playmode state machine through the §12.57 handshake chain
+(`0x38f74` etc.) far enough for `INITIAL_System` to return and `Thread_CTKDVD` to
+reach `POWERONMENU_Initial`, opening the idle-screensaver gate.

@@ -5108,3 +5108,50 @@ priority, or a create that returns a handle nobody resumes). That single resume,
 faithful, would start the producer and — per §12.60/§12.61 — cascade the whole boot
 forward. Verified producer identity via §12.43 (`0x6748` = the F_REQ worker); confirmed
 non-execution empirically here (`CT952_PCWATCH`).
+
+### 12.63 The worker's resume EXISTS in firmware — it is sequenced AFTER a display/CC readiness call (0x5abb4) that never returns
+
+Chased the missing `cyg_thread_resume` for worker `0x6748` (§12.62):
+
+**The create has no resume (by design of that branch):** `INITIAL_ThreadInit(9)`
+builds the worker descriptor with entry `0x6400|0x348 = 0x6748` and calls create
+`0x596f4` at `0x41be4`, then `b,a 0x41d50` (bare ret) — **no resume in the id-9
+branch** (unlike id-5/id-0xb which pair create+`0x596e0`). So the worker is created
+suspended and resumed separately.
+
+**The separate resume is real and located:** function `0x66dc` loads the worker handle
+(`ld [0x40038fb0]`) and calls resume `0x596e0` at `0x670c`, also setting
+`__fThreadInit` bit `0x80000` (idempotent guard). `0x66dc` has exactly one caller:
+`0x41b04`, inside the mode-0 boot-init function at `0x41a88`.
+
+**But `0x41b04` is never reached.** Empirically (VDEC_IDLE+VSYNC_KEEP, `CT952_PCWATCH`):
+`0x41a90` executes **once**, and neither `0x41b04` (resume) nor `0x41b58` (its skip
+branch) ever execute. The call at `0x41a90` — **`0x5abb4(7)`** — never returns; the
+thread parks inside it. `0x5abb4` is a large CC/display readiness dispatch (checks
+`0x4003274a`/`0x40032782`/state `[0x149]`, branches into the `0x5afxx` display state
+machine) whose deep path performs the 24-tick `0xa33d8` CC-mbox waits (§12.56/12.61)
+and loops without returning. So:
+
+```
+boot-init (0x41a88):  r = 0x5abb4(7)      <- display/CC readiness; NEVER returns
+                      if (r) skip                (0x41b58)
+                      else   resume worker (0x41b04 -> 0x66dc -> 0x670c)
+```
+
+**This is the deadlock made exact.** The CC-event worker (the producer of the very
+mbox/F_REQ posts the whole boot waits on) is resumed **only after** `0x5abb4(7)`
+returns — and `0x5abb4(7)` is stuck in the display/CC readiness loop that is itself
+(transitively) waiting on what the worker would post. A genuine ordering knot at the
+boot-init level: resume-after-readiness, readiness-needs-producer, producer-needs-resume.
+
+**Why it works on silicon (hypothesis):** `0x5abb4`'s readiness loop is a *bounded*
+poll that, on real hardware, sees the display/decoder reach ready (VSYNC-driven
+sequencer completes, DSP posts state) and RETURNS, then the worker is resumed. In the
+emulator the loop's ready-condition is never satisfied because the display/decoder
+state it polls is exactly the un-modeled DSP/display behavior we have been peeling
+(§12.57/12.60/12.61). So the faithful fix converges on the same target: model the
+display/decoder readiness `0x5abb4(7)` polls for, so it returns and the resume fires.
+
+**Next:** dissect `0x5abb4(7)`'s loop exit condition — the specific display/decoder
+ready state it waits for — and model that (the continuation of the VDEC_IDLE/VSYNC
+line, now with a concrete return-or-hang test at `0x41b04`).

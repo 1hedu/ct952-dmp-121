@@ -649,6 +649,12 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
     static int mbt = -1; static uint32_t mbtn = 0; static uint64_t mbfrom = 0;
     if (mbt < 0) { mbt = getenv("CT952_MBOXTRACE") ? 1 : 0;
         const char *e = getenv("CT952_MBOX_FROM"); mbfrom = e ? strtoull(e,NULL,0) : 34000000ull; }
+    /* Flag-wait trace (CT952_FLAGTRACE=<from>): log every cyg_flag_wait (eCos
+     * 0x4001dffc) past <from> with the flag object (%o0), mask (%o1) and caller
+     * (%i7) -- names what the parked threads block on when the boot plateaus. */
+    static long ftr = -2; static uint32_t ftn = 0;
+    if (ftr == -2) { const char *e = getenv("CT952_FLAGTRACE");
+                     ftr = e ? (long)strtoull(e, NULL, 0) : -1; }
     /* Periodic PC sampler (CT952_PCSAMPLE=N): every N instructions print the
      * current PC so a single run reveals the boot trajectory / terminal hot loop
      * without many slow run-to samples. */
@@ -712,6 +718,12 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
                             c->pc, pwh[k], sparc_get_reg(c, 8), sparc_get_reg(c, 9),
                             sparc_get_reg(c, 15), (unsigned long long)c->icount);
                 }
+        }
+        if (ftr >= 0 && c->pc == 0x4001dffcu && c->icount >= (uint64_t)ftr && ftn < 400) {
+            ftn++;
+            fprintf(stderr, "[FLAG] wait obj=%08x mask=%08x i7=%08x icount=%llu\n",
+                    sparc_get_reg(c, 8), sparc_get_reg(c, 9), sparc_get_reg(c, 31),
+                    (unsigned long long)c->icount);
         }
         if (mbt && c->pc == 0x5969cu && c->icount > mbfrom && mbtn < 2000) {
             mbtn++;

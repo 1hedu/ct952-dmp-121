@@ -5347,3 +5347,32 @@ media fabric, not the DSP registers — is the last wall, and it is bounded to
 display-advance producer) — and try milder clock multipliers (512× may over-compress
 and derail the display sequencer). New: confirmed time-starvation as the dominant
 cause; event system verified alive via F_REQ cycling.
+
+### 12.73 Close-the-gaps loop confirmed; boot advances to ~82M then parks at a new mbox wait (frontier)
+
+With all faithful/diagnostic fixes (VDEC_IDLE + VSYNC_KEEP + TICK_FAST_AT=...,512 +
+IIC 0x420c), the boot advances far past everything prior:
+- config-read poll (§12.72) cleared (0x624f4 no longer hot);
+- event system alive (§12.71): worker runs, F_REQ/F_DONE cycle;
+- runs to ~82M then **hard-parks** (PC histogram: only eCos idle/scheduler past 82M,
+  zero firmware PCs -- all threads suspended).
+
+**The parking waits (new instrumentation `CT952_FLAGTRACE`, `CT952_MBOXTRACE` from
+54M):** no `cyg_flag_wait` (4001dffc) past 54M; instead **3 threads poll mbox-gets**
+around 55M then go idle: caller `0x841f4` obj `0x4003cc00`, caller `0x70240` obj `1`,
+caller `0x59864` obj varies. They poll briefly then block -- the boot settles into a
+suspended state waiting on one of these mbox objects (esp. `0x4003cc00`) that no
+producer posts once the early activity drains.
+
+**Reframe holds:** the boot is a **close-the-gaps sequence**, not a wall. Each fix
+(decoder playmode, VSYNC, eCos clock, IIC status bit) closed a real, bounded gap and
+advanced the boot; the next is another such gap -- a producer for the `0x4003cc00`
+mbox (or the internal-source-present edge, still the leading candidate). The finish
+line (POWERONMENU → slideshow) is not reached, but the path is now incremental and
+measured, not a mystery.
+
+**Turn summary (major):** overturned the "structural deadlock" model -- most of it was
+**time-starvation** of legitimate firmware delays (eCos clock ~133K instr/ms). With a
+sped clock the event fabric, worker, and F_REQ producer all run. Closed the IIC
+config-read gap (§12.72). New instrumentation: `CT952_CALLTRAIL`, `CT952_FLAGTRACE`.
+Remaining frontier: the `0x4003cc00` mbox producer / internal-source-present.

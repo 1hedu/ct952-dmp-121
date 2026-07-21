@@ -4693,3 +4693,12 @@ CC event loop that is deadlocked in the untimed `0x40033830` mbox-get (§12.49/�
 — it is collateral of that deadlock, not its cause. The unchanged frontier remains
 the CC/OSD event-framework producer (§12.49/§12.50). New instrumentation:
 `CT952_P2FULL` (`machine.c`).
+
+### 12.52 eCos-timeout hypothesis CLOSED — the CC mbox-get is UNTIMED (needs a real message, not a timeout)
+
+Disassembled the live DRAM eCos kernel (from m8b.snap) along the CC-thread block path to settle whether the wait is timed (and a failing eCos alarm/DSR delivery could explain the stall) or untimed. It is **untimed**, definitively:
+- Flash wrapper `0x5969c`: `save; call 0x4001de40; ret` — passes NO timeout.
+- `0x4001de40`: `o0 = *(0x400423a8) = 0x40033830` (the CC mbox); `call 0x4001e498(obj+0x1c)` — no timeout arg.
+- get-primitive `0x4001e498`: bumps sched-lock (`0x40024974`), reads mbox `[+0x3c]` (message-count); if `!=0` returns the message, **else dequeues the thread from the ready-list at `0x4002e3f0` and reschedules (`call 0x4001e66c`)** — a plain untimed sleep. No alarm object, no timeout deadline.
+
+So the CC loop blocks until a message is **posted** (put-primitive `0x4001f2e4`/`0x4001de5c`/`0xad4cc` sets `[+0x3c]` and wakes the waiter), not until a timer expires. The eCos clock/alarm subsystem is NOT the gate — a working or broken timeout is irrelevant to an untimed wait. This eliminates the last "kernel-timing" explanation and re-confirms: the stall is a **missing message POST**, and every hardware event source that could drive that post has been ruled out (§12.28-§12.51). The producer is a software post gated, circularly, behind the same loop it would wake.

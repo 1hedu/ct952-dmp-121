@@ -5244,3 +5244,42 @@ modeled inserted SD card via `SDCD#`. That single initial source-present edge sh
 post `MediaPresentPost(_,1)` → set F_REQ → wake the worker → cascade every link above
 to the slideshow. This is the one remaining hardware/state input the emulator does not
 provide; everything upstream of it is now identified and (where hardware) modeled.
+
+### 12.66 Crutch result + user correction — media-present is NOT the screensaver blocker; crutched boot advances far but does not converge to POWERONMENU in 250M
+
+**User correction (important):** a real photo frame boots and runs its built-in
+slideshow with NO card inserted. So `MediaPresentPost(_,1)` never firing (§12.65) is
+*normal*, not the blocker — the OSDSS screensaver reads internal JPEGs directly and
+does not use the media-*source* fabric. The §12.65 media chain was a mis-attribution
+for the screensaver path (it remains the correct chain for external-media playback,
+just not for the built-in slideshow).
+
+**Crutch experiment:** with all three diagnostic knobs — `CT952_VDEC_IDLE` (faithful
+DSP idle playmode), `CT952_VSYNC_KEEP` (force VSYNC delivery), `CT952_SKIP_READY`
+(force worker resume past the hung `0x5abb4(7)`) — the boot advances substantially:
+`disp_state` 7→0 (display running), `__fThreadInit` 0x102→0x80102 (worker up), and it
+runs new display/decoder code (`0x6f8xx` result-ring consumer, `0xa8xxx`). But a long
+run to **icount 250,000,000 never reaches `POWERONMENU_Initial` (0x61be8)** — final
+pc `0x62528`, still cycling in CC/event loops. The crutches are NOT sufficient.
+
+**Remaining gate:** the boot cycles in display/decoder *ring-consumer* loops
+(`0x6f8a0`: compare write/read ptrs `0x40039d8c`/`0x40039efc`, return when empty) that
+poll for producer data. The producer is the decoder DSP result path, which is
+un-modeled beyond the picojpeg pixel stand-in — so the ring stays empty and the
+consumer never advances the state machine that would let `INITIAL_System` return.
+
+**Also reconsidered:** `0x5abb4(7)` (whose hang forced `SKIP_READY`) waits on **source
+7** readiness — and F_REQ bit 0x80 == source 7. So source 7 is likely the internal
+display/photo source, which on real hardware is posted *present* at power-on (always
+there). The faithful unblock may be to post the internal source (source 7) present at
+boot so `0x5abb4(7)` returns naturally and resumes the worker — but the initial
+source-scan that would do this appears gated behind the same stalled init, and
+`SKIP_READY` (which bypasses `0x5abb4` entirely) may skip setup needed downstream,
+which is why the crutched boot does not converge.
+
+**Honest status:** the full dependency chain is mapped and every link identified; three
+faithful/diagnostic models advance the boot from "dead at INITIAL_System" to "display
+up, worker up, cycling in decoder-ring loops." The finish line (rendered slideshow) is
+NOT reached — the remaining work is modeling the **decoder DSP result-ring producer**
+(the state the ring consumers poll for), the deepest layer of the DSP behavioral model
+(§12.58). That, not media-present, is the last gate.

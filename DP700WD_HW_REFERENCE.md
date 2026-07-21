@@ -5195,3 +5195,52 @@ worker `0x6748` dispatches ← **F_REQ bit 0x80 set by media/source-present prod
 hardware, faithfully modelable; the final unknown is the media/source-present post.
 
 New knob: `CT952_SKIP_READY` (diagnostic — force worker resume).
+
+### 12.65 ROOT REACHED — the innermost trigger is an initial "source-present" event; the emulator presents no media source
+
+Traced F_REQ bit `0x80` (source 7; F_REQ bits are `1<<source`, MediaPresentPost posts
+`1<<1`/`1<<2`) to the producer. Findings:
+
+- **`0x65dc(mask)` sets F_REQ bit `mask` only if `__fThreadInit` bit `0x80000` (worker
+  resumed) is set** — so event posting is gated on the worker being up (now satisfied
+  by `SKIP_READY`, §12.64).
+- **The media-*present* call is `0x6120`**: `MediaPresentPost(source, present=1)` (all
+  other MediaPresentPost sites pass `present=0` = removal). Its setter `0x6108` has one
+  caller `0x12ba4`, inside the source-event handler `0x12b30`, which is invoked from
+  `0xd834`/`0xd8a0`/`0xdb4c`/`0x5a4c8`/`0x5f718` (the CC/source event fabric).
+- With every crutch applied (VDEC_IDLE+VSYNC_KEEP+SKIP_READY) **MediaPresentPost is
+  still never called with present=1** — no code path ever declares a source present.
+
+**The root:** the whole event fabric is edge-triggered by an **initial
+"source-present" event**, and nothing in the emulated boot ever raises one. On real
+hardware that first edge comes from a **media-detect**: a card-insert (schematic
+`SDCD#` pin 124 `GPC[13]/SDCD_N`, `MSINS#` pin 122), a USB attach, or a power-on scan
+that finds the **internal SPI-flash photo store** as a source. The emulator models no
+inserted card and no present source, so `MediaPresentPost(_, 1)` never fires → F_REQ
+never gets its source bit → worker never dispatches → CC/OSD mbox never posts →
+display sequencer never completes → `INITIAL_System` never returns →
+`POWERONMENU_Initial` never runs → screensaver never arms.
+
+**COMPLETE CHAIN, slideshow → root (every link identified this session):**
+```
+OSDSS slideshow (idle screensaver, ~20s)
+ ← __bPOWERONMENUInitial=TRUE
+ ← POWERONMENU_Initial() runs
+ ← INITIAL_System() returns
+ ← display sequencer reaches ready (VSYNC-clocked; §12.60/12.61 — CT952_VSYNC_KEEP)
+ ← CC/OSD mbox 0x40033830 posted
+ ← worker 0x6748 dispatches events (§12.62/12.63 — resume gated; CT952_SKIP_READY)
+ ← F_REQ source bit set (needs worker up AND a source event)
+ ← MediaPresentPost(source, present=1)          ← ★ NEVER FIRES
+ ← a media/source-present trigger (card-detect SDCD#, USB, or internal-flash scan)
+                                                  ← ★ THE ROOT: emulator presents no source
+```
+Plus the parallel decoder link (§12.57 — CT952_VDEC_IDLE, the DSP idle playmode),
+which is faithful and already modeled.
+
+**Faithful fix (the keystone):** model a **present media source** — most faithfully
+the internal SPI-flash photo store the frame ships with (so it needs no card), or a
+modeled inserted SD card via `SDCD#`. That single initial source-present edge should
+post `MediaPresentPost(_,1)` → set F_REQ → wake the worker → cascade every link above
+to the slideshow. This is the one remaining hardware/state input the emulator does not
+provide; everything upstream of it is now identified and (where hardware) modeled.

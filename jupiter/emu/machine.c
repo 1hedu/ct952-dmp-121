@@ -1436,6 +1436,16 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
          * is being reset (something reads as "activity"). */
         if (getenv("CT952_WWATCH")) {
             uint32_t a = addr & ~3u;
+            /* also watch the display-state-machine var 0x40039949 (byte) + the
+             * readiness flag 0x4003996c (§12.59/12.67): the 7->0xd progression is
+             * the DSP-model target -- log every step + the pc that wrote it. */
+            if (addr == 0x40039949u || (addr & ~3u) == 0x4003996cu) {
+                static int dw; if (dw < 300) {
+                    fprintf(stderr, "[WW] %-14s %08x=%02x pc=%08x icount=%llu\n",
+                            addr == 0x40039949u ? "DISPSTATE" : "READYFLAG",
+                            addr, val & 0xff, m->cpu.pc,
+                            (unsigned long long)m->cpu.icount); dw++; }
+            }
             if (a == 0x40023a10u || a == 0x400239b8u || a == 0x40039074u) {
                 static int ww;
                 if (ww < 200) {

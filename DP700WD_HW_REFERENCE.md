@@ -4436,3 +4436,129 @@ killed). **Precise next step:** in a live-capable environment, break on the `0x4
 get, read `%i7` to name the precompiled poll-call that blocks, and break on writes to
 `0x4002401c` to catch whether/when the display-restart runs. New instrumentation:
 `CT952_DUMPFLAGS` now dumps `F_REQ 0x40026e9c` + `disp_state 0x4002401c`.
+
+### 12.50 LCM / display-controller raster modeled FAITHFULLY (live MEM_LINE + N-hsync line-int + DMA scan-address); display-restart is COMMAND-driven, not raster-driven — LCM RULED OUT as the boot blocker
+
+Task: stop stubbing the LCM / display timing-generator register block to
+last-written constants and model it faithfully — a **live raster line**
+(`REG_DISP_MEM_LINE 0x80001A68`), the **display-line/hsync interrupt**
+(`REG_DISP_N_HSYNC_INT 0x80001A6C`), and a **live DMA scan-address**
+(`0x80000E0C/E10`) — then measure whether a firmware that now sees a live display
+engine advances the display state machine (re-runs the display-restart `0x3fac0`,
+re-arms VSYNC, clears `disp_state 0x4002401c` bit1, cycles the CC loop, arms the
+screensaver). The `--gdb` stub **works in this harness** (contrary to §12.49's
+"listeners killed" note — every `--gdb` launch here reaches `[gdb] listening` and
+accepts a client); it is used below. NB the stub's memory reads
+(`machine_dbg_read`) only cover flash/DRAM/BRAM — **IO-page reads via gdb return
+0**, so live IO-register values must be read by native trace, not the stub.
+
+**Raster timing decoded from the firmware's own programming (measured `--iolog`).**
+The DISP timing generator is programmed once during bring-up and the values are
+stable through the park:
+```
+TGEN_TOTAL 0x1A38 = 0x120d035a   bit28 DISP_TGEN_EN set; (Vtotal<<16)|Htotal
+                                 -> Vtotal = (v>>16)&0xFFF = 0x20d = 525 lines
+                                 -> Htotal =  v     &0xFFFF = 0x35a = 858 pel
+SYNC_WH    0x1A3C = 0x0014000a   Hsync width 0x14=20, Vsync height 0x0a=10;
+                                 bit28 DISP_PSCAN_EN CLEAR -> interlaced
+SCREEN_SIZE 0x1A44 = 0x00f002d0  720 x 240 (one field); SCREEN_POS 0x1A40=0x00170087
+```
+i.e. a standard NTSC-class 858x525 interlaced raster, 720x240 active per field.
+`SYNC_WH` matches `disp.h` `TVSYNC_WIDTH=20`/`TVSYNC_HEIGHT=10`, confirming the
+`(H<<16)|V` field order (and hence the same order for `TGEN_TOTAL`).
+
+**What was modeled (faithful, `machine.c` — no crutch).**
+- **Live `REG_DISP_MEM_LINE 0x1A68`** (`io_read` case): when `DISP_TGEN_EN` is set,
+  return `disp_cur_line(m)` — the scan line derived from the *same*
+  `vsync_cnt/vsync_div` field clock that raises VSYNC in `machine_cycle` — masked
+  `&0x7FF`, OR'd with `DISP_EVEN_FIELD (0x10000000)` on odd fields. Because the
+  line is derived from the VSYNC counter, **`MEM_LINE==0` coincides exactly with
+  the top-of-frame VSYNC-pending assertion**, so `spflash._VSYNCPolling`'s
+  `(P1_1ST_PEND & VSYNC) && (MEM_LINE==0)` fires at the real vblank and gdi's
+  `GDI_CHECK_DISP_MEM_LINE` sees the raster sweep out of the draw rectangle. When
+  `DISP_TGEN_EN` is clear (generator off, e.g. early boot), return the last-written
+  value (the firmware's idioms then see the static 0, as before). Field lines =
+  `Vtotal` (progressive) or `Vtotal/2 ≈ 262` (interlaced, this panel).
+- **N-hsync line interrupt** (`machine_cycle`): if `REG_DISP_N_HSYNC_INT 0x1A6C`
+  is programmed non-zero AND the generator is enabled, raise `P1_1ST` bit1
+  (`INT_PROC1_1ST_HSYNC 0x02`) each time the raster crosses a multiple of N lines.
+  Guarded so it is free when unused. **This firmware never programs 0x1A6C** (0
+  reads/writes in the iolog) and the compiled `INT_Proc1_1st_isr` HSYNC handler
+  (`interrupt.c:151`) is **empty**, so the machinery is faithful-but-inert here.
+- **Live DMA scan-address `0x80000E0C/E10`** (`io_read` cases): when the generator
+  is enabled and a real DRAM start pointer is programmed (`[0xE04]≥0x40000000`,
+  `[0xE08]>[0xE04]`), walk a current pointer from start toward end in step with the
+  raster line; else return last-written (so the shared `0x80000E00` DMA-descriptor
+  block, also touched by non-display DMA, is left untouched). These are read
+  **only** by the display-enable safe-scan check (flash `0x3fa40`, 2 reads), which
+  compares them against `0x1fff`/`0x1cf00`; a framebuffer pointer (`≥0x40000000`)
+  is always `>0x1cf00` → the "scan is safe, proceed" branch, unchanged from the
+  frozen `0x40000000`. New struct fields `disp_field`, `disp_hsync_grp`; new
+  env probe `CT952_MLTRACE` (logs MEM_LINE reads + PC). Verified live: at ~40M with
+  the generator on, `MEM_LINE` reads `0x10000071` (even field, line 0x71=113) from
+  poller `pc=0x4001fb14` and sweeps across the frame — **the raster is genuinely
+  live**, no longer a constant.
+
+**Measured A/B (crutch-free boot, `TICK_MULT=256`, `--run-to 90M`) — the live
+raster changes NOTHING about the deadlock.**
+```
+                     baseline (frozen)     with live raster (§12.50)
+disp_state 0x4002401c   0x00000027            0x00000027   (bit1 STOPPED)
+P1_1ST mask@0b0         fffffffe (VSYNC off)  fffffffe     (VSYNC off)
+P1_1ST pend@0b4         00000001              00000001     (VSYNC firing, masked)
+F_REQ 0x40026e9c        0x00000000            0x00000000   (bit0x80 never set)
+__bPOWERONMENUInitial   0                     0
+_bOSDSSScreenSaverMode  0                     0
+```
+Identical. The display stays STOPPED, VSYNC stays masked, the CC loop never cycles,
+the screensaver never arms. The display-STOP still fires at the same instants
+(`MDIS clear` at 9.78M and 11.3M, `CT952_VSMTRACE`), and the display-RESTART's
+VSYNC re-arm (`MASK<-ffffffff` at `pc=0x3fac8`) still runs **exactly once at 4.94M**
+(initial bring-up) and never again.
+
+**Why the raster can't break the circle — the display-restart is COMMAND-driven,
+not raster/interrupt-driven (proven by static call-graph + live `%i7` trace).**
+- **STOP** `0xa3d50` (sets `MDIS` VSYNC-off + `disp_state|=2`) is called
+  **synchronously** from the display-mode functions `0x33c70` / `0x3529c` — it is
+  a leaf of a display reconfiguration; it does **not** call the restart and simply
+  returns.
+- **RESTART** `0x3f7bc` (whose tail `0x3fa40` runs the E0C/E10 safe-scan and
+  `0x3fac0` re-arms VSYNC `st -1,[0x800000b0]`) has **no static caller**; it is
+  reached only via `0x41728` inside the mode function `0x416f4`, which runs the
+  restart only when its command arg has **bit2 set (0x14)**. `0x416f4` is called
+  from `0xa8c0` (cmd `0x11`, bit2 clear → no restart) and from `0xadb0`
+  (cmd `0x14`, bit2 set → restart). `0xadb0` has **no static caller** — it is an
+  indirectly-dispatched command handler. Live `--gdb` trace (restore `pre2.snap`
+  @4.5M, break `0x416f4`/`0x3f7bc`) caught the one dispatch:
+  ```
+  HIT MODEfn(0x416f4) i7=4001ea60  cmd(o0)=0x14      <- 0xadb0 handler, cmd 0x14
+  HIT RESTART(0x3f7bc) i7=0000adbc  ...              <- 0x416f4 -> 0x41728 -> restart
+  ... then only "[idle]" — restart command NEVER dispatched again.
+  ```
+  So the restart is dispatched by the **precompiled OSD/event command loop**
+  (dispatcher frame `0x4001ea60`) delivering **command `0x14`** to handler
+  `0xadb0`. That is the *same* CC/event command framework that §12.45-49 proved is
+  blocked in the untimed mbox-get on `0x40033830`. The restart is gated on a
+  **message dispatch**, not on any raster poll or display interrupt — so a live
+  `MEM_LINE`/scan-address (which only feed *polls*, all of which already completed
+  on the boot path — `0x1A68` is read a bounded ~63-104x, never in an infinite
+  wait) **cannot** cause command `0x14` to be dispatched.
+
+**VERDICT — the LCM / display controller is faithfully modeled and RULED OUT as the
+boot blocker.** The timing generator, raster line, field parity, line-interrupt,
+and DMA scan-address are now live and self-consistent (VSYNC ⇔ `MEM_LINE==0` at
+top-of-frame), and the emulator continues to generate VSYNC and faithfully respect
+the firmware's VSYNC mask. Making the raster live is measurably **inert** to the
+deadlock because the deadlock's gate is upstream of all display polling: the
+display-RESTART (`0xadb0`→`0x416f4(0x14)`→`0x3f7bc`→`0x3fac0`) is a **command**
+posted through the precompiled CC/OSD event loop, and that loop is the one blocked
+in the `0x40033830` mbox-get with no producer to wake it (§12.49). **The precise,
+unchanged next gate:** the producer that should re-post CC mbox `0x40033830` / set
+`F_REQ 0x40026e9c` bit `0x80` — a DSR in the precompiled event framework — is never
+generated in emulation; on real hardware the per-frame VSYNC DSR does it, but here
+VSYNC is (faithfully) masked because the boot left the display STOPPED, and the
+restart that would re-arm VSYNC is itself gated behind that same event loop. To
+break it one must either reverse the precompiled framework's `0x40033830`-get
+caller (break there live, read `%i7`) and the command-`0x14` producer, or deliver
+the missing per-frame event. New instrumentation this session: `CT952_MLTRACE`;
+the live-raster model is unconditional (faithful HW), not env-gated.

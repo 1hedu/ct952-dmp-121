@@ -174,6 +174,25 @@ static void machine_maybe_jpeg_decode(machine_t *m)
 #define R_P1_1ST_MDIS  0x0BC        /* MASK_DISABLE (W1C into MASK) */
 #define INT_NO_PROC1_1ST 13
 #define IRQ_P1_1ST_VSYNC 0x1u
+#define IRQ_P1_1ST_HSYNC 0x2u       /* INT_PROC1_1ST_HSYNC: N-hsync line int */
+/* LCM / display timing-generator registers (ctkav_disp.h, CT909P_IC_SYSTEM).
+ * REG_DISP_BASE = 0x80001A00; offsets are from 0x80000000. */
+#define R_DISP_TGEN_TOTAL 0x1A38    /* (Vtotal<<16)|Htotal; bit28 DISP_TGEN_EN */
+#define R_DISP_SYNC_WH    0x1A3C    /* (Hwidth<<16)|Vheight; bit28 DISP_PSCAN_EN */
+#define R_DISP_MEM_LINE   0x1A68    /* live read-frame-buffer line position */
+#define R_DISP_N_HSYNC    0x1A6C    /* interrupt for each N hsyncs */
+#define R_DISP_F0Y_ADDR   0x1AC0    /* main frame buffer 0 Y start address */
+#define DISP_TGEN_EN      0x10000000u  /* TGEN_TOTAL: timing generator enable */
+#define DISP_PSCAN_EN     0x10000000u  /* SYNC_WH: progressive-scan enable */
+#define DISP_EVEN_FIELD   0x10000000u  /* MEM_LINE: even-field indicator */
+/* Display DMA current-scan-address registers (0x80000E00 block): E04/E08 hold
+ * the DMA start/end DRAM pointers, E0C/E10 the live current-read pointers the
+ * display-enable safe-scan check (flash 0x3fa40) reads to avoid reconfiguring
+ * mid-active-line. See DP700WD_HW_REFERENCE.md §12.50. */
+#define R_DISP_DMA_START  0xE04
+#define R_DISP_DMA_END    0xE08
+#define R_DISP_DMA_CUR0   0xE0C
+#define R_DISP_DMA_CUR1   0xE10
 /* Secondary "PROC1 2nd" interrupt controller (ctkav_platform.h:70-76):
  * cascades into LEON interrupt line 10 (INT_NO_PROC1_2ND). Sources: USB/SERVO/
  * IR/BIU/MCU/VPU. We model the IR source (bit2) so a modeled remote keypress
@@ -246,6 +265,41 @@ static uint32_t io_get(machine_t *m, uint32_t off)
 static void io_set(machine_t *m, uint32_t off, uint32_t v)
 {
     m->io[off / 4] = v;
+}
+
+/* ---- LCM / display timing-generator raster (DP700WD_HW_REFERENCE.md §12.50) ----
+ *
+ * The CT909 DISP block runs a timing generator programmed by TGEN_TOTAL 0x1A38
+ * = (Vtotal<<16)|Htotal (bit28 DISP_TGEN_EN) and SYNC_WH 0x1A3C (bit28
+ * DISP_PSCAN_EN = progressive). It scans out one field per VSYNC period; the
+ * live scan-line position is exposed as REG_DISP_MEM_LINE 0x1A68 (masked &0x7FF
+ * for the line, bit28 DISP_EVEN_FIELD for parity). The firmware polls MEM_LINE
+ * to sync raster-sensitive ops (spflash _VSYNCPolling waits MEM_LINE==0 at the
+ * top of frame; gdi GDI_CHECK_DISP_MEM_LINE waits for the raster to leave the
+ * rectangle being drawn). We derive the line from the same vsync_cnt/vsync_div
+ * field clock that raises VSYNC (machine_cycle), so MEM_LINE==0 coincides
+ * exactly with the VSYNC-pending assertion at the top of frame. */
+static uint32_t disp_field_lines(machine_t *m)
+{
+    uint32_t tgen = io_get(m, R_DISP_TGEN_TOTAL);
+    uint32_t vtot = (tgen >> 16) & 0x0FFFu;
+    if (!vtot) vtot = 525u;                     /* NTSC frame total fallback */
+    /* SYNC_WH DISP_PSCAN_EN clear => interlaced: one VSYNC = one field ~ Vtotal/2
+     * lines; progressive => the field spans the whole Vtotal. */
+    if (io_get(m, R_DISP_SYNC_WH) & DISP_PSCAN_EN)
+        return vtot;
+    vtot >>= 1;
+    return vtot ? vtot : 1u;
+}
+
+/* Current scan line within the field (0 .. field_lines-1). */
+static uint32_t disp_cur_line(machine_t *m)
+{
+    uint32_t flines = disp_field_lines(m);
+    uint32_t div = m->vsync_div ? m->vsync_div : 1u;
+    uint32_t line = (uint32_t)(((uint64_t)m->vsync_cnt * flines) / div);
+    if (line >= flines) line = flines - 1u;
+    return line;
 }
 
 static void log_access(machine_t *m, uint32_t addr, int is_write,
@@ -353,6 +407,47 @@ static uint32_t io_read(machine_t *m, uint32_t off)
          * verification (e.g. =0x00000000 reproduces the unmodeled behavior). */
         const char *e = getenv("CT952_ADC");
         return e ? (uint32_t)strtoul(e, NULL, 0) : 0xFF000000u;
+    }
+    case R_DISP_MEM_LINE: {
+        /* Live main-display read-frame-buffer line position (§12.50). When the
+         * timing generator is disabled the block is quiescent -- return the
+         * last-written value (the firmware's own poll idioms then see the
+         * static 0). When enabled, sweep 0..field_lines-1 each VSYNC period and
+         * flag even/odd field parity, so any wait-for-line / wait-for-vblank
+         * sees real motion and MEM_LINE==0 lines up with the top-of-frame VSYNC. */
+        uint32_t en = io_get(m, R_DISP_TGEN_TOTAL) & DISP_TGEN_EN;
+        uint32_t val = en ? ((disp_cur_line(m) & 0x7FFu) |
+                             (m->disp_field ? DISP_EVEN_FIELD : 0u))
+                          : io_get(m, R_DISP_MEM_LINE);
+        if (getenv("CT952_MLTRACE")) {
+            static int mt; if (mt < 80) { fprintf(stderr,
+                "[MLrd] MEM_LINE=%08x en=%u tgen=%08x pc=%08x icount=%llu\n",
+                val, en?1u:0u, io_get(m, R_DISP_TGEN_TOTAL), m->cpu.pc,
+                (unsigned long long)m->cpu.icount); mt++; }
+        }
+        return val;
+    }
+    case R_DISP_DMA_CUR0:
+    case R_DISP_DMA_CUR1: {
+        /* Live display-DMA current-scan address (§12.50). The display-enable
+         * safe-scan check (flash 0x3fa40) reads these to confirm the scan-out is
+         * not mid-active before reconfiguring. Reflect a live pointer that walks
+         * from the DMA start toward the end in step with the raster line, but
+         * only while the timing generator is enabled AND a real DRAM start
+         * pointer is programmed -- otherwise return the last-written value so the
+         * shared 0x80000E00 DMA-descriptor block (also used by non-display DMA)
+         * is left untouched. */
+        if (!(io_get(m, R_DISP_TGEN_TOTAL) & DISP_TGEN_EN))
+            return io_get(m, off);
+        uint32_t start = io_get(m, R_DISP_DMA_START);
+        uint32_t end   = io_get(m, R_DISP_DMA_END);
+        if (start < 0x40000000u || end <= start)
+            return io_get(m, off);
+        uint32_t flines = disp_field_lines(m);
+        uint32_t span   = end - start;
+        uint32_t cur    = start +
+            (uint32_t)(((uint64_t)disp_cur_line(m) * span) / (flines ? flines : 1u));
+        return cur & ~3u;
     }
     default:
         log_access(m, 0x80000000u + off, 0, 0);
@@ -1452,11 +1547,32 @@ static void machine_cycle(machine_t *m)
     /* Display VSYNC tick: raise the secondary VSYNC-pending bit at the
      * panel field rate so the firmware's display state machine advances.
      * Real timing is ~MCLK/50Hz (~2.66M cycles); we use a shorter, env-
-     * tunable divider so many fields elapse within a bring-up run. */
+     * tunable divider so many fields elapse within a bring-up run.
+     * vsync_cnt also drives the live raster line (disp_cur_line / MEM_LINE):
+     * MEM_LINE==0 lines up with the top-of-frame VSYNC assertion here. */
     if (++m->vsync_cnt >= m->vsync_div) {
         m->vsync_cnt = 0;
+        m->disp_field ^= 1u;         /* even/odd field toggles each VSYNC */
+        m->disp_hsync_grp = 0;       /* re-arm the N-hsync line counter */
         io_set(m, R_P1_1ST_PEND,
                io_get(m, R_P1_1ST_PEND) | IRQ_P1_1ST_VSYNC);
+    }
+    /* Display line interrupt (REG_DISP_N_HSYNC_INT 0x1A6C -> P1_1ST bit1,
+     * INT_PROC1_1ST_HSYNC): "interrupt for each N hsyncs" (§12.50). Guarded on
+     * the register being programmed non-zero AND the timing generator enabled,
+     * so it costs nothing on this firmware (which never programs it -- the
+     * INT_Proc1_1st_isr HSYNC handler is empty in this build) yet fires
+     * faithfully at the programmed line cadence if a future path arms it. */
+    {
+        uint32_t nhs = io_get(m, R_DISP_N_HSYNC) & 0x0FFFu;
+        if (nhs && (io_get(m, R_DISP_TGEN_TOTAL) & DISP_TGEN_EN)) {
+            uint32_t grp = disp_cur_line(m) / nhs;
+            if (grp != m->disp_hsync_grp) {
+                m->disp_hsync_grp = grp;
+                io_set(m, R_P1_1ST_PEND,
+                       io_get(m, R_P1_1ST_PEND) | IRQ_P1_1ST_HSYNC);
+            }
+        }
     }
     if (m->presc_cnt == 0) {
         m->presc_cnt = io_get(m, R_PRESC_RLD);

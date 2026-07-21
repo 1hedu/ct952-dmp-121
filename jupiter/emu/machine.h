@@ -62,6 +62,16 @@ typedef struct machine {
     /* display VSYNC generation (secondary PROC1-1st IRQ, LEON line 13) */
     uint32_t vsync_cnt, vsync_div;
 
+    /* Live LCM / display timing-generator raster (DP700WD_HW_REFERENCE.md
+     * §12.50). The CT909 DISP block (ctkav_disp.h) drives a scan-line counter
+     * (REG_DISP_MEM_LINE 0x1A68), toggles the field-parity bit each VSYNC
+     * period, and can raise a per-N-hsync line interrupt (REG_DISP_N_HSYNC_INT
+     * 0x1A6C -> INT_PROC1_1ST_HSYNC bit1). We derive MEM_LINE at read time from
+     * vsync_cnt/vsync_div and the timing-generator total, so no separate line
+     * clock can drift from the VSYNC cadence. */
+    uint32_t disp_field;        /* even/odd field parity, toggles each VSYNC */
+    uint32_t disp_hsync_grp;    /* last N-hsync group that raised the line IRQ */
+
     /* Functional hardware-JPEG-decode model: the CT952 decodes the staged
      * JPEG (e.g. the power-on COBY logo at DRAM 0x401dc000) in a DMA/VLD block
      * we don't model gate-for-gate. When armed, the emulator decodes the JPEG

@@ -1400,6 +1400,28 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
+        /* Screensaver-gate write-watch (CT952_WWATCH): trace the exact writes
+         * that decide the OSDSS slideshow -- __bPOWERONMENUInitial (0x40023a10,
+         * the gate), __dwOSDSSCheckTime (0x400239b8, reset by OSDSS_ResetTime
+         * each time a "key/activity" is seen), and __bISRKey (0x40039074, the
+         * decoded panel/IR key). If the gate never turns 1, POWERONMENU_Initial
+         * never completes; if CheckTime keeps getting rewritten, the idle timer
+         * is being reset (something reads as "activity"). */
+        if (getenv("CT952_WWATCH")) {
+            uint32_t a = addr & ~3u;
+            if (a == 0x40023a10u || a == 0x400239b8u || a == 0x40039074u) {
+                static int ww;
+                if (ww < 200) {
+                    const char *nm = a == 0x40023a10u ? "POMInit"
+                                   : a == 0x400239b8u ? "OSDSSCheckTime"
+                                                      : "ISRKey";
+                    fprintf(stderr, "[WW] %-14s %08x=%08x pc=%08x icount=%llu\n",
+                            nm, addr, val, m->cpu.pc,
+                            (unsigned long long)m->cpu.icount);
+                    ww++;
+                }
+            }
+        }
         /* Video-plane-enable trace (CT952_VENTRACE): log writes to the software
          * video-enable flag *0x40023fc0 (compositor 0xa683c copies it to VIDEO_EN)
          * and the gate *0x40040e70, to find where the JPEG display enables video. */

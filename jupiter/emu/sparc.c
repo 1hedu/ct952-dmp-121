@@ -639,9 +639,21 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
     static int mbt = -1; static uint32_t mbtn = 0; static uint64_t mbfrom = 0;
     if (mbt < 0) { mbt = getenv("CT952_MBOXTRACE") ? 1 : 0;
         const char *e = getenv("CT952_MBOX_FROM"); mbfrom = e ? strtoull(e,NULL,0) : 34000000ull; }
+    /* Periodic PC sampler (CT952_PCSAMPLE=N): every N instructions print the
+     * current PC so a single run reveals the boot trajectory / terminal hot loop
+     * without many slow run-to samples. */
+    static long pcsamp = -2; static uint64_t pcs_next = 0;
+    if (pcsamp == -2) { const char *e = getenv("CT952_PCSAMPLE");
+        pcsamp = e ? (long)strtoul(e, NULL, 0) : 0; }
     for (i = 0; i < n; i++) {
         if (c->halted) break;
         if (c->brk_pc && c->pc == c->brk_pc) break;   /* stop AT the bp, don't execute it */
+        if (pcsamp > 0 && c->icount >= pcs_next) {
+            pcs_next = c->icount + (uint64_t)pcsamp;
+            fprintf(stderr, "[PCS] pc=%08x o7=%08x sp=%08x icount=%llu\n",
+                    c->pc, sparc_get_reg(c, 15), sparc_get_reg(c, 14),
+                    (unsigned long long)c->icount);
+        }
         if (mbt && c->pc == 0x5969cu && c->icount > mbfrom && mbtn < 2000) {
             mbtn++;
             fprintf(stderr, "[MBOX] get caller o7=%08x arg o0=%08x icount=%llu\n",

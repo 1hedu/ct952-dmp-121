@@ -4792,3 +4792,56 @@ a "~20s in, something fires" stimulus that a passive emulator never generates.
 flash SF_CSN/SFCLK/SFDIO/SFD0`, 116-120 `GPG[0..4]` NIM/tuner (unused on photo
 frame), 57 `CVBS`, 59/61/63 `R/G/B`, 66-68 `VOUTB/G/R`. Full 128-pin table archived
 in the extraction script output.
+
+### 12.55 The slideshow is the IDLE screensaver — gated by __bPOWERONMENUInitial, NOT by a flipped key (ADC no-key verified correct)
+
+Two user insights drove this pass: (a) the panel keys are a **SAR/ADC resistor
+ladder** (confirmed §12.54, KEY_DET0/1 pins 25/24), and (b) *"buttons don't trigger
+the slideshow — LACK of buttons does."* Both are exactly right, and they pin the
+acceptance test precisely.
+
+**The slideshow == the OSDSS idle screensaver.** `OSDSS_Monitor()` (osdss.c:298,
+called from the CC main loop cc.c:1004) enters the JPEG slideshow (`OSDSS_Entry`)
+when the box has been idle (`__dwOSDSSCheckNOData == __dwTimeNow`, i.e. playback
+position unchanged) for longer than **`OSDSS_ENTER_TIME = COUNT_10_SEC*2 ≈ 20 s`**
+(osdss.h:20, the DMP952A value) — **but only if `__bPOWERONMENUInitial == TRUE`**
+(plus clock off, no alarm). That 20 s is the "~20 s in" the user has cited all along.
+
+**The SAR/ADC key path, fully mapped:** `PANEL_KeyScan()` (panel.c:198) kicks a SAR
+conversion via `ADCGLB = 0x8000407C` (write `0x00840000` ch0, `0x00C40000` ch1 for
+DMP952A), spins a short delay, reads the 8-bit result from bits [31:24], and
+threshold-decodes: **result ≥ 0xF0 ⇒ no key** (ladder pulled to rail); < 0xF0 ⇒ a
+key. `aScanMap[0] = KEY_NO_KEY`.
+
+**"Flipped key / keeping it alive" hypothesis — EMPIRICALLY REFUTED.** The emulator
+models `ADCGLB` as `0xFF000000` (machine.c:403) ⇒ decode → `KEY_NO_KEY`, i.e.
+*correct* idle, not `KEY_PICTURE` (which would force standby). A new write-watch
+(`CT952_WWATCH`, machine.c) on the three deciding globals shows, across a crutch-free
+boot:
+- `__bPOWERONMENUInitial (0x40023a10)`: written 0 only by early bss-clear, **never
+  set to 1** — the gate never opens.
+- `__bISRKey (0x40039074)`: written 0 once at 4.8M, **never a phantom key** — nothing
+  is injected that would reset the idle timer.
+- `__dwOSDSSCheckTime (0x400239b8)`: stays `0xFFFFFFFF` — `OSDSS_Monitor`'s first-call
+  init branch **never runs**, so the idle clock never even starts.
+
+So the emulator is NOT erroneously holding a key down; the ADC/idle side is faithful.
+The slideshow can't arm because the boot never reaches the power-on-menu state.
+
+**Where it's actually stuck.** `__bPOWERONMENUInitial` is set at the *end* of
+`POWERONMENU_Initial()` (950_Files/poweronmenu.c:434), called once at boot
+(cc.c:1320). The logo JPEG *does* decode (that call is inside POWERONMENU_Initial,
+line 417), so it enters the function but blocks before line 434 — in the display/
+decoder bring-up (`DISP_DisplayCtrl(DISP_MAINVIDEO,TRUE)`). A periodic PC sampler
+(`CT952_PCSAMPLE`, sparc.c) shows steady state from ~38M: the eCos scheduler cycling,
+with a **generic bounded-wait primitive `0xa33d8`** (waits up to 0x18=24 ticks
+polling the CC event mbox `0x5969c`→`0x40033830`, osdss/display region) timing out
+and being re-called forever — the event never posts. One thread also periodically
+runs the PROC2 vdec-playmode poll (`0x70890` on bram `0xB0000190`).
+
+**VERDICT.** The user's model is correct end-to-end: no-key idle → 20 s → slideshow,
+and the ADC no-key is modeled faithfully. The block is NOT a spurious keep-alive; it
+is the *same* missing-event-POST frontier (§12.49-§12.53), now pinned to its
+acceptance-test meaning: **POWERONMENU_Initial cannot finish its display bring-up, so
+`__bPOWERONMENUInitial` never turns TRUE and the idle screensaver machinery never
+starts.** New instrumentation: `CT952_WWATCH`, `CT952_PCSAMPLE`.

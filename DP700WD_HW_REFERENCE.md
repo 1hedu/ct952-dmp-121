@@ -5155,3 +5155,43 @@ display/decoder readiness `0x5abb4(7)` polls for, so it returns and the resume f
 **Next:** dissect `0x5abb4(7)`'s loop exit condition — the specific display/decoder
 ready state it waits for — and model that (the continuation of the VDEC_IDLE/VSYNC
 line, now with a concrete return-or-hang test at `0x41b04`).
+
+### 12.64 PAYOFF TEST — resuming the worker is necessary and WORKS, but the worker is a CONSUMER of F_REQ; the innermost root is the F_REQ-bit-0x80 producer (§12.43)
+
+Ran the decisive experiment (`CT952_SKIP_READY`): jump the boot-init straight to the
+worker-resume `0x41b04` (bypassing the hung `0x5abb4(7)` and its `i0!=0` skip), so the
+CC-event worker `0x6748` starts.
+
+**Result — the resume genuinely works and matters:**
+- `0x66dc` runs → resume `0x596e0` fires → **worker `0x6748` executes** (o7=eCos
+  thread-entry `0x4001ea60`) — first time ever.
+- `__fThreadInit`: `0x00000102` → **`0x00080102`** (USB/worker bit `0x80000` now set) —
+  exactly the "natural boot" value recorded in earlier sessions. So the un-resumed
+  worker (§12.62/12.63) was the reason `__fThreadInit` was short a bit under
+  `--skip-panelcfg`.
+
+**But the boot still does NOT reach POWERONMENU**, and `F_REQ (0x40026e9c)` bit `0x80`
+is STILL never set (`CT952_FREQTRACE`: only `0x0` written; the sole post-resume write
+is the worker's own `cyg_flag` setup at eCos `0x4001dfdc`). So:
+
+**The worker is the F_REQ *consumer/dispatcher*, not its producer.** Its body
+`cyg_flag_wait`s on `F_REQ` bit `0x80`; on that bit it runs dispatcher `0x6eec` →
+`PostEvent 0x12f10` → re-posts the CC/OSD mbox `0x40033830` → CC loop cycles. It
+*forwards* events; it does not originate bit `0x80`. Something else must **set F_REQ
+bit 0x80**, and that producer never runs — the exact §12.43 frontier, now confirmed as
+the innermost root beneath the whole stack.
+
+**What bit 0x80 is:** F_REQ's low byte `0x40026e98` mirrors `MediaPresentPost`'s last
+source index (setter `0x6130`), so bit `0x80` is a **media/source-present event**. The
+producer is the media/source-detect path (§12.15) — it must post "source present" to
+wake the worker, which then drives the CC/OSD event loop that unblocks display init,
+which lets `INITIAL_System` return, which reaches `POWERONMENU_Initial`.
+
+**Chain, fully mapped slideshow→root:**
+OSDSS idle screensaver ← `__bPOWERONMENUInitial` ← `POWERONMENU_Initial` ←
+`INITIAL_System` returns ← display sequencer ready (VSYNC) ← CC/OSD mbox posts ←
+worker `0x6748` dispatches ← **F_REQ bit 0x80 set by media/source-present producer** ←
+??? (the one remaining unknown). Every intermediate link is now identified and, where
+hardware, faithfully modelable; the final unknown is the media/source-present post.
+
+New knob: `CT952_SKIP_READY` (diagnostic — force worker resume).

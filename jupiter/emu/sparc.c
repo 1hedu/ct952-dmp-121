@@ -655,9 +655,26 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
     static long pcsamp = -2; static uint64_t pcs_next = 0;
     if (pcsamp == -2) { const char *e = getenv("CT952_PCSAMPLE");
         pcsamp = e ? (long)strtoul(e, NULL, 0) : 0; }
+    /* DIAGNOSTIC (CT952_SKIP_READY): the boot-init readiness call 0x5abb4(7) at
+     * 0x41a90 never returns (§12.63), so the worker-resume at 0x41b04 is never
+     * reached. Skip the call (jump straight to its return site 0x41a98, faking
+     * return 0 in %o0) so the boot reaches the resume path -- tests whether
+     * starting the CC-event worker cascades the whole boot forward. */
+    static int skipready = -1;
+    if (skipready < 0) skipready = getenv("CT952_SKIP_READY") ? 1 : 0;
     for (i = 0; i < n; i++) {
         if (c->halted) break;
         if (c->brk_pc && c->pc == c->brk_pc) break;   /* stop AT the bp, don't execute it */
+        if (skipready && c->pc == 0x41a90u) {
+            /* Jump straight to the worker-resume call 0x41b04 (skip 0x5abb4 AND
+             * the i0!=0 skip-branch), with %o0=8 as that call expects. Decisive
+             * test: does starting the CC-event worker cascade the boot? */
+            sparc_set_reg(c, 8, 8);          /* %o0 = 8 (arg 0x66dc expects) */
+            c->pc = 0x41b04u; c->npc = 0x41b08u;
+            fprintf(stderr, "[SKIPREADY] jumped to worker-resume 0x41b04 at icount=%llu\n",
+                    (unsigned long long)c->icount);
+            continue;
+        }
         if (pcsamp > 0 && c->icount >= pcs_next) {
             pcs_next = c->icount + (uint64_t)pcsamp;
             fprintf(stderr, "[PCS] pc=%08x o7=%08x sp=%08x icount=%llu\n",

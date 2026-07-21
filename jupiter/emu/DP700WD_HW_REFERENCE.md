@@ -61,3 +61,35 @@ keystone — not more DSP-register modeling.
 **Honest status:** genuine progress locating the deadlock to one instruction; two
 mid-turn model errors caught and corrected. The keystone is the CC-event mbox producer
 (software), reachable by tracing which mbox `0x5abb4(7)` blocks on and its poster.
+
+### 12.70 MAJOR CORRECTION — the boot is not deadlocked, it is SLOW (real firmware delays × slow eCos clock); the worker resume is reached NATURALLY once the clock is sped up
+
+A deterministic call-trail from the `0x41a90` entry (`CT952_CALLTRAIL`: log every CALL
+after the main thread enters `0x5abb4(7)`) overturned the §12.63/§12.69 "hang" reads
+(which were static-analysis errors):
+
+- **`0x5abb4(7)` RETURNS** — execution reaches `0x41aac` right after it. It does NOT
+  hang. `SKIP_READY` was bypassing a non-problem.
+- **`0x59e90` = `SOURCE_Select(source)`**, called with **source 7 (internal source)**;
+  it also RETURNS (at 48.4M, `PCWATCH` on its return `0x41ab4`).
+- The boot-init then runs a sequence of real **`OS_DelayTime` calls (`0x59850`)**:
+  `0x59850(0x64)` = 100 ms took ~13M instructions (48.4M→61.7M) but **returned**;
+  `0x59850(0x5dc)` = 1500 ms would take ~200M instructions. The eCos clock advances
+  ~133K instr/ms, so real firmware delays consume enormous instruction counts.
+
+**So the "deadlock" is largely SLOWNESS, not a missing producer.** With the intended
+knob `CT952_TICK_FAST_AT=48000000,256` (speed the eCos TIMER1 clock 256× after the
+early gates), the boot-init completes the delays and **reaches the worker-resume
+`0x41b04` at 54.8M NATURALLY** — no `SKIP_READY`. The resume path is real and reached
+on its own once the delays are given a runnable time budget.
+
+**This reframes the whole late-boot picture:** VDEC_IDLE (decoder playmode) + VSYNC_KEEP
+(display VSYNC) + a sped-up eCos clock let the boot-init run to completion through its
+legitimate delays and reach the CC-event worker resume — the crutches SKIP_READY and
+the "missing mbox producer" framing (§12.49-69) were partly artifacts of the boot
+being time-starved (delays never completing in the instruction budget of a test run).
+
+**Now testing:** long run with `TICK_FAST_AT=...,512` to see whether, past the resume,
+the worker starts and cascades to `POWERONMENU_Initial` → the idle screensaver/
+slideshow. New knob: `CT952_CALLTRAIL`. (Correcting my own §12.63/12.69 hang-location
+errors, caught by measuring instead of static-reading.)

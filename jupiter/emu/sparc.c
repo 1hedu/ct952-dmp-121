@@ -681,6 +681,29 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
                     c->pc, sparc_get_reg(c, 15), sparc_get_reg(c, 14),
                     (unsigned long long)c->icount);
         }
+        /* Call-trail from 0x5abb4(7) entry (CT952_CALLTRAIL): the instant the
+         * main thread reaches the boot-init 0x41a90 call, log every subsequent
+         * CALL (pc -> target, %o0 arg) for N calls -- shows exactly how 0x5abb4(7)
+         * descends and where it blocks/loops (settles poll-vs-block, §12.69). */
+        { static int ct = -1; static int on = 0, nlog = 0;
+          if (ct < 0) ct = getenv("CT952_CALLTRAIL") ? 1 : 0;
+          if (ct) {
+              if (c->pc == 0x41a90u) { on = 1;
+                  fprintf(stderr, "[CT] === enter 0x5abb4(o0=%x) icount=%llu ===\n",
+                          sparc_get_reg(c, 8), (unsigned long long)c->icount); }
+              if (on && nlog < 400) {
+                  int fault = 0;
+                  uint32_t insn = c->bus->read(c->bus, c->pc, 4, &fault);
+                  if (!fault && (insn >> 30) == 1) {   /* CALL */
+                      uint32_t disp = insn & 0x3fffffff;
+                      if (disp & 0x20000000) disp |= 0xc0000000u;
+                      uint32_t tgt = c->pc + (disp << 2);
+                      fprintf(stderr, "[CT] %08x call %08x o0=%08x o1=%08x\n",
+                              c->pc, tgt, sparc_get_reg(c, 8), sparc_get_reg(c, 9));
+                      nlog++;
+                  }
+              }
+          } }
         if (pw) {
             for (int k = 0; k < pwn; k++)
                 if (c->pc == pwl[k] && pwh[k] < 40) {

@@ -4236,6 +4236,28 @@ Pursued the standing hypothesis (§12.28/§12.34) that a *decode-completion inte
 is flash `0x7efdc` (sets `__fThreadInit 0x40038f80` bit `0x10`) is the missing boot producer.
 Two independent results, both decisive.
 
+> **CORRECTION (§12.51, binary-proven): (A) below is WRONG. `SUPPORT_JPEGDEC_ON_PROC2`
+> IS defined in this build.** The shipped image is the CT909R-family / DMP952A config
+> (root `platform.h`'s `CT909P_IC_SYSTEM` is stale — it does not reflect the linked
+> binary). Proof from the running image, not the header: the `#ifdef
+> SUPPORT_JPEGDEC_ON_PROC2` AIU-GR2..16 reset loop (`chips.c:1374`/`utl.c:5194`)
+> **executes** (`--iolog`: GR2..GR16 `0x80000788`–`0x800007c0` each written 0); the
+> firmware **stages PROC2 for the JPEG code** (`PROC2_START` GR22 `0x800007d8` =
+> `0x40002000`, `PROC2_SP` GR21 `0x800007d4` = `0x4001cf00`, boot-cmd GR25
+> `0x800007e4` = `0x10003` — the exact `hdecoder.c:714`/`724-737` handshake); and
+> `jpegdec.bin` in the build tree **is** the real PROC2 SPARC image (trap table at
+> `0x40002000`, reset→`0x40003000`, boot handshake spins on GR25 low-bits==`0x10003`
+> then clears GR25). So a PROC2 software JPEG decoder **does exist**. **BUT §12.48's
+> operational conclusion still holds** — measured in §12.51, PROC2 (`cpu2`) executes
+> **zero** instructions during the boot: it is staged-and-held once and **never
+> released** (no `REG_PLAT_RESET_CONTROL_DISABLE` bit0 = `0x80000304`=1, no DSU2
+> release, in 90M), so the boot photos still decode on the **PROC1** JPEG worker
+> (`0x7007c`) + HW-JPU path (poll-satisfied, §10.8/§12.48B). The PROC2 JPEG offload is
+> real but is only activated by a runtime slideshow decode that is downstream of the
+> event-loop deadlock (§12.49/§12.50), so it is **not** the missing CC-event producer.
+> The paragraph below reasoned from the stale header and reached the right operational
+> answer for the wrong reason — read it with that correction.
+
 **(A) There is NO software (PROC2-code) JPEG decoder in this build — preprocessor-proven.**
 `SUPPORT_JPEGDEC_ON_PROC2` is defined **only** inside `#ifdef CT909R_IC_SYSTEM`
 (`Winav.h:1075-1077`); this image is `CT909P_IC_SYSTEM` (`platform.h:26-27`, CT909R commented
@@ -4562,3 +4584,112 @@ break it one must either reverse the precompiled framework's `0x40033830`-get
 caller (break there live, read `%i7`) and the command-`0x14` producer, or deliver
 the missing per-frame event. New instrumentation this session: `CT952_MLTRACE`;
 the live-raster model is unconditional (faithful HW), not env-gated.
+
+### 12.51 PROC2 SOFTWARE JPEG DECODER — confirmed present (corrects §12.48A), but STAGED-AND-HELD, never released at boot; its PROC1 completion is a POLLED AIU-GR mailbox, not the missing CC-event producer
+
+Task: on the hypothesis that a PROC2 "frame-done" handshake is the unmodeled
+per-decode event producer that should wake the CC/OSD loop (F_REQ `0x40026e9c`
+bit `0x80` / re-post CC mbox `0x40033830`, §12.42-12.50), determine empirically
+what PROC2 (`cpu2`) does during a photo decode and model its completion signal
+faithfully. Static RE (`dis.sh`, `jpegdec.bin` disasm) + full-speed native trace
+(new `CT952_P2FULL`, `machine.c`); the `--gdb` stub was not needed.
+
+**(1) Binary reality — `SUPPORT_JPEGDEC_ON_PROC2` IS defined (corrects §12.48A).**
+§12.48A reasoned from the *stale* root header (`platform.h` `CT909P_IC_SYSTEM`) and
+wrongly concluded the macro is off. The **linked image** proves otherwise:
+- The `#ifdef SUPPORT_JPEGDEC_ON_PROC2` AIU-GR2..16 reset loop (`chips.c:1374`,
+  `utl.c:5194`) **executes** — `--iolog` shows GR2..GR16 (`0x80000788`–`0x800007c0`)
+  each written `0` (one write apiece). (The `initial.c:1874` copy is guarded by
+  `CT951_PLATFORM`, a different macro, and is *not* the source — the two that fired
+  are the `SUPPORT_JPEGDEC_ON_PROC2` ones.)
+- The firmware **stages PROC2 to run the JPEG code**: at pc `0x3f830` (called from
+  the display-restart chain `0x41728`, §12.50) it writes SP GR21 `0x800007d4` =
+  `0x4001cf00`, START GR22 `0x800007d8` = `0x40002000`, boot-cmd GR25 `0x800007e4`
+  = `0x00010003` — the exact `HAL_ReloadAudioDecoder` handshake (`hdecoder.c:702-714`).
+- `jpegdec.bin` in the build tree **is** the real PROC2 SPARC image: a trap table
+  at load-addr `0x40002000` (`reset → 0x40003000`), and its boot handshake (offset
+  `0x131c`) spins reading GR25 until `(GR25 & 0x1ffff)==0x10003`, then `clr [GR25]`
+  to ack — the PROC2 side of `hdecoder.c:724-737`. So a PROC2 **software** JPEG
+  decoder unquestionably exists. §12.48A's premise ("no PROC2 JPEG decoder") is
+  **struck**; its *operational* conclusion survives (see below).
+
+**(2) MEASURED: PROC2 executes ZERO instructions during the boot.** Full-speed
+`CT952_P2FULL` trace (every `0x80000304`/`0x324`/`0x98000000`/GR21/22/25 write, any
+value) over a 90M crutch-free boot, cross-checked against the reset-bit map
+(`ctkav_platform.h:302/340`: `PLAT_RESET_PROC2_*` = bit0 `0x1`; **not** the VPU/JPU
+reset bit23 `0x00800000` that shares `0x304/0x324` via `MACRO_RESET_JPU`, 541× per
+JPU op — that distinction is what hid the picture from bit-0-only filters):
+```
+icount 4,943,791  GR21(0x7d4)=4001cf00   pc=3f830   ; stage SP
+icount 4,943,794  GR22(0x7d8)=40002000   pc=3f830   ; stage START (JPEG load addr)
+icount 4,943,801  GR25(0x7e4)=00010003   pc=3f830   ; boot-cmd
+icount 4,943,860  0x80000324 = 00000001  pc=3f9c4   ; PLAT_RESET_PROC2_ENABLE (assert = HOLD)
+       DRAM@40002000: 02e4056b 02c20593 ...          ; NOT jpegdec.bin (a0100000...) -> code NOT loaded
+icount 4,943,862  GR25(0x7e4)=00000000   pc=3f9cc   ; pre-clear ack slot
+--- and then, in all 90M: ZERO writes of 0x80000304=..01 (PROC2 release),
+    ZERO 0x98000000 (DSU2 release). Only bit23 VPU resets recur. ---
+[EXIT, CT952_PROC2=1] PROC2 on=0 pc=00000000 icount=0 halted=1
+```
+So `proc2_boot` is **never** triggered: the firmware asserts PROC2 reset **once**
+(hold) and never deasserts it. The staged JPEG code is not even present at
+`0x40002000` at that point (the ROMLD "JPEG" decompress hasn't run), and the
+"wait-for-boot-ACK" poll right after the hold is satisfied *trivially* because
+PROC1 pre-cleared GR25 itself (`GR25>>16 == 0`), so the firmware reads "boot OK"
+without PROC2 ever running. **`cpu2` executes 0 instructions the entire boot.** The
+host-`picojpeg` model runs the boot photos (#1 480×270 logo, #2 640×360 album)
+*instead of* PROC2 — faithfully, since PROC2 isn't the decoder here.
+
+**(3) The real PROC2→PROC1 completion mechanism (for the record — never exercised).**
+It is a **polled shared-register mailbox**, not an interrupt (PROC2's `bus2` has no
+async IRQ wiring, and `HAL_ReadInfo`/JPEGDEC read status by polling): boot-ack via
+**GR25 `0x800007e4`** (PROC2 clears it → PROC1 polls `>>16==0`, `hdecoder.c:728`),
+and per-decode command/status via the **AIU-GR(2..17) bank `0x80000788`–`0x800007c4`**
+(`chips.c:1372` "REG_AIU_GR(2)~(17) connect PROC1↔PROC2"); in `jpegdec.bin` the
+workhorse status register is **GR15 `0x800007bc`** (72 accesses). Because completion
+is **poll-consumed by the JPEG worker thread `0x7007c`** — exactly like the HW-JPU
+`JPU_BUSY`/BCR0A polls the emulator already models and satisfies (§10.8/§12.48B) —
+a PROC2 completion would raise **no DSR and post no message**, so it structurally
+**cannot** be the producer that sets F_REQ bit `0x80`. That producer is a
+message/DSR in the precompiled CC/OSD event framework (§12.49/§12.50), a different
+class entirely.
+
+**(4) What was modeled / changed.** Nothing faked — fabricating a PROC2 completion
+IRQ/mailbox post would be a crutch (the event never occurs). The emulator's PROC2
+model is already faithful for the release case: when the firmware *does* deassert
+PROC2 reset (`0x80000304` bit0) or DSU2-release (`0x98000000`), `proc2_boot` seeds
+`cpu2` at GR22/GR21 and `machine_run`/`machine_step_bp` step it natively on the
+shared bus, so it would drive the real GR15/GR25 handshake itself (no stand-in).
+Added **`CT952_P2FULL`** (`machine.c`, env-gated): the complete PROC2 lifecycle
+trace (bit0-vs-bit23 reset disambiguation + GR21/22/25 staging + a DRAM dump of the
+staged entry on each core-reset, to check whether the "JPEG" section was actually
+loaded) that produced the measurements above. The default PROC2 gate
+(`CT952_PROC2`) is left as-is: it is measurably inert to this boot (no release → no
+`cpu2` step), and flipping it risks running unloaded `0x40002000` garbage if a
+release ever appears.
+
+**(5) Measured after this pass (raw crutch-free boot, `TICK_MULT=256`, `--run-to
+90M`, `CT952_PROC2=1`):**
+```
+[EXIT] PROC2 on=0 icount=0 halted=1        <- cpu2 never ran
+__fThreadInit          = 0x00080102        (JPEG 0x2 + Parser 0x100 + USB 0x80000; unchanged)
+__bPOWERONMENUInitial  = 0x00
+_bOSDSSScreenSaverMode = 0x00              <- screensaver NOT armed
+F_REQ 0x40026e9c       = 0x00000000        <- bit 0x80 STILL never set
+event_flag 0x40026ea4  = 0x00000000
+disp_state 0x4002401c  = 0x00000027        (bit1 stopped, unchanged)
+```
+No PROC2 completion fires because PROC2 never runs; F_REQ bit `0x80` stays clear,
+the CC mbox is not re-posted, and the screensaver does not arm — identical to the
+pre-existing baseline.
+
+**VERDICT — PROC2-JPEG-completion STRUCK from the boot-stall suspect list** (joining
+MPEG §12.47 and the `0x7efdc` codec-thread / decode-IRQ class §12.48). The PROC2
+software JPEG decoder **does exist** in this build (correcting §12.48A's reason),
+but it is staged-and-held and **never released** at boot, so it executes nothing and
+produces no completion signal; and even if it ran, its completion is a **polled**
+AIU-GR mailbox consumed by a worker thread, not a DSR that could set F_REQ bit
+`0x80`. Its activation is gated behind the *same* command-driven display-restart /
+CC event loop that is deadlocked in the untimed `0x40033830` mbox-get (§12.49/§12.50)
+— it is collateral of that deadlock, not its cause. The unchanged frontier remains
+the CC/OSD event-framework producer (§12.49/§12.50). New instrumentation:
+`CT952_P2FULL` (`machine.c`).

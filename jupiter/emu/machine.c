@@ -1316,6 +1316,27 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
                          addr, val, m->cpu.pc, io_get(m, R_PROC2_START),
                          (unsigned long long)m->cpu.icount);
     }
+    /* CT952_P2FULL: complete PROC2 lifecycle trace (any value) -- the reset
+     * bit0 (PLAT_RESET_PROC2, ctkav_platform.h:302/340) vs. the VPU/JPU reset
+     * bit23 (0x00800000) share 0x304/0x324, so a bit-0-only filter hides the
+     * whole picture. Also logs the AIU-GR staging bank the JPEG-on-PROC2 boot
+     * uses: START GR22(0x7d8), SP GR21(0x7d4), ACK GR25(0x7e4). */
+    if (getenv("CT952_P2FULL") &&
+        (addr == 0x80000304u || addr == 0x80000324u || addr == 0x98000000u ||
+         addr == 0x800007d8u || addr == 0x800007d4u || addr == 0x800007e4u)) {
+        static int n; if (n < 200) { n++;
+        fprintf(stderr, "[P2full] %08x=%08x pc=%08x i7=%08x icount=%llu\n",
+                addr, val, m->cpu.pc, sparc_get_reg(&m->cpu, 31),
+                (unsigned long long)m->cpu.icount);
+        /* On a PROC2-core reset write (bit0), dump the staged entry region so we
+         * can see whether HAL_LoadAudioCode actually decompressed the "JPEG"
+         * section to DS_PROC2_STARTADDR (0x40002000) before the release. */
+        if ((addr == 0x80000324u || addr == 0x80000304u) && (val & 1u)) {
+            uint8_t *p = machine_dram_ptr(m, 0x40002000u);
+            if (p) fprintf(stderr, "       DRAM@40002000: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11]);
+        } }
+    }
 
     /* PROC2 reset/debug control (writes from PROC1) */
     if (m->proc2_enable) {

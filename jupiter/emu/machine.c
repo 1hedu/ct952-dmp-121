@@ -1133,6 +1133,19 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         return (v >> ((addr & 2) ? 0 : 16)) & 0xFFFF;
     }
     if (addr >= 0xB0000000u && addr + (uint32_t)size <= 0xB0010000u) {
+        /* DSP-interface read trace (CT952_DSPTRACE=<from_icount>): log every SRAM
+         * (bram) read past the given icount -- reveals exactly which decoder-DSP
+         * state the firmware polls at the stall, to build the DSP model (§12.67). */
+        { static long dt = -2; static uint64_t dtn[64]; static int dti = 0;
+          if (dt == -2) { const char *e = getenv("CT952_DSPTRACE");
+                          dt = e ? (long)strtoull(e, NULL, 0) : -1; }
+          if (dt >= 0 && m->cpu.icount >= (uint64_t)dt) {
+              uint32_t o = addr - 0xB0000000u; int seen = 0, k;
+              for (k = 0; k < dti; k++) if (dtn[k] == o) { seen = 1; break; }
+              if (!seen && dti < 64) { dtn[dti++] = o;
+                  fprintf(stderr, "[DSP rd] b0000%03x sz%d pc=%08x icount=%llu\n",
+                          o, size, m->cpu.pc, (unsigned long long)m->cpu.icount); }
+          } }
         /* EXPERIMENT (CT952_FORCE_PLAYMODE): present the vdec playmode
          * (0xb0000190) as a fixed value, standing in for the PROC2 decoder
          * microcode reaching MODE_STOP(0x10). Tests whether the boot thread's

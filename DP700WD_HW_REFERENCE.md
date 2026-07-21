@@ -5283,3 +5283,35 @@ up, worker up, cycling in decoder-ring loops." The finish line (rendered slidesh
 NOT reached — the remaining work is modeling the **decoder DSP result-ring producer**
 (the state the ring consumers poll for), the deepest layer of the DSP behavioral model
 (§12.58). That, not media-present, is the last gate.
+
+### 12.67 DSP-model groundwork — SRAM interface mapped; the crutched stall does NOT poll the DSP (model must be built with crutches OFF, at 0x5abb4)
+
+Started the absolute DSP model. Mapped the PROC1↔decoder SRAM interface (ctkav_vdec.h,
+`REG_SRAM_BASE = 0xB0000000`):
+- `0x190` **PLAYMODE** (BYTE) — command/state (already stood-in by `CT952_VDEC_IDLE`).
+- `0x194` **WATCHDOG** (DWORD) — **written by PROC1** (`REG_SRAM_WATCHDOG++` in cc.c:843/
+  1270, mm_play.c:2739, monitor.c:674; monitor.c:1575 checks it changed). It is a
+  *firmware* self-liveness counter, NOT a DSP-posted signal. Do not model it as DSP.
+- `0x198` **DISPLINE** (DWORD) — display line.
+- `0x00-0x18F` — decoder scratch (MP4/MPG state vars), PROC1-managed.
+
+**Empirical finding (new `CT952_DSPTRACE` = log distinct bram reads past an icount):**
+with `VDEC_IDLE`+`VSYNC_KEEP`+`SKIP_READY`, the boot performs **no bram/SRAM reads at
+the stall** (50M+). So the current *livelock* is not a DSP-register poll — `VDEC_IDLE`
+already covers the one decoder handshake (the `0x190` playmode poll at 0x6f820), and
+what remains is firmware coordination that `SKIP_READY` disrupts by skipping the
+`0x41a98`-`0x41b04` setup.
+
+**Consequence for the model:** the place the DSP model actually matters is `0x5abb4(7)`
+(§12.63) — the readiness dispatch whose hang forced `SKIP_READY`. But `SKIP_READY`
+*bypasses* `0x5abb4` entirely, hiding what it polls. So the absolute DSP model must be
+built with the crutch OFF: run `VDEC_IDLE`+`VSYNC_KEEP` only, let the thread park in
+`0x5abb4`'s call tree (`0x5a38c→0x61248→0x37400→0x38f74→0xa33d8`, §12.56), and model
+exactly the decoder/display state that path polls so `0x5abb4(7)` returns *naturally*
+— which resumes the worker with its setup intact (no livelock). That, not a broad SRAM
+model, is the bounded target.
+
+**Status:** SRAM interface documented; DSP watchdog correctly excluded (PROC1-owned);
+`CT952_DSPTRACE` added. The absolute DSP model is a substantial, well-scoped next
+effort centered on the `0x5abb4(7)` readiness poll (crutches off), NOT the media
+fabric and NOT the PROC1 watchdog. New knob: `CT952_DSPTRACE`.

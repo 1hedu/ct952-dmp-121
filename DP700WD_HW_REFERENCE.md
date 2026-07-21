@@ -5376,3 +5376,41 @@ measured, not a mystery.
 sped clock the event fabric, worker, and F_REQ producer all run. Closed the IIC
 config-read gap (§12.72). New instrumentation: `CT952_CALLTRAIL`, `CT952_FLAGTRACE`.
 Remaining frontier: the `0x4003cc00` mbox producer / internal-source-present.
+
+### 12.74 RAM dump (user suggestion) confirms NO source present; source-detect never runs and is NOT indirectly dispatched
+
+Acting on the user's two suggestions — (1) dump RAM to catch ROM/DRAM changes, (2)
+consider interprocedural + indirect dispatch as why the producer is unfindable.
+
+**RAM dump at 55M (all fixes, event system alive):**
+- `F_REQ 0x40026e9c = 0`, `F_DONE = 0` (transient bits cycle, 0 at snapshot).
+- **CC mbox `0x40033830` message-count `[+0x3c] = 0`** — empty; the boot-init pollers
+  (`0x841f4`/`0x70240`) wait on it.
+- `__fThreadInit = 0x80102` (worker up), `__bPOWERONMENUInitial = 0`.
+- **Per-source presence table `0x40039b08` (stride 0x64, present flag +0x30): ALL
+  sources present=0**, including slot 7. Only slot 0 has state `0x30`. So NOTHING is
+  marked present — the user's "no source present" reading is confirmed in memory.
+
+**Source-detect never runs:** `CT952_PCWATCH` on the source-event handler `0x12b30`
+and the present=1 path `0x6120` — **0 hits**. Only `0x60bc` (MediaPresentPost source-0
+*removal*, present=0) fires (3×). So no source-present is ever posted.
+
+**Indirect-dispatch check (user's point):** searched BOTH flash and the DRAM dump for
+function-pointer words to `0x12b30`/`0x6108`/`0x6120` and the direct callers
+(`0xd834`/`0xd8a0`/`0xdb4c`/`0x5a4c8`/`0x5f718`) — **none**. So the source-detect is
+NOT reached via an indirect/table dispatch; it is called directly from sites that
+simply never execute. The producer isn't hidden by indirection — the **source-scan
+that would call it never runs**.
+
+**ROM/DRAM code check:** flash is XIP/read-only in the model (writes ignored), so ROM
+cannot be self-modified; eCos + relocated sections live in DRAM but the poller/producer
+functions run XIP from flash (addresses < 0x200000), matching the disassembly — no
+patched-code surprise.
+
+**Frontier (confirmed):** the boot reaches "event system alive, worker dispatching"
+but no source-present is ever declared, so the CC-mbox event that would carry
+`Thread_CTKDVD` to `POWERONMENU_Initial` is never posted. The next step is the
+**source-scan**: find the boot-time media scan that should call `0x12b30` to declare
+the internal source (and/or the "no source found" path a card-less frame takes to the
+menu), and why it never executes. New: RAM-dump analysis method; indirect-dispatch
+ruled out for the source-detect.

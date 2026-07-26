@@ -166,6 +166,12 @@ menu path, NOT needed for the slideshow).
    by-design; if the menu/OSD overlay is wanted, model whatever ISR/thread sets those
    flags. `FORCE_POM` enters `POWERONMENU_Initial` but it then blocks in its own menu
    loop (completion store `0x61ca4` not reached).
-2. Make `--fb-out` composite the de-tiled video plane under the real-bounds OSD (right
-   now `machine_disp_scanout` samples `m->jpeg_rgb` only where OSD idx==0, and the OSD
-   geometry overruns) so a single scan-out shows photo + UI together.
+2. ~~Make `--fb-out` composite the de-tiled video plane under the real-bounds OSD.~~
+   **DONE (§12.76):** `machine_disp_scanout` now samples the de-tiled video plane
+   straight from DRAM (shared `video_sample_rgb`) wherever the OSD is transparent, and
+   CLAMPS the OSD read to the real region (0x4005F000..0x40065000) so it no longer
+   overruns into the tiled video buffer. `--fb-out` shows the clean photo + the OSD's
+   real content (a thin status strip at rows 7–12) in one scan-out; the green stripes
+   are gone. Verified across three distinct cycling slideshow frames (butterfly/
+   lantana, Grand-Teton/Moulton-Barn, Tuolumne river) — the built-in `--video-out`
+   de-tile and the composite `--fb-out` agree.

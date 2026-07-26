@@ -2407,6 +2407,31 @@ static uint32_t disp_yuv_to_rgb(uint32_t yuv)
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
+/* Sample one RGB pixel of the de-tiled video/slideshow plane (macroblock-tiled
+ * YUV 4:2:0 at 0x40065000/0x400B3C00, strip 0x2D00) at native coords (vx,vy).
+ * The single source of truth for the tile geometry shared by the video scan-out
+ * and the panel composite. Returns 0 if the plane isn't mapped. */
+static uint32_t video_sample_rgb(machine_t *m, uint32_t vx, uint32_t vy)
+{
+    const uint32_t strip = 0x2D00u;
+    const uint8_t *yb = machine_dram_ptr(m, 0x40065000u);
+    const uint8_t *cb = machine_dram_ptr(m, 0x400B3C00u);
+    uint32_t yo, cx, cy, co;
+    int Y, U, V, R, G, B;
+    if (!yb || !cb) return 0;
+    yo = (vy >> 4) * strip + (vx >> 2) * 64u + (vy & 15) * 4u + (vx & 3);
+    cx = vx >> 1; cy = vy >> 1;
+    co = (cy >> 4) * strip + (cx >> 3) * 256u + ((cx & 7) >> 2) * 64u
+       + (cy & 15) * 4u + (cx & 3);
+    Y = yb[yo];
+    U = (int)cb[co] - 128;
+    V = (int)cb[co + 128] - 128;
+    R = clamp8(Y + ((91881 * V) >> 16));
+    G = clamp8(Y - ((22554 * U + 46802 * V) >> 16));
+    B = clamp8(Y + ((116130 * U) >> 16));
+    return ((uint32_t)R << 16) | ((uint32_t)G << 8) | (uint32_t)B;
+}
+
 int machine_disp_scanout(machine_t *m, uint32_t osd_base,
                          uint32_t w, uint32_t h, uint32_t stride,
                          const char *ppm_path)
@@ -2448,32 +2473,39 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     f = fopen(ppm_path, "wb");
     if (!f) return -1;
     fprintf(f, "P6\n%u %u\n255\n", w, h);
-    /* Composite the panel: the decoded photo on the video/main plane (scaled
-     * to the panel), with the OSD plane on top -- OSD index 0 is transparent,
-     * so the photo shows through wherever no UI is drawn. Renders the OSD
-     * content regardless of the hardware enable bit (the firmware draws before
-     * flipping enable); enable state is still reported via the return value. */
-    for (y = 0; y < h; y++)
-        for (x = 0; x < w; x++) {
-            uint8_t idx = fb[(uint64_t)y * stride + x];
-            uint32_t c;
-            /* OSD plane off -> the panel shows only the video plane (the decoded
-             * photo); don't composite the not-yet-displayed OSD content. */
-            if (!osd_en) idx = 0;
-            if (idx == 0 && m->jpeg_rgb && m->jpeg_w > 0 && m->jpeg_h > 0) {
-                /* transparent OSD pixel -> sample the video plane */
-                int vx = (int)((uint64_t)x * m->jpeg_w / (w ? w : 1));
-                int vy = (int)((uint64_t)y * m->jpeg_h / (h ? h : 1));
-                const uint8_t *p = m->jpeg_rgb +
-                                   ((size_t)vy * m->jpeg_w + vx) * 3;
-                c = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
-            } else {
-                c = pal[idx];
+    /* Composite the panel: the decoded photo on the video/main plane (de-tiled
+     * straight from DRAM, scaled to the panel) with the OSD plane on top -- OSD
+     * index 0 is transparent, so the photo shows through wherever no UI is drawn.
+     * The OSD read is CLAMPED to the real OSD region (DS_OSDFRAME_ST .. _END =
+     * 0x4005F000 .. 0x40065000); beyond it lies the tiled video buffer, so
+     * reading it as OSD indices produced the spurious "green stripes" (index 0 ->
+     * BT.601 green). Pixels past the region are treated as transparent. Renders
+     * OSD content regardless of the enable bit (firmware draws before flipping
+     * enable); enable state is still reported via the return value. */
+    {
+        const uint32_t osd_end = 0x40065000u;   /* DS_OSDFRAME_END */
+        int have_video = (m->jpeg_rgb && m->jpeg_w > 0 && m->jpeg_h > 0);
+        uint32_t vw = m->jpeg_w > 0 ? (uint32_t)m->jpeg_w : 640u;
+        uint32_t vh = m->jpeg_h > 0 ? (uint32_t)m->jpeg_h : 360u;
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++) {
+                uint64_t lin = (uint64_t)y * stride + x;
+                int in_osd = osd_en && (osd_base + lin < osd_end);
+                uint8_t idx = in_osd ? fb[lin] : 0;
+                uint32_t c;
+                if (idx == 0 && have_video) {
+                    /* transparent OSD pixel -> the de-tiled video plane */
+                    uint32_t vx = (uint32_t)((uint64_t)x * vw / (w ? w : 1));
+                    uint32_t vy = (uint32_t)((uint64_t)y * vh / (h ? h : 1));
+                    c = video_sample_rgb(m, vx, vy);
+                } else {
+                    c = pal[idx];
+                }
+                fputc((int)((c >> 16) & 0xFF), f);
+                fputc((int)((c >> 8) & 0xFF), f);
+                fputc((int)(c & 0xFF), f);
             }
-            fputc((int)((c >> 16) & 0xFF), f);
-            fputc((int)((c >> 8) & 0xFF), f);
-            fputc((int)(c & 0xFF), f);
-        }
+    }
     fclose(f);
     return osd_en ? 0 : 1;
 }
@@ -2489,30 +2521,19 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
 int machine_video_scanout(machine_t *m, uint32_t w, uint32_t h,
                           const char *ppm_path)
 {
-    const uint32_t YBASE = 0x40065000u, CBASE = 0x400B3C00u, strip = 0x2D00u;
-    const uint8_t *yb = machine_dram_ptr(m, YBASE);
-    const uint8_t *cb = machine_dram_ptr(m, CBASE);
     FILE *f;
     uint32_t x, y;
-    if (!yb || !cb) return -1;
+    if (!machine_dram_ptr(m, 0x40065000u) || !machine_dram_ptr(m, 0x400B3C00u))
+        return -1;
     f = fopen(ppm_path, "wb");
     if (!f) return -1;
     fprintf(f, "P6\n%u %u\n255\n", w, h);
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++) {
-            uint32_t yo = (y >> 4) * strip + (x >> 2) * 64u
-                        + (y & 15) * 4u + (x & 3);
-            uint32_t cx = x >> 1, cy = y >> 1;
-            uint32_t co = (cy >> 4) * strip + (cx >> 3) * 256u
-                        + ((cx & 7) >> 2) * 64u + (cy & 15) * 4u + (cx & 3);
-            int Y = yb[yo];
-            int U = (int)cb[co] - 128;
-            int V = (int)cb[co + 128] - 128;
-            /* BT.601 full-range inverse (matches the MCU-BIU forward transform) */
-            int R = clamp8(Y + ((91881 * V) >> 16));
-            int G = clamp8(Y - ((22554 * U + 46802 * V) >> 16));
-            int B = clamp8(Y + ((116130 * U) >> 16));
-            fputc(R, f); fputc(G, f); fputc(B, f);
+            uint32_t c = video_sample_rgb(m, x, y);
+            fputc((int)((c >> 16) & 0xFF), f);
+            fputc((int)((c >> 8) & 0xFF), f);
+            fputc((int)(c & 0xFF), f);
         }
     fclose(f);
     return 0;

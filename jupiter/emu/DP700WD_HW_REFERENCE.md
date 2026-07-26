@@ -571,3 +571,52 @@ forcing the source count to 0 (§12.40's decline reaches POWERONMENU but is unfa
 real device has configured sources and legitimately shows media-select). Next: trace the
 mode-8 key path (`0x260f4` → `0x22494`) and the dialog's selection/timeout to name the exact
 resolution event to model.
+
+### 12.88 ★ MAJOR REFRAME — keys ARE dispatched and handled by an interactive photo-browser; the slideshow auto-advances via KEY_NEXT; "keys do nothing" was a KEY_EXIT + media-not-ready artifact
+
+Traced the mode-8 key path end-to-end and CONFIRMED at runtime, overturning §12.85/§12.86.6's
+"keys are swallowed / unrouted" reading.
+
+**The full key path (runtime-confirmed, `CT952_PCWATCH` + injected IR key):**
+`pump 0xa720 → 0x260f4 (active-UI msg handler) → 0xb1ac (key translate) → 0x9fc8 → 0x22494
+(action) → 0x22fbc → 0x2ab50`. `0x2ab50` is a **176-entry jump table** (`jmp [0x2b078 +
+(key-0x32)*4]`) — the photo-browser / media-manager KEY dispatcher.
+
+**The dispatcher acts on ~24 keys** (non-default table slots), incl. the full nav set:
+- KEY_UP/DOWN/LEFT/RIGHT `0x8d-0x90` → `0x2ace4`; KEY_MENU `0xb5` → `0x2abb8`;
+  KEY_NEXT `0x3d` → `0x2ae38`; KEY_PREV `0x3e` → `0x2af4c`; KEY_BROWSE `0xe0` → `0x2adfc`;
+  KEY_COPY_DEL `0xe1` → `0x2ae18` → `0x233cc` (→ OSD_ChangeUI(COPY_DELETE_DLG=18); this is
+  what the earlier "UI 0x12 transition" actually is — a copy/delete key, not a media resolve).
+- ~150 other codes (incl. **KEY_EXIT `0xc8` = GROUP11+0**) map to the DEFAULT no-op `0x2b06c`.
+
+**Why the earlier test misled:** the injected IR scancode 0x0c decodes to key **`0xc8` =
+KEY_EXIT**, which is a deliberate **no-op in this UI** — so "the key did nothing" was correct
+but unrepresentative. The dispatcher itself runs fine (PCWATCH: `0x260f4`→`0x22494` fire on
+the injected key AND on the periodic event).
+
+**The "periodic 0x3d event" is KEY_NEXT** (`GROUP4+1 = 61 = 0x3d`): the slideshow AUTO-ADVANCE
+posts KEY_NEXT ~every 13M instr through the SAME dispatcher (`0x260f4→0x22494→0x2ab50→0x2ae38`).
+So the demo slideshow IS the interactive photo browser auto-playing — not a separate attract
+path. `0x40020ec8` alternating `0xa0`/`0x3d` (§12.86.5) is idle-tick vs KEY_NEXT.
+
+**Why keys still don't visibly navigate (the real remaining gap):** the key handlers GATE their
+actions on media/browser-READY state and bail to no-op (`return 0xa2`) when not ready. The nav
+handler `0x2ace4` checks `0x4003996c` (READYFLAG), `0x40032b18`, `0x40032b04`, `0x40032afc`;
+KEY_NEXT `0x2ae38` checks `0x4003996c`/`0x40032b04`; the COPY_DEL resolve `0x233cc` needs
+`0x4003996c & 0x20` AND source `0x40032b4f == 8`. `0x4003996c` bit 0x20 (READYFLAG) only
+**pulses** (set by `0x5a6c8`, cleared by `0x36ff0`; §12.68) because no real media source is
+present to hold it — so at the moment a key arrives the browser is "not ready" and the handler
+no-ops. With no browsable media there is also nothing to navigate to.
+
+**So the faithful gap is narrowed and named:** it is NOT key routing (that works) — it is the
+**media/browser READY state**. The lever is to model a media source as PRESENT and ready so the
+READY flags hold: primarily **`0x4003996c` bit `0x20` (READYFLAG)** plus the media-state bytes
+the handlers check (`0x40032b04`, `0x40032b18`, `0x40032afc`, source `0x40032b4f`). With a
+ready source, nav/menu/browse keys produce real navigation and the browser is interactive.
+(The OSD overlay for the menu/cursor may additionally need compositing in `machine_disp_scanout`
+to be visible — to verify once a source is ready.)
+
+**Confidence:** HIGH that keys are dispatched & handled (runtime-confirmed path + jump-table);
+HIGH that KEY_EXIT is a no-op and KEY_NEXT drives the slideshow; MEDIUM-HIGH that READYFLAG +
+media-state is the enabling gate (static reads of the handler bodies; next step is to hold
+those flags and confirm nav becomes live).

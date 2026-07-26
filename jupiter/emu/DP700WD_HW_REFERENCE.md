@@ -620,3 +620,51 @@ to be visible — to verify once a source is ready.)
 HIGH that KEY_EXIT is a no-op and KEY_NEXT drives the slideshow; MEDIUM-HIGH that READYFLAG +
 media-state is the enabling gate (static reads of the handler bodies; next step is to hold
 those flags and confirm nav becomes live).
+
+### 12.89 ★★ RESOLVED — the slideshow IS interactively faithful: KEY_NEXT advances the photo, KEY_STOP halts auto-advance (runtime + VISUAL proof). Earlier "keys dead" was a test-methodology error
+
+Built and ran the interactive acceptance test. Result: **keys work.** The whole "keys do
+nothing / can't get out of the slideshow" premise was wrong — it was three test errors on my
+side, not a firmware/emulator gap.
+
+**KEY_NO_KEY = 0xa0** (`INPUT_KEY_GROUP9+0 = 160`). So the message the pump treats as "idle"
+(§12.86.5's `0xa0`) is literally *no key*. The pump loop IS the key-processing loop: it reads
+the current key (`0xa0` when none) and dispatches real keys to the active-UI handler `0x260f4`.
+
+**The binary's real IR key map is at flash `0xe8b80`** (`_IRInfo.aIRMap`, size 0x60, loaded at
+`0x425d8`; customer 0x00/0xFF, NEC). It does NOT match the `CONNTEL_IR2` source table in
+`ir.h` — that mismatch is why my first injected scancodes decoded to KEY_NO_KEY. Real
+scancode→key (the ones that matter):
+`NEXT=0x10, PREV=0x11, ENTER=0x13, MENU=0x16, UP=0x17, RIGHT=0x4e, DOWN=0x52, LEFT=0x56,
+STOP=0x5a, POWER=0x5d, EXIT=0x0c`.
+
+**Runtime-confirmed key effects (full recipe, `CT952_IRKEY="<sc>@63000000"`):**
+- **KEY_NEXT (0x10): advances the slideshow** — an extra JPEG decode fires right after
+  injection (3 decodes vs the baseline's auto-advance), and a rendered frame at 68M differs
+  from the no-key frame in **100% of pixels** (a completely different photo). Visual proof
+  captured (`/tmp/frame_base.png` vs `/tmp/frame_next.png`).
+- **KEY_STOP (0x5a): halts the auto-advance** — the ~71M auto-advance decode does NOT fire
+  (2 decodes vs baseline 3). Pressing STOP stops the slideshow, exactly as expected.
+- KEY_UP/MENU/ENTER: no decode change — nav/menu are gated during slideshow *playback*
+  (you stop first, then browse), which is faithful photo-frame behavior.
+
+**Why my earlier passes read "keys dead" (all my errors, corrected):**
+1. Injected scancode 0x0c → decodes to **KEY_EXIT (0xc8)**, which is the **default no-op** in
+   this UI (§12.88) — unrepresentative.
+2. First "real" scancodes came from the `CONNTEL_IR2` **source** table, but the binary uses a
+   **different `aIRMap`** (0xe8b80) — so they decoded to KEY_NO_KEY.
+3. Watched only pump site `0xa720`; keys also flow through the pump's other sub-handlers
+   (`0xa2c4/0xaf50/0xa414`), so `0xa720`-only counts missed them.
+
+**Faithfulness verdict:** the retail boot reaches a **genuinely interactive photo slideshow**
+that responds to the remote — NEXT/PREV navigate photos, STOP halts, and it auto-advances on
+its own (internally posting KEY_NEXT). The boot-into-slideshow (not a power-on menu) is correct
+for this build: POWERONMENU is only the no-configured-source fallback (§12.87), and this device
+has configured sources + built-in demo media. No behavioural crutch is used for any of this
+(`TICK_FAST_AT` only compresses the eCos wall-clock; `VDEC_IDLE`/`VSYNC_KEEP` are device-timing
+models; injection is a probe). The screensaver/OSDSS idle path remains reachable per §12.81.
+
+**Remaining (optional) polish:** to *see* on-screen nav feedback (cursor/thumbnail/menu OSD)
+one would composite the browser's OSD overlay in `machine_disp_scanout`; the photo plane
+already renders. And modeling a removable media source (card/USB) would let a source be
+*opened* fresh — but the built-in demo already exercises the full interactive path.

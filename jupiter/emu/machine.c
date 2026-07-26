@@ -2556,21 +2556,6 @@ void machine_dump_iolog(machine_t *m, FILE *f)
 
 static int clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
-/* BT.601 studio-range YCbCr (0x00YYUUVV) -> packed 0x00RRGGBB: the exact
- * inverse of the SDK's jup_argb_to_yuv, so a colour loaded into the OSD
- * palette scans back out to its original ARGB. */
-static uint32_t disp_yuv_to_rgb(uint32_t yuv)
-{
-    int y = (int)((yuv >> 16) & 0xFF);
-    int u = (int)((yuv >> 8) & 0xFF);
-    int v = (int)(yuv & 0xFF);
-    int c = y - 16, d = u - 128, e = v - 128;
-    int r = clamp8((298 * c + 409 * e + 128) >> 8);
-    int g = clamp8((298 * c - 100 * d - 208 * e + 128) >> 8);
-    int b = clamp8((298 * c + 516 * d + 128) >> 8);
-    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-}
-
 /* Sample one RGB pixel of the de-tiled video/slideshow plane (macroblock-tiled
  * YUV 4:2:0 at 0x40065000/0x400B3C00, strip 0x2D00) at native coords (vx,vy).
  * The single source of truth for the tile geometry shared by the video scan-out
@@ -2611,11 +2596,14 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
         int loaded = 0;
         for (i = 0; i < 256; i++) {
             uint32_t raw = io_get(m, R_DISP_GAM_OSD + (uint32_t)i * 4);
-            pal[i] = disp_yuv_to_rgb(raw);
-            /* Test the RAW palette word, not the converted RGB: an all-zero
-             * GAM_OSD entry converts to (0,135,0) green (BT.601 Y=U=V=0), which
-             * is nonzero and would falsely read as "palette loaded". */
-            if (i && raw) loaded = 1;
+            /* The OSD palette RAM on this firmware stores plain 0x00RRGGBB (verified
+             * from the live GAM_OSD contents: grays like 0xbbbbbb/0x464646/0x101010
+             * have R==G==B, which only holds for RGB -- a YUV gray would be U=V=0x80;
+             * and 0x0f7d10/0xcd1b24/0xe9ca2b read as sensible UI green/red/gold). The
+             * high byte is an attribute/alpha flag (e.g. 0x01xxxxxx), so mask to 24b.
+             * The earlier YUV interpretation turned 0xbbbbbb gray into magenta. */
+            pal[i] = raw & 0x00FFFFFFu;
+            if (i && (raw & 0x00FFFFFFu)) loaded = 1;
         }
         /* if the firmware hasn't loaded the OSD palette RAM yet, fall back
          * to a visible per-index ramp so drawn content stays legible */

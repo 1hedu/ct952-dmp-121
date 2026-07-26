@@ -713,6 +713,21 @@ black so drawn UI is visible in isolation). Remaining: in Media-Manager/browse m
 the 268 KB `DS_OSDFRAME_MM` plane (full-screen thumbnails/menu) — its stride/geometry should be
 re-derived the same way when that UI is entered (needs a browsable media source).
 
+### 12.92 ★ OSD PALETTE COLOR BUG FIXED — GAM_OSD is RGB (0x00RRGGBB), not YUV; the box was magenta, now gray
+
+User flagged the OSD colors were wrong (box magenta). Root: the scanout ran GAM_OSD entries
+through a BT.601 `disp_yuv_to_rgb`, but on this firmware the OSD palette RAM stores **plain
+0x00RRGGBB**. Confirmed from the live palette (`--iolog`, GAM_OSD window 0x80001C00+):
+`[2]=0x00bbbbbb, [3]=0x01464646, [7]=0x00101010` — grays with **R==G==B**, which only holds
+for RGB (a YUV gray would be U=V=0x80); `[4]=0x0f7d10 (green) [5]=0xcd1b24 (red)
+[6]=0xe9ca2b (gold) [12]=0x0e499d (blue)` all read as sensible UI colours as RGB. The high
+byte is an attribute/alpha flag (e.g. `0x01xxxxxx`) → mask to 24 bits. YUV-interpreting
+`0xbbbbbb` gray produced the (255,128,255) magenta.
+
+Fix: `pal[i] = raw & 0x00FFFFFF` (removed the unused `disp_yuv_to_rgb`). The slideshow OSD box
+now renders 0xbbbbbb gray (matches the real UI's gray/blue scheme). The video/photo plane was
+already correct (that path uses a separate, correct YUV→RGB in `video_sample_rgb`).
+
 **Net:** the retail boot renders a live photo slideshow with a composited OSD overlay whose
 on-screen indicator updates in response to remote keys — the interactive path is faithful end
 to end (input → firmware UI handler → OSD redraw → panel scan-out). The full-screen

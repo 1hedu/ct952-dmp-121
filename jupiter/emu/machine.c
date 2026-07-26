@@ -1067,6 +1067,22 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
                 fprintf(stderr, "[KEYrd] __bISRKey read pc=%08x icount=%llu\n",
                         m->cpu.pc, (unsigned long long)m->cpu.icount); krt++; }
         }
+        /* Ungated __bISRKey read watch (CT952_KEYWATCH=<from>): who POLLS the key
+         * var? If only the ISR reads it and no application loop does, the key
+         * consumer (INPUT/AP_MainLoop) is not running -- which is why keys do
+         * nothing in the slideshow. Distinct callers past <from>. */
+        { static long kw = -2; static uint32_t seen[32]; static int nseen = 0;
+          if (kw == -2) { const char *e = getenv("CT952_KEYWATCH");
+              kw = e ? (long)strtoull(e, NULL, 0) : -1; }
+          if (kw >= 0 && (addr == 0x400235acu || addr == 0x40039074u) &&
+              m->cpu.icount >= (uint64_t)kw) {
+              uint32_t pc = m->cpu.pc; int fresh = 1;
+              for (int k = 0; k < nseen; k++) if (seen[k] == pc) { fresh = 0; break; }
+              if (fresh && nseen < 32) { seen[nseen++] = pc;
+                  fprintf(stderr, "[KEYWATCH] key %08x accessed pc=%08x icount=%llu\n",
+                          addr, pc, (unsigned long long)m->cpu.icount); }
+          }
+        }
         /* DECODE-status poll locator (CT952_DSTRACE): log reads of the HAL/JEPG
          * status region around the logo-decode finish so we can find the var
          * HALJPEG_Status(DECODE) polls and force it OK (10.39 decoder work). */

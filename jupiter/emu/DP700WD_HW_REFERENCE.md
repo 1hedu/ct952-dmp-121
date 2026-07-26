@@ -405,3 +405,26 @@ demo/slideshow state: injecting KEY_EXIT set __bISRKey=0xc8 yet POWERONMENU_Init
 the demo's active loop isn't polling __bISRKey. So which key+state routes to POWERONMENU
 (and thus faithfully to OSDSS) is the remaining piece; the injection mechanisms themselves
 are wired and confirmed at the hardware/decode level.
+
+### 12.84 CORRECTION — the running pump DOES poll keys (real key var is 0x400235ac, not 0x40039074)
+
+Prompted by the observation that on real hardware every key acts during the slideshow,
+re-examined the key path — and found I had been watching the WRONG variable.
+
+- The IR ISR (0x42370) writes the decoded key to **three** places: `0x40039074`,
+  `0x400235ac`, and `0x400235ad` (with timestamps 0x400235b4/b8). `0x40039074` is a
+  secondary copy that only the ISR touches — which is why "no app reads __bISRKey"
+  (§12.83) looked like the control loop was dead. It is not.
+- The **real current-key variable is `0x400235ac`**, and it IS polled by the RUNNING
+  message pump: `0xa2c4` (pump's first call each loop) reads it at 0xa2cc and handles
+  POWER/LCD (0x51/0x50); `0x9e58` reads it as the idle/no-key gate. PANEL_KeyScan
+  (0x5988c) and the pump's key reads both begin at ~60M (the input subsystem comes
+  online there). So keys DO reach the control loop — my §12.83 "control loop not
+  running" was a measurement artifact of watching 0x40039074.
+
+Still open: injecting KEY_EXIT (0xc8) in the active window (>60M) is polled by the pump
+but produces no visible action / no POWERONMENU — `0xa2c4` only acts on POWER/LCD, and
+where a *general* key (navigation/menu) is dispatched in the slideshow state is not yet
+pinned. New knob: CT952_KEYWATCH=<from> (distinct-PC read watch on 0x400235ac/0x40039074).
+So the input plumbing is faithful (keys are polled); demonstrating a specific key->action
+in the slideshow is the remaining piece.

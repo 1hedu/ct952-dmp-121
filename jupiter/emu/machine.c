@@ -2629,6 +2629,11 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     {
         const uint32_t osd_end = 0x40065000u;   /* DS_OSDFRAME_END */
         int have_video = (m->jpeg_rgb && m->jpeg_w > 0 && m->jpeg_h > 0);
+        /* CT952_OSD_ONLY: render the OSD plane on a black field (transparent
+         * index 0 -> black) instead of compositing the photo behind it, so the
+         * drawn UI (menu/cursor/icons) is visible in isolation for debugging. */
+        int osd_only = getenv("CT952_OSD_ONLY") != NULL;
+        if (osd_only) have_video = 0;
         uint32_t vw = m->jpeg_w > 0 ? (uint32_t)m->jpeg_w : 640u;
         uint32_t vh = m->jpeg_h > 0 ? (uint32_t)m->jpeg_h : 360u;
         for (y = 0; y < h; y++)
@@ -2637,7 +2642,9 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
                 int in_osd = osd_en && (osd_base + lin < osd_end);
                 uint8_t idx = in_osd ? fb[lin] : 0;
                 uint32_t c;
-                if (idx == 0 && have_video) {
+                if (idx == 0 && osd_only) {
+                    c = 0;   /* OSD-only debug view: transparent -> black */
+                } else if (idx == 0 && have_video) {
                     /* transparent OSD pixel -> the de-tiled video plane */
                     uint32_t vx = (uint32_t)((uint64_t)x * vw / (w ? w : 1));
                     uint32_t vy = (uint32_t)((uint64_t)y * vh / (h ? h : 1));

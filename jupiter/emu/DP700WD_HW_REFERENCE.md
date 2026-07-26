@@ -668,3 +668,30 @@ models; injection is a probe). The screensaver/OSDSS idle path remains reachable
 one would composite the browser's OSD overlay in `machine_disp_scanout`; the photo plane
 already renders. And modeling a removable media source (card/USB) would let a source be
 *opened* fresh — but the built-in demo already exercises the full interactive path.
+
+### 12.90 ★ OSD overlay composites AND reacts to keys — nav keys visibly update the on-screen OSD (confirmed via `--fb-out`)
+
+`machine_disp_scanout` (used by `--fb-out`) already composites the 8bpp OSD plane
+(DS_OSDFRAME_ST 0x4005F000, palette = DISP GAM_OSD 0x80001C00) over the de-tiled photo
+plane — index 0 transparent. Verified during the running slideshow:
+- **OSD is enabled** (`0x1a54` programmed; scanout reports "OSD enabled") and draws a thin
+  **top status/info bar** (rows ~2–12; ~0.3% of the panel). The rest is transparent so the
+  photo shows through. Real OSD size reg `0x1a54 = 0x00f002d0` (720×240); the renderer clamps
+  the OSD read to DS_OSDFRAME_END 0x40065000 (the video buffer start) to avoid the
+  green-stripe artifact (§ earlier), which is fine for this bar.
+- **The OSD REACTS to keys.** OSD-only renders (new `CT952_OSD_ONLY`: transparent→black so the
+  drawn UI shows in isolation) diffed baseline vs injected key:
+  - **KEY_UP (0x17): 971 OSD px change; KEY_DOWN (0x52): 951 px** — the top-bar element updates
+    (an on-screen selection/info indicator moving), i.e. the OSD cursor/indicator reacts to
+    navigation, exactly as expected.
+  - KEY_PREV (0x11): 19 px (minor); KEY_STOP/MENU: no OSD change at that instant (they act on
+    playback state, not this bar).
+  Composite (`--fb-out`) frames differ identically (971/951 px), so the change is visible on
+  the panel, not just the OSD plane.
+
+**Net:** the retail boot renders a live photo slideshow with a composited OSD overlay whose
+on-screen indicator updates in response to remote keys — the interactive path is faithful end
+to end (input → firmware UI handler → OSD redraw → panel scan-out). The full-screen
+thumbnail/menu grid (vs this status bar) would appear in the browse UI, which needs a
+browsable media source; that (and any OSD-geometry widening past the 24 KB clamp for a
+full-screen menu) is the only remaining polish. New debug knob: `CT952_OSD_ONLY`.

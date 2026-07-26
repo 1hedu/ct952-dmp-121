@@ -689,6 +689,30 @@ plane — index 0 transparent. Verified during the running slideshow:
   Composite (`--fb-out`) frames differ identically (971/951 px), so the change is visible on
   the panel, not just the OSD plane.
 
+### 12.91 ★ OSD STRIDE BUG FIXED — real stride is 480, not 720 (byte-level verified); the overlay was sheared
+
+User flagged the OSD looked wrong ("stride error maybe?") — correct. The renderer defaulted to
+OSD stride 720 (a guess), which sheared the drawn content: per-row analysis showed a 104px
+block ping-ponging between x=440 and x=200 every row (a diagonal wrap), not a real glyph.
+
+**Root, from a raw dump of the live OSD plane** (new `CT952_DRAMDUMP="<addr>:<len>@<icount>"`
+→ /tmp/dramdump.bin; dumped 0x4005F000 len 0x6000): byte-level autocorrelation of the
+non-zero mask peaks **sharply at stride 480** (score 728 at 480 vs 721 at 479/481, clean
+falloff). The OSD uses palette indices 2 & 3 (text/box), content bytes at offset 5480..8943.
+- Register cross-check: `REG_DISP_OSD_SIZE` (0x1a54)=0x00f002d0, `REG_DISP_SCREEN_SIZE`
+  (0x1a44)=0x00f002d0 (`ctkav_disp.h`). The DRAM map (`dvd_dram_16m.h`) has TWO OSD frames:
+  `DS_OSDFRAME` (DVD, 0x5F000..0x65000 = 24 KB, used in slideshow) and `DS_OSDFRAME_MM`
+  (Media-Manager, 0x5F000..0xA2000 = 268 KB, the full browse UI). 24 KB / stride 480 = 51 rows
+  (a top status strip), consistent with the content at rows 11..18.
+- Rendered at stride 480 the content resolves to a **clean solid 104×8 box at (200,11)** — no
+  shear (0 drift across rows). Fixed the `main.c` defaults: OSD `fb_w=480, fb_h=240,
+  fb_stride=480` (was 616/440/720). `--fb-stride`/`--fb-wh` still override.
+
+**New debug knobs:** `CT952_DRAMDUMP` (raw region dump), `CT952_OSD_ONLY` (render OSD plane on
+black so drawn UI is visible in isolation). Remaining: in Media-Manager/browse mode the OSD is
+the 268 KB `DS_OSDFRAME_MM` plane (full-screen thumbnails/menu) — its stride/geometry should be
+re-derived the same way when that UI is entered (needs a browsable media source).
+
 **Net:** the retail boot renders a live photo slideshow with a composited OSD overlay whose
 on-screen indicator updates in response to remote keys — the interactive path is faithful end
 to end (input → firmware UI handler → OSD redraw → panel scan-out). The full-screen

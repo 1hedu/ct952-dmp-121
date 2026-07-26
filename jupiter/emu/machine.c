@@ -2126,6 +2126,26 @@ uint64_t machine_run(machine_t *m, uint64_t n)
               pk_done = 1;
           }
         }
+        /* Diagnostic (CT952_DRAMDUMP="<hexaddr>:<hexlen>@<icount>"): one-shot raw
+         * DRAM dump to /tmp/dramdump.bin past <icount>, for offline geometry
+         * analysis (e.g. the OSD plane's true stride). */
+        { static long dd_at = -2; static int dd_done = 0;
+          static uint32_t dd_addr = 0, dd_len = 0;
+          if (dd_at == -2) { const char *e = getenv("CT952_DRAMDUMP"); dd_at = -1;
+              if (e) { char b[96]; strncpy(b, e, 95); b[95] = 0;
+                  char *at = strchr(b, '@'); if (at) { *at = 0; dd_at = (long)strtoull(at + 1, NULL, 0); }
+                  char *cl = strchr(b, ':'); if (cl) { *cl = 0; dd_len = (uint32_t)strtoul(cl + 1, NULL, 0); }
+                  dd_addr = (uint32_t)strtoul(b, NULL, 0); } }
+          if (dd_at >= 0 && !dd_done && m->cpu.icount > (uint64_t)dd_at &&
+              dd_addr >= 0x40000000u && dd_len) {
+              const uint8_t *p = machine_dram_ptr(m, dd_addr);
+              FILE *df = p ? fopen("/tmp/dramdump.bin", "wb") : NULL;
+              if (df) { fwrite(p, 1, dd_len, df); fclose(df);
+                  fprintf(stderr, "[DRAMDUMP] %08x len %u -> /tmp/dramdump.bin at icount=%llu\n",
+                      dd_addr, dd_len, (unsigned long long)m->cpu.icount); }
+              dd_done = 1;
+          }
+        }
         if (!irkey_done && m->cpu.icount > irkey_at) {
             /* present a clean NEC data frame (not repeat 0x100, not invalid 0x400)
              * with the scancode in the low byte; customer=0x00 customer1=0xFF.

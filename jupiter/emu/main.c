@@ -21,8 +21,10 @@ int main(int argc, char **argv)
     uint64_t max_instr = 200000000ull;
     uint32_t seed_entry = 0, seed_sp = 0;
     uint32_t fb_addr = 0x4005F000u;   /* DS_OSDFRAME_ST */
-    uint32_t fb_w = 616, fb_h = 440;  /* firmware OSD region geometry */
-    uint32_t fb_stride = 720;         /* OSD buffer row stride (720-aligned, not fb_w) */
+    uint32_t fb_w = 480, fb_h = 240;  /* OSD framebuffer geometry (see stride) */
+    uint32_t fb_stride = 480;         /* OSD row stride = 480, VERIFIED by byte-level
+                                       * autocorrelation of the live OSD plane (§12.91):
+                                       * the 720 guess sheared the content diagonally. */
     const char *video_path = NULL;    /* --video-out: de-tiled slideshow plane */
     uint32_t vid_w = 640, vid_h = 360;/* slideshow video plane native size */
     int rom_load = 0;

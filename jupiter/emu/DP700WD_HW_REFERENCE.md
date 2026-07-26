@@ -513,3 +513,61 @@ calls `POWERONMENU_Initial()` → `OSD_ChangeUI(17)` → the interactive menu, w
 **New diagnostics this turn (all opt-in, inert unless env-set):** `CT952_UICHANGE` (PC-trace
 OSD_ChangeUI 0x4a754), `CT952_PUMPARG[=<icount>]` (mode-handler dispatch arg at 0xa720 +
 message-record fetch at 0xa6ec), `CT952_POKE` (one-shot DRAM write, for gate experiments).
+
+### 12.87 ★ THE EXACT WAIT PINNED — the INITIAL thread enters MEDIA_SELECT (mode-8) SUCCESSFULLY and returns, skipping the POWERONMENU fallback; POWERONMENU_Initial is never invoked by any thread
+
+Followed "pin the exact wait" to the single deciding branch, with runtime confirmation.
+
+**The boot's power-on thread is flash function `0x418f0`** — a thread ENTRY (backtrace at
+its body shows the caller chain is the eCos thread trampoline `0x4001ea40/0x4001ea60`, not a
+flash caller). It runs the power-on sequence (readiness `0x5abb4(7)`, `SOURCE_Select`
+`0x59e90`, `OS_DelayTime`s, worker-resume `0x66dc`) and ends with a two-way UI choice at
+`0x41b30-0x41b58`:
+
+```
+41b30  mov 8,%o0
+41b34  call 0xafd8      ; enter MEDIA_SELECT_DLG (mode 8)
+41b3c  and %o0,0xff,%o0
+41b40  cmp %o0,0
+41b44  bne 0x41b58      ; <-- THE DECISION: if mode-8 entered OK, RETURN
+41b48  mov 7,%o0        ; else fall through to:
+41b50  call 0xafd8      ; enter mode 7 (whose enter-handler calls POWERONMENU_Initial)
+41b58  ret              ; thread returns -> exits
+```
+
+**Runtime pin (`CT952_PCWATCH`, full recipe):**
+- `0x41b34` hit at 55.88M (`o0=8`).
+- `0x41b44` hit at 60.686M with **`o0=1`** — i.e. `0xafd8(8)` **returned SUCCESS**.
+- `0x41b58` (ret) hit at 60.686M; **`0x41b50` (the mode-7/POWERONMENU fallback) is NEVER
+  reached.**
+- **`POWERONMENU_Initial` (0x61be8) is never entered by any thread** — 0 hits across ALL its
+  call sites (`0x2620c/0x26210, 0x26444, 0x265e4, 0x26de8, 0x1f610, 0x67d68`) in 100M
+  (`CT952_PCWATCH`). Its callers are per-mode ENTER-handlers (`save; call 0x61be8(1)`),
+  reached only when the pump enters mode-7-family via `0xafd8`; that entry never happens.
+
+**Why `0xafd8(8)` succeeds:** mode-8's enter-handler `[rec+4] = 0x25ef4` returns nonzero
+because the media-select source list has **5 CONFIGURED sources** (built unconditionally by
+`0x299c0`; count stored in `mode8_stayflag` 0x40032b3b; §12.40). Configured != present media,
+so it enters the dialog regardless of whether any card/USB is inserted. `0xafd8(8)` also does
+real work (runs the mode-8 enter path incl. the demo-JPEG decode) — hence the ~4.8M-instr gap
+between 0x41b34 and its return.
+
+**So the "exact wait" is not a blocked eCos primitive — it is a taken branch.** The device's
+faithful power-on UI IS the **MEDIA_SELECT_DLG (mode 8)** — the "menu with a timeout" the
+photo frame shows — and the INITIAL thread deliberately returns into it and exits.
+POWERONMENU is only the *fallback* for the no-configured-source case, which this build never
+hits. Pinned OSD_ChangeUI address for POWERONMENU_Initial's own body: it calls
+`OSD_ChangeUI(17)` at `0x61c94` and sets `__bPOWERONMENUInitial=1` at `0x61ca4` (guard
+`if(flag) return` at 0x61bf0), matching poweronmenu.c:380 exactly.
+
+**Consequence for the faithful gap (keys / menu):** mode-8 is the correct terminal UI. What
+is missing is its INTERACTIVITY + resolution: (a) key events must be dispatched to the mode-8
+message handler `0x260f4` (its `[rec+8]`) so a key navigates/selects a source — an injected
+IR key posts event `0xc8` into the pump slot 0x40020ec8 (§12.86.6) but the pump does not route
+it to `0x260f4`; and (b) a source SELECTION or auto-select TIMEOUT must fire to leave the
+dialog (its tick handler `0x261cc`→`0x2747c` has no timeout logic). Modeling media-select
+resolution — the dialog consuming keys and/or a selection/timeout — is the faithful lever, NOT
+forcing the source count to 0 (§12.40's decline reaches POWERONMENU but is unfaithful: the
+real device has configured sources and legitimately shows media-select). Next: trace the
+mode-8 key path (`0x260f4` → `0x22494`) and the dialog's selection/timeout to name the exact
+resolution event to model.

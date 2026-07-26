@@ -97,6 +97,7 @@ void sparc_pchist_dump(FILE *f, int topn);
 
 /* Register access helpers (r index 0..31 in the current window) */
 uint32_t sparc_get_reg(sparc_t *c, int idx);
+int sparc_win_backtrace(sparc_t *c, uint32_t *out, int max);
 void sparc_set_reg(sparc_t *c, int idx, uint32_t v);
 
 #endif /* CT952EMU_SPARC_H */

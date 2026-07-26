@@ -68,6 +68,23 @@ void sparc_set_reg(sparc_t *c, int idx, uint32_t v)
     c->wr[win_slot(CWP(c), idx)] = v;
 }
 
+/* Register-window backtrace: walk from the current window outward (restore
+ * direction, CWP+1), reading each frame's %i7 (return address, idx 31). Reliable
+ * even when windows have not been spilled to the stack. Fills `out` with up to
+ * `max` return addresses; returns the count. Stops at NWIN frames or a return
+ * address outside XIP flash (<0x00100000). */
+int sparc_win_backtrace(sparc_t *c, uint32_t *out, int max)
+{
+    int n = 0, w = CWP(c), k;
+    for (k = 0; k < NWIN && n < max; k++) {
+        uint32_t i7 = c->wr[win_slot(w, 31)];
+        if (i7 == 0 || i7 >= 0x00100000u) break;   /* leave flash text -> stop */
+        out[n++] = i7;
+        w = (w + 1) % NWIN;
+    }
+    return n;
+}
+
 static void set_reg_w(sparc_t *c, int cwp, int idx, uint32_t v)
 {
     if (idx == 0) return;

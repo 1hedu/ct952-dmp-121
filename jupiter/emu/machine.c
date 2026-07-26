@@ -103,19 +103,43 @@ static void machine_maybe_jpeg_decode(machine_t *m)
         /* Register-window backtrace: saved %i7 at [fp+0x3c], saved %fp at
          * [fp+0x38] -- names the firmware call chain that kicked the decode
          * (OSDSS_Entry -> _OSDSS_PictureUpdate -> UTL_ShowJPEG_Slide -> ...). */
-        fp = sparc_get_reg(&m->cpu, 30);
-        fprintf(stderr, "  [decode#%d frames]", m->jpeg_count);
-        for (k = 0; k < 16 && fp >= 0x40000000u && fp < 0x40800000u; k++) {
-            const uint8_t *sp = machine_dram_ptr(m, fp + 0x38);
-            uint32_t nfp, ret;
-            if (!sp) break;
-            nfp = ((uint32_t)sp[0] << 24) | (sp[1] << 16) | (sp[2] << 8) | sp[3];
-            ret = ((uint32_t)sp[4] << 24) | (sp[5] << 16) | (sp[6] << 8) | sp[7];
-            fprintf(stderr, " %08x", ret);
-            if (nfp <= fp) break;
-            fp = nfp;
+        (void)fp;
+        {
+            uint32_t bt[32];
+            int nb = sparc_win_backtrace(&m->cpu, bt, 32), bi;
+            fprintf(stderr, "  [decode#%d winframes]", m->jpeg_count);
+            for (bi = 0; bi < nb; bi++) fprintf(stderr, " %08x", bt[bi]);
+            fprintf(stderr, "\n");
+        }
+    }
+    /* Pic-index finder (CT952_PICIDX): at each decode, diff the low data region
+     * against the previous decode and report bytes that INCREMENTED by 1 with a
+     * small value -- the OSDSS slideshow's picture-index counter (__bOSDSSPicIdx)
+     * advances +1 per photo, so this pins its real address from our own binary. */
+    if (getenv("CT952_PICIDX")) {
+        static const uint32_t cand[] = {0x40022fa3u,0x40031ad3u,0x40039935u,0x400399b7u};
+        int ci;
+        fprintf(stderr, "  [decode#%d cand]", m->jpeg_count);
+        for (ci = 0; ci < 4; ci++) {
+            uint8_t *p = machine_dram_ptr(m, cand[ci]);
+            fprintf(stderr, " %08x=%d", cand[ci], p ? *p : -1);
         }
         fprintf(stderr, "\n");
+        static uint8_t *prev = NULL;
+        const uint32_t LO = 0x40020000u, HI = 0x40040000u;
+        uint8_t *base = machine_dram_ptr(m, LO);
+        if (base) {
+            if (!prev) { prev = malloc(HI - LO); if (prev) memcpy(prev, base, HI - LO); }
+            else {
+                uint32_t i;
+                fprintf(stderr, "  [decode#%d +1 bytes]", m->jpeg_count);
+                for (i = 0; i < HI - LO; i++)
+                    if (base[i] == (uint8_t)(prev[i] + 1) && base[i] <= 32)
+                        fprintf(stderr, " %08x:%u->%u", LO + i, prev[i], base[i]);
+                fprintf(stderr, "\n");
+                memcpy(prev, base, HI - LO);
+            }
+        }
     }
     /* keep the raster for the scan-out video-plane composite */
     free(m->jpeg_rgb);

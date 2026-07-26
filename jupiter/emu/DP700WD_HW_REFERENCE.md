@@ -235,3 +235,40 @@ Follow-up to nail down cleanly (from our binary only, no 909): verify the real
 `_bOSDSSScreenSaverMode`/`__bOSDSSPicIdx` addresses (via a function that writes them —
 OSDSS_Entry sets the mode byte TRUE right before `_OSDSS_PictureUpdate`), instead of the
 DUMPFLAGS guesses.
+
+### 12.79 Verified from our binary: an indexed picture slideshow cycles the demo photos (DUMPFLAGS OSDSS addresses disproven)
+
+Trying to pin the real `_bOSDSSScreenSaverMode`/`__bOSDSSPicIdx` addresses (no 909,
+no DUMPFLAGS guesses). Tools: `sparc_win_backtrace()` (walks the CPU register windows
+for a reliable runtime call stack even when frames aren't spilled) + `CT952_PICIDX`
+(diffs the data region between successive photo decodes).
+
+**True runtime decode call stack (register windows) for the cycling photos:**
+`[thread] → 0x2747c (display tick) → 0x27d20 (24-state jump-table machine, state var
+0x40032b4f) → 0x376b4 (JPEG display) → 0x6c500 (HALJPEG/JPU kick)`. The message pump
+(handler 0x261cc, msgtype 0xa0) drives 0x2747c; the OSDSS trigger is asynchronous
+(posts the state/message and returns), so it is not on the synchronous stack — which is
+why a plain backtrace can't name it.
+
+**Per-decode data diff (CT952_PICIDX) — verified counters:**
+- `0x40022fa3`: 1,2,3,4,5,6,7,8,9… — a **monotonic total-decode counter** (NOT a pic
+  index).
+- `0x40031ad3` / `0x40039935` / `0x400399b7`: 0,1,2,3,4,5 then **wrap** (decode #7 → 1),
+  moving in lockstep — a **picture index that cycles through the ~6 built-in demo
+  photos**. This is exactly `__bOSDSSPicIdx` behaviour: an indexed photo slideshow.
+
+**DUMPFLAGS addresses disproven:** the guessed `__bOSDSSPicIdx = 0x400239cc` does NOT
+cycle (it only reset 255→0 once at boot), so it is not the picture index. Only
+`__bPOWERONMENUInitial = 0x40023a10` was ever verified (from POWERONMENU_Initial's own
+`stb` at 0x61ca4). The `_bOSDSSScreenSaverMode = 0x400239c4` guess is therefore also
+untrustworthy — my earlier "screen-saver mode = 0 → not OSDSS" (§12.77) had no basis.
+
+**Honest limit:** without a symbol map for *this* binary I could not uniquely label the
+exact symbols — the three mirrored pic-index candidates are struct-pointer accessed
+(defeating the sethi+store scan that pinned `__bPOWERONMENUInitial`), and ~90 booleans
+flip at the slideshow transition, so `_bOSDSSScreenSaverMode` can't be singled out by
+the dynamic heuristics alone. What IS established from our binary: the demo photos are
+driven by a genuine **cycling picture index** (an indexed slideshow), consistent with
+the OSDSS JPEG screen saver. Pinning the exact `_bOSDSSScreenSaverMode`/`__bOSDSSPicIdx`
+symbols cleanly would need a linker map or a targeted disassembly of OSDSS_Entry, which
+I have not located with certainty yet.

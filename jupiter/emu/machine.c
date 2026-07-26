@@ -2477,3 +2477,43 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     fclose(f);
     return osd_en ? 0 : 1;
 }
+
+/* ---- DISP video plane scanout (the slideshow photo) ----------------- *
+ * The photo-frame slideshow decode lands in the video/main frame buffer as
+ * macroblock-tiled YUV 4:2:0 (Y at DS_FRAMEBUF_ST_SLIDESHOW 0x40065000, C at
+ * 0x400B3C00, strip 0x2D00) -- the exact bytes the hardware scan-out DAC reads
+ * to the panel, and what the firmware's own DSP/JPU write-back produced. This
+ * de-tiles that plane straight from DRAM (no host-side shortcut) and emits the
+ * RGB the panel shows. Tile geometry matches the MCU-BIU write-back above and
+ * videoplane.py (§12.12/§12.19). */
+int machine_video_scanout(machine_t *m, uint32_t w, uint32_t h,
+                          const char *ppm_path)
+{
+    const uint32_t YBASE = 0x40065000u, CBASE = 0x400B3C00u, strip = 0x2D00u;
+    const uint8_t *yb = machine_dram_ptr(m, YBASE);
+    const uint8_t *cb = machine_dram_ptr(m, CBASE);
+    FILE *f;
+    uint32_t x, y;
+    if (!yb || !cb) return -1;
+    f = fopen(ppm_path, "wb");
+    if (!f) return -1;
+    fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            uint32_t yo = (y >> 4) * strip + (x >> 2) * 64u
+                        + (y & 15) * 4u + (x & 3);
+            uint32_t cx = x >> 1, cy = y >> 1;
+            uint32_t co = (cy >> 4) * strip + (cx >> 3) * 256u
+                        + ((cx & 7) >> 2) * 64u + (cy & 15) * 4u + (cx & 3);
+            int Y = yb[yo];
+            int U = (int)cb[co] - 128;
+            int V = (int)cb[co + 128] - 128;
+            /* BT.601 full-range inverse (matches the MCU-BIU forward transform) */
+            int R = clamp8(Y + ((91881 * V) >> 16));
+            int G = clamp8(Y - ((22554 * U + 46802 * V) >> 16));
+            int B = clamp8(Y + ((116130 * U) >> 16));
+            fputc(R, f); fputc(G, f); fputc(B, f);
+        }
+    fclose(f);
+    return 0;
+}

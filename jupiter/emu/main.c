@@ -23,6 +23,8 @@ int main(int argc, char **argv)
     uint32_t fb_addr = 0x4005F000u;   /* DS_OSDFRAME_ST */
     uint32_t fb_w = 616, fb_h = 440;  /* firmware OSD region geometry */
     uint32_t fb_stride = 720;         /* OSD buffer row stride (720-aligned, not fb_w) */
+    const char *video_path = NULL;    /* --video-out: de-tiled slideshow plane */
+    uint32_t vid_w = 640, vid_h = 360;/* slideshow video plane native size */
     int rom_load = 0;
     int m_skip_panelcfg = 0;
     int m_build_panelcfg = 0;
@@ -60,6 +62,12 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--fb-stride") && i + 1 < argc)
             fb_stride = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--video-out") && i + 1 < argc)
+            video_path = argv[++i];
+        else if (!strcmp(argv[i], "--video-wh") && i + 1 < argc) {
+            char *xp; vid_w = (uint32_t)strtoul(argv[++i], &xp, 0);
+            if (xp && (*xp == 'x' || *xp == 'X')) vid_h = (uint32_t)strtoul(xp + 1, NULL, 0);
+        }
         else if (!strcmp(argv[i], "--seed-entry") && i + 1 < argc)
             seed_entry = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed-sp") && i + 1 < argc)
@@ -316,6 +324,15 @@ int main(int argc, char **argv)
             fprintf(stderr, "[ct952emu] wrote %s (%ux%u, OSD %s @ 0x%08x)\n",
                     fb_path, fb_w, fb_h, r == 0 ? "enabled" : "DISABLED",
                     fb_addr);
+    }
+
+    if (video_path) {
+        int r = machine_video_scanout(m, vid_w, vid_h, video_path);
+        if (r < 0)
+            fprintf(stderr, "[ct952emu] video scanout FAILED\n");
+        else
+            fprintf(stderr, "[ct952emu] wrote %s (%ux%u de-tiled slideshow plane @ 0x40065000)\n",
+                    video_path, vid_w, vid_h);
     }
 
     if (m->uart_file) fclose(m->uart_file);

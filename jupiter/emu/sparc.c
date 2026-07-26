@@ -681,11 +681,79 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
                     (unsigned long long)c->icount);
             continue;
         }
+        /* Indirect-call target logger (CT952_ICALL): at the message-pump indirect
+         * dispatch sites 0xa720 (call %o1) and 0xa778 (call %o0), log the handler
+         * target and message type (%l0/%o0). Reveals which event handlers actually
+         * run -- and whether a POWERONMENU-triggering message ever arrives. The
+         * pump uses interprocedural indirect dispatch, invisible to static callers. */
+        /* Experiment (CT952_FORCE_POM=<icount>): the message pump loops handler
+         * 0xa0 (splash tick 0x2747c) forever because the splash->menu transition
+         * flags never reach ready. Once past <icount>, redirect ONE indirect
+         * dispatch at 0xa778 to the POWERONMENU wrapper 0x2620c, so the pump calls
+         * POWERONMENU_Initial(1) in-context. Validates the downstream menu/OSDSS
+         * slideshow render (acceptance test) while the faithful gate is isolated. */
+        { static long fp = -2; static int done = 0;
+          if (fp == -2) { const char *e = getenv("CT952_FORCE_POM");
+              fp = e ? (long)strtoull(e, NULL, 0) : -1; }
+          if (fp >= 0 && !done && c->pc == 0xa778u &&
+              c->icount >= (uint64_t)fp && sparc_get_reg(c, 8) == 0x261ccu) {
+              sparc_set_reg(c, 8, 0x2620cu);   /* %o0 = POWERONMENU wrapper */
+              done = 1;
+              fprintf(stderr, "[FORCEPOM] redirected pump dispatch -> 0x2620c at icount=%llu\n",
+                      (unsigned long long)c->icount);
+          }
+        }
+        { static int ic=-1; static uint32_t seen[64]; static int nseen=0;
+          if (ic<0) ic = getenv("CT952_ICALL") ? 1 : 0;
+          if (ic && (c->pc==0xa720u || c->pc==0xa778u)) {
+              uint32_t tgt = sparc_get_reg(c, c->pc==0xa720u ? 9 : 8);
+              int fresh=1; for(int k=0;k<nseen;k++) if(seen[k]==tgt){fresh=0;break;}
+              if (fresh && nseen<64) { seen[nseen++]=tgt;
+                  fprintf(stderr, "[ICALL] site=%08x target=%08x msgtype=%02x icount=%llu\n",
+                      c->pc, tgt, sparc_get_reg(c,16)&0xff,
+                      (unsigned long long)c->icount);
+              }
+          }
+        }
         if (pcsamp > 0 && c->icount >= pcs_next) {
             pcs_next = c->icount + (uint64_t)pcsamp;
             fprintf(stderr, "[PCS] pc=%08x o7=%08x sp=%08x icount=%llu\n",
                     c->pc, sparc_get_reg(c, 15), sparc_get_reg(c, 14),
                     (unsigned long long)c->icount);
+        }
+        /* Backtrace-at-PC (CT952_BTAT=<pc>[,<splo>,<sphi>][;from=<icount>]): when
+         * execution reaches <pc> with %fp in [splo,sphi], walk the register-window
+         * backtrace ([fp+0x3c]=saved i7, [fp+0x38]=saved fp) to name the caller
+         * chain. Prints up to 8 times past <from>. Generalizes STACKW so the MAIN
+         * thread's OS_DelayTime park (pc=0x59864) can be attributed to its app
+         * caller (INITIAL_System / INITIAL_PowerONStatus / a retry loop). */
+        { static long bt = -2; static uint32_t btpc=0, btlo=0x40000000u, bthi=0x40800000u;
+          static uint64_t btfrom=0; static int btn=0;
+          if (bt == -2) { const char *e = getenv("CT952_BTAT");
+              if (e) { char b[128]; strncpy(b,e,127); b[127]=0;
+                  char *t=strtok(b,",;"); btpc=t?(uint32_t)strtoul(t,NULL,0):0;
+                  t=strtok(NULL,",;"); if(t) btlo=(uint32_t)strtoul(t,NULL,0);
+                  t=strtok(NULL,",;"); if(t) bthi=(uint32_t)strtoul(t,NULL,0);
+                  const char *f=getenv("CT952_BT_FROM"); btfrom=f?strtoull(f,NULL,0):0;
+                  bt = btpc?1:0; } else bt=0; }
+          if (bt && c->pc==btpc && btn<8 && c->icount>=btfrom) {
+              uint32_t fp = sparc_get_reg(c, 30);
+              if (fp>=btlo && fp<bthi) { btn++;
+                  fprintf(stderr, "[BT] icount=%llu pc=%08x o7=%08x fp=%08x\n  ",
+                      (unsigned long long)c->icount, c->pc,
+                      sparc_get_reg(c,15), fp);
+                  for (int d=0; d<16 && fp>=0x40000000u && fp<0x40800000u; d++) {
+                      int fault=0;
+                      uint32_t ret=c->bus->read(c->bus, fp+0x3c, 4, &fault);
+                      uint32_t nfp=c->bus->read(c->bus, fp+0x38, 4, &fault);
+                      if (fault) break;
+                      fprintf(stderr, "%08x ", ret);
+                      if (nfp<=fp) break;
+                      fp=nfp;
+                  }
+                  fprintf(stderr, "\n");
+              }
+          }
         }
         /* Call-trail from 0x5abb4(7) entry (CT952_CALLTRAIL): the instant the
          * main thread reaches the boot-init 0x41a90 call, log every subsequent

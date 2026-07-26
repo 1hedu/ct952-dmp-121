@@ -257,4 +257,10 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
                          uint32_t w, uint32_t h, uint32_t stride,
                          const char *ppm_path);
 
+/* De-tile the video/slideshow plane (macroblock-tiled YUV 4:2:0 at 0x40065000/
+ * 0x400B3C00) straight from DRAM to an RGB PPM -- the photo the panel scans out.
+ * Returns 0 on success, -1 on error. */
+int machine_video_scanout(machine_t *m, uint32_t w, uint32_t h,
+                          const char *ppm_path);
+
 #endif /* CT952EMU_MACHINE_H */

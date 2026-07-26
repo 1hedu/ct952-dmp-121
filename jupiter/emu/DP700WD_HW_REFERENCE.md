@@ -93,3 +93,79 @@ being time-starved (delays never completing in the instruction budget of a test 
 the worker starts and cascades to `POWERONMENU_Initial` → the idle screensaver/
 slideshow. New knob: `CT952_CALLTRAIL`. (Correcting my own §12.63/12.69 hang-location
 errors, caught by measuring instead of static-reading.)
+
+### 12.71–12.74 (recap from commit log; doc edits didn't land those turns)
+- **§12.72** modelled IIC data-ready status `0x8000420c` bit2 (per-byte config-read
+  poll was timing out). Commit `fac6f68`.
+- **§12.73** with VDEC_IDLE + VSYNC_KEEP + `TICK_FAST_AT=48000000,512` + the IIC fix,
+  the boot advances to ~82M then *appeared* to park (later shown to be the periodic
+  idle poll, not a park). Commit `ed1116b`. NOTE: the "parks at 0x4003cc00 mbox"
+  reading was WRONG — see §12.75; `0x5969c` is `cyg_thread_yield`, not mbox-get, so
+  `o0=0x4003cc00` was a stale register, not a mailbox object.
+- **§12.74** RAM dump: no removable source present; source-detect handler `0x12b30`
+  never runs and is not indirectly dispatched from flash/DRAM. Commit `a74ad97`.
+
+### 12.75 ★ BREAKTHROUGH — the faithful boot DECODES AND RENDERS THE SLIDESHOW PHOTO
+
+The whole quest's acceptance test is met: booting retail `dp700wd.bin` with only the
+device-timing knobs (`CT952_VDEC_IDLE=1 CT952_VSYNC_KEEP=1
+CT952_TICK_FAST_AT=48000000,512`, and `--skip-panelcfg`), eCos comes alive on its own,
+the firmware's DSP/JPU decode path runs, and **built-in demo photographs are decoded
+into the slideshow frame buffer and cycle** — a real photo-frame slideshow. No
+behavioural crutch is needed for the photo path (`TICK_FAST_AT` only accelerates the
+eCos tick's wall-clock; it does not change behaviour).
+
+**How it was found (correcting several prior misreads):**
+- The boot is **not deadlocked and not parked** — it runs indefinitely (verified to
+  242M+ instr). Threads cycle on an F_REQ/F_DONE event handshake (flag `0x40026e9c`/
+  `0x40026ea4`, bit `0x04000000`) every ~13M instr = one ~100 ms idle tick. That is
+  normal idle polling, not a stall. (§12.69's "deadlock" and §12.73's "0x4003cc00
+  mbox park" were both wrong: `0x5969c` is `cyg_thread_yield` → argless `0x4001de40`,
+  not the generic mbox-get, so the traced `o0` values were stale registers.)
+- The main app thread runs a **message pump** (`0xa6cc`, entry `0xadb0`) that dequeues
+  messages and **indirect-calls** the handler pointer stored in each message
+  (`call %o1` @ `0xa720`, `call %o0` @ `0xa778`) — the interprocedural + indirect
+  dispatch that made static caller-analysis miss the flow (exactly the user's warning).
+  New knob `CT952_ICALL` logs the targets: over 100M instr only **two** handlers ever
+  run — `0x261cc` (msgtype 0xa0, the splash/idle tick `0x2747c`) and `0x260f4`
+  (msgtype 0x3d, once). `POWERONMENU_Initial` (`0x61be8`) is reachable from 8 handler
+  sites but its message type is never posted, so the DVD-style power-on **menu** never
+  pops — which is correct for a photo frame that boots straight into the slideshow.
+- The eCos flag API in this build: `0x4001dffc`=wait, `0x4001e0b0`=peek,
+  `0x4001e02c`=wait(mode), `0x4001e014`=maskbits, wrappers `0x59610/28/40/597d0`.
+- **The slideshow photo lives in the video plane, not the OSD plane.** The emulator's
+  JPU MCU-BIU model (`machine.c:109`) writes the decoded frame as **macroblock-tiled
+  YUV 4:2:0** to `DS_FRAMEBUF_ST_SLIDESHOW` = `0x40065000` (Y) / `0x400B3C00` (C),
+  strip `0x2D00` — exactly what the hardware scan-out DAC reads. The log line
+  `JPU MCU-BIU wrote 640x360 tiled YUV to 0x40065000/0x400b3c00` fires **repeatedly**
+  in a plain baseline run: the slideshow is decoding successive photos.
+- The earlier "green horizontal stripes" image was a **rendering-tool artifact**, not
+  a firmware/emulation fault: `--fb-out` scans the small OSD plane (`0x4005F000`,
+  ~620×78) at 616×440, overrunning into the tiled video FB and rendering those bytes
+  as palette indices (index 0 → BT.601 `(0,135,0)` green, machine.c:2427). De-tiling
+  the video plane with the documented tile geometry yields a **pristine full photo**
+  (Grand Teton / Moulton Barn; a flower+butterfly frame; etc.).
+
+**Emulator change:** added `machine_video_scanout()` + `--video-out PPM [--video-wh
+WxH]` (default 640×360) that de-tiles the slideshow plane straight from DRAM
+(`0x40065000`/`0x400B3C00`) to RGB — the faithful "what the panel shows" render, no
+host-side shortcut. (`videoplane.py` did the same de-tile off a snapshot; this makes it
+a first-class emulator output.)
+
+**Diagnostic knobs added this session (sparc.c):** `CT952_BTAT=<pc>[,lo,hi]` +
+`CT952_BT_FROM` (register-window backtrace at any PC/sp-window — attributed the main
+thread's `OS_DelayTime` park to the splash tick); `CT952_ICALL` (message-pump indirect
+dispatch logger); `CT952_FORCE_POM=<icount>` (experiment: redirect one pump dispatch to
+the POWERONMENU wrapper `0x2620c` — invokes `POWERONMENU_Initial(1)`; used to probe the
+menu path, NOT needed for the slideshow).
+
+**Open (faithful polish, not blockers):**
+1. The DVD-style power-on **menu** still isn't posted (splash tick `0x2747c` loops
+   while its display-ready flags — READYFLAG `0x4003996c`, `0x40032b4f`, … — never
+   reach the advance state). A photo frame boots straight to slideshow, so this may be
+   by-design; if the menu/OSD overlay is wanted, model whatever ISR/thread sets those
+   flags. `FORCE_POM` enters `POWERONMENU_Initial` but it then blocks in its own menu
+   loop (completion store `0x61ca4` not reached).
+2. Make `--fb-out` composite the de-tiled video plane under the real-bounds OSD (right
+   now `machine_disp_scanout` samples `m->jpeg_rgb` only where OSD idx==0, and the OSD
+   geometry overruns) so a single scan-out shows photo + UI together.

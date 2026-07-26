@@ -380,3 +380,28 @@ transition — inject then clear.)
 
 Both are the faithful hardware input paths (real ISR / real ADC scan), usable to drive
 POWERONMENU (menu/stop key) and thence the OSDSS screen saver (§12.81).
+
+### 12.83 Input injection "wired up": edge-based, both paths deliver real decoded keys
+
+Made both injection paths produce real press EDGES and traced them all the way in.
+
+**IR (CT952_IRKEY=<scancode>[@<icount>]) — full path, edge via interrupt.** The IR ISR
+decode is at flash 0x42370 → scancode→key lookup 0x4241c (NEC decode of IR regs
+0x80000390/0x394, customer check at 0x400235ae) → writes __bISRKey(0x40039074) at 0x4239c.
+Injecting scancode 0x0c: [KEYwr] 40039074=c8 pc=0x423a0 then [KEYrd] pc=0x423f0 ~6 instr
+later — the ISR decodes KEY_EXIT (0xc8) and reads it back. Confirmed.
+
+**Panel (CT952_PANELKEY="<r0>,<r1>[@<at>[,<len>]]") — channel-aware + timed edge.**
+Returns r0 only on the 0x84 ladder line, r1 on 0xC4, else the 0xFF idle rail; with @at,len
+it presses at `at` for `len` instructions then releases (a real idle→press→release edge,
+since the debounce SM 0x59c8c needs a transition). PANEL_KeyScan(0x5988c) is driven by the
+input handler at 0xa388 (calls it, then the debounce 0x59c8c). Verified 0xE0,0xFF →
+RDATA0=0xE0 → KEY_LEFT decoded.
+
+**Honest gap — action dispatch is state-specific.** An injected key lands in __bISRKey
+(IR) or is decoded by PANEL_KeyScan (panel), but does NOT fire POWERONMENU in the current
+demo/slideshow state: injecting KEY_EXIT set __bISRKey=0xc8 yet POWERONMENU_Initial
+(0x61be8) stayed at 0 hits, and __bISRKey is read only once (by the ISR) in the window —
+the demo's active loop isn't polling __bISRKey. So which key+state routes to POWERONMENU
+(and thus faithfully to OSDSS) is the remaining piece; the injection mechanisms themselves
+are wired and confirmed at the hardware/decode level.

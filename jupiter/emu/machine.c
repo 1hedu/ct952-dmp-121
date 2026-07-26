@@ -461,14 +461,31 @@ static uint32_t io_read(machine_t *m, uint32_t off)
          * defaulting to the 0xFF idle rail otherwise. */
         const char *pk = getenv("CT952_PANELKEY");
         if (pk) {
+            /* "<r0>,<r1>[@<at>[,<len>]]": press the key (voltage r0 on the 0x84
+             * ladder line, r1 on 0xC4) as a real EDGE -- idle before <at>, held for
+             * <len> instructions, then released back to the 0xFF idle rail. The
+             * input debounce (0x59c8c) needs an idle->press transition and the key
+             * held consistently across a few 100ms scans, then a release, to latch
+             * __bISRKey and fire the action -- a constant level never edges. */
             static int pk_init = 0; static uint32_t r0 = 0xFF, r1 = 0xFF;
-            if (!pk_init) { pk_init = 1; char b[64]; strncpy(b, pk, 63); b[63] = 0;
+            static uint64_t at = 0, len = 0;
+            if (!pk_init) { pk_init = 1; char b[80]; strncpy(b, pk, 79); b[79] = 0;
+                char *a = strchr(b, '@');
+                if (a) { *a = 0; char *l = strchr(a + 1, ',');
+                    if (l) { *l = 0; len = strtoull(l + 1, NULL, 0); }
+                    at = strtoull(a + 1, NULL, 0); }
                 char *c = strchr(b, ','); if (c) { *c = 0; r1 = (uint32_t)strtoul(c + 1, NULL, 0); }
-                r0 = (uint32_t)strtoul(b, NULL, 0); }
-            uint32_t chan = (io_get(m, 0x407Cu) >> 16) & 0xFF;
-            if (chan == 0x84u) return (r0 & 0xFF) << 24;
-            if (chan == 0xC4u || chan == 0xE4u) return (r1 & 0xFF) << 24;
-            return 0xFF000000u;
+                r0 = (uint32_t)strtoul(b, NULL, 0);
+                if (at && !len) len = 10000000ull;   /* default ~press duration */
+            }
+            int pressed = !at || (m->cpu.icount >= at &&
+                                  (!len || m->cpu.icount < at + len));
+            if (pressed) {
+                uint32_t chan = (io_get(m, 0x407Cu) >> 16) & 0xFF;
+                if (chan == 0x84u) return (r0 & 0xFF) << 24;
+                if (chan == 0xC4u || chan == 0xE4u) return (r1 & 0xFF) << 24;
+            }
+            return 0xFF000000u;   /* released / idle rail */
         }
         const char *e = getenv("CT952_ADC");
         return e ? (uint32_t)strtoul(e, NULL, 0) : 0xFF000000u;

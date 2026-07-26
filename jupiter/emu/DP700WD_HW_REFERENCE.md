@@ -728,6 +728,27 @@ Fix: `pal[i] = raw & 0x00FFFFFF` (removed the unused `disp_yuv_to_rgb`). The sli
 now renders 0xbbbbbb gray (matches the real UI's gray/blue scheme). The video/photo plane was
 already correct (that path uses a separate, correct YUV→RGB in `video_sample_rgb`).
 
+### 12.93 The gray/navy MEDIA_SELECT menu renders only its empty gray panel — the navy source-list text is never drawn (no media to list)
+
+User: the UI should be "gray and navy blue," not gray with black text, and the text is cut off.
+Root cause chain, verified from the live OSD plane + palette:
+- We are in the **MEDIA_SELECT_DLG** (pump mode 8, §12.86-87) — a *menu*, which is why the
+  expected scheme is gray panels + navy text.
+- Full palette load traced (`CT952_PALTRACE`, GAM_OSD window, ACCESS_OSD set): a zero-init
+  pass then a real pass loading **only indices 0..11** — `[2]=0xbbbbbb gray, [3]=0x464646
+  dark-gray, [5]=0xcd1b24 red, [6]=0xe9ca2b gold, [11]=0x0e499d NAVY`; 12..255 = 0 (black).
+  So navy IS in the palette, at index 11.
+- But the OSD framebuffer (0x5F000..0x65000) uses **only indices 2 and 3** — `index 11 (navy)
+  has ZERO pixels`. The lower full-width "ramp" (indices 27..78) seen when the clamp is lifted
+  is the video buffer past 0x65000, not OSD.
+- **Conclusion:** the menu draws its empty gray panel (idx 2 fill + idx 3 border) but never
+  draws the navy source-list text, because there are **no media sources to list** (no card/USB
+  modeled). The "cut off / black text" is the small empty panel, not real text.
+
+So the color pipeline is now correct (stride 480 §12.91, RGB palette §12.92, navy present at
+idx 11); the missing navy is *content*, not colour — it needs the browsable media source
+modeled so the menu populates its list. New debug knob: `CT952_PALTRACE`.
+
 **Net:** the retail boot renders a live photo slideshow with a composited OSD overlay whose
 on-screen indicator updates in response to remote keys — the interactive path is faithful end
 to end (input → firmware UI handler → OSD redraw → panel scan-out). The full-screen

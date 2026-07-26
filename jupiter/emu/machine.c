@@ -657,6 +657,17 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
      * (0x1a40..0x1a5c), and the GAM_OSD palette (0x1c00..0x1cff) with PC +
      * icount + value -- shows whether the firmware ever ATTEMPTS OSD-enable /
      * palette-load and where the display bring-up stalls (§12.1). */
+    /* Palette-write trace (CT952_PALTRACE): every write to the GAM_OSD window
+     * 0x1c00..0x1ffc, with the OSD_CR access-mode bit and icount -- to see how
+     * the OSD palette RAM is actually loaded (address-mapped vs auto-increment
+     * data port) and separate palette from gamma. */
+    if (getenv("CT952_PALTRACE") && off >= 0x1c00u && off <= 0x1ffcu) {
+        static int pt; if (pt < 1024) { pt++;
+            fprintf(stderr, "[PAL] +%03x <- %08x  osdcr=%08x pc=%08x icount=%llu\n",
+                    off, v, io_get(m, 0x1a58u), m->cpu.pc,
+                    (unsigned long long)m->cpu.icount);
+        }
+    }
     if (getenv("CT952_DISPTRACE") &&
         ((off >= 0x1a40u && off <= 0x1a5cu) || (off >= 0x1c00u && off <= 0x1cffu))) {
         static int dt; if (dt < 120) {

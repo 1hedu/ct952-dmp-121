@@ -175,3 +175,35 @@ menu path, NOT needed for the slideshow).
    are gone. Verified across three distinct cycling slideshow frames (butterfly/
    lantana, Grand-Teton/Moulton-Barn, Tuolumne river) — the built-in `--video-out`
    de-tile and the composite `--fb-out` agree.
+
+### 12.77 ★ The cycling photos ARE the slideshow — no menu transition is the faithful boot path
+
+Resolving the "splash→menu transition" open item (§12.75 #1): there is **no missing
+trigger to model** — the frame boots straight into its built-in photo slideshow, which
+is exactly what a digital photo frame does.
+
+Evidence (`--jpeg-out` / decode log of a plain baseline boot):
+- The firmware's **MM (multimedia) subsystem** stages successive built-in demo JPEGs
+  into the MM video buffer `DS_VDBUF_ST_MM = 0x401dc000` (the emulator's decode hook
+  fires on each new SOI `FF D8` with a changed signature) and kicks the DSP/JPU decode.
+- Decode #1 is a 480×270 boot logo; decodes #2..N are **distinct 640×360 photos**,
+  10+ per run — i.e. the slideshow is actively cycling images (butterfly/lantana,
+  Grand-Teton/Moulton-Barn, Tuolumne river, …).
+- `_bOSDSSScreenSaverMode=0` and `__bOSDSSPicIdx=0`: this is the **MM photo player**
+  slideshow, not the OSDSS *screensaver* (OSDSS is the after-longer-idle dimmer that
+  arms from the menu; the photo frame's main function is this MM slideshow, and it
+  runs on its own).
+
+Why the splash tick `0x2747c` "never advances to POWERONMENU": the DVD-heritage
+power-on menu is **not** part of this DMP photo-frame build's auto-boot. The splash
+tick's advance is gated by `[0x4002fb48]` (a display-state byte written from 14 sites
+across the display subsystem) + READYFLAG `0x4003996c` bit 0x20; it is an emergent
+display state, not a single device signal, and the frame simply never drives it to the
+"menu" state because it goes to slideshow instead. `FORCE_POM` can shove
+`POWERONMENU_Initial` in, but that is DVD behaviour, not the faithful photo-frame path.
+
+**Conclusion:** the acceptance test — retail firmware boots faithfully and reaches the
+built-in photo slideshow rendering — is **met**. The remaining faithful nicety is only
+that `--fb-out` already composites the panel (§12.76); the menu is a non-goal for this
+build. If OSDSS *screensaver* mode is specifically wanted, that is a separate, smaller
+follow-up (arm OSDSS from the idle path), but the visible slideshow is already running.

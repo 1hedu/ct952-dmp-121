@@ -272,3 +272,42 @@ driven by a genuine **cycling picture index** (an indexed slideshow), consistent
 the OSDSS JPEG screen saver. Pinning the exact `_bOSDSSScreenSaverMode`/`__bOSDSSPicIdx`
 symbols cleanly would need a linker map or a targeted disassembly of OSDSS_Entry, which
 I have not located with certainty yet.
+
+### 12.80 ★ VERIFIED OSDSS addresses — and the honest verdict: OSDSS_Entry never runs in our boot (so the current slideshow is PRE-OSDSS)
+
+Careful disassembly (anchored on the verified `__bPOWERONMENUInitial=0x40023a10`, whose
+readers include `OSDSS_Monitor`) positively identified the OSDSS code and pinned every
+address from our own binary:
+
+| symbol | address | how verified |
+|---|---|---|
+| `OSDSS_Monitor` | `0x591b4` | reads `__bPOWERONMENUInitial`; matches osdss.c:298 line-by-line |
+| `OSDSS_Entry` | `0x59108` | `stb 1,[0x400239c4]` then `OSD_ChangeUI(12,0)` then `clrh [0x400239cc]` |
+| `_bOSDSSScreenSaverMode` | `0x400239c4` | the `stb 1` target in OSDSS_Entry (`=TRUE`) — **DUMPFLAGS was RIGHT** |
+| `__bOSDSSPicIdx` | `0x400239cc` | the `clrh` target in OSDSS_Entry (`=0`) — **DUMPFLAGS was RIGHT** |
+| `__dwOSDSSCheckTime` | `0x400239b8` | OSDSS_Monitor `ld/st` |
+| `__dwOSDSSCheckNOData` | `0x400239c0` | OSDSS_Monitor |
+| `OSD_ChangeUI` | `0x4a754` | called `(12,0)` from OSDSS_Entry |
+| `OSDSS_ENTER_TIME` | `0xe260` (~58 s) | the idle threshold OSDSS_Monitor compares against |
+
+**This overturns §12.78/§12.79 and RESTORES §12.77.** The DUMPFLAGS addresses were
+correct all along; my §12.78 concession ("the guessed addrs are unreliable, so it must
+be OSDSS") and §12.79 ("0x400239cc isn't the pic index") were both wrong — 0x400239cc
+IS `__bOSDSSPicIdx`, it just never cycles because OSDSS never enters.
+
+**OSDSS_Entry is statically single-caller and gated:** its only caller is OSDSS_Monitor,
+which calls it only when `__bPOWERONMENUInitial != 0 && __bCLOCKShowClock==0 &&
+__bAlarmState==0` AND the idle time exceeds ~58 s. Empirically (PCWATCH + OSDSSWATCH on
+the verified addresses, run to 120M): **OSDSS_Monitor executes 40+ times but
+OSDSS_Entry executes 0 times**, and `_bOSDSSScreenSaverMode` is never set to 1. The gate
+that fails is `__bPOWERONMENUInitial == 0` (POWERONMENU_Initial never completes, §12.75).
+
+**Honest verdict on "is this the OSDSS screensaver?":** On the *real device*, the photo
+screen saver IS OSDSS — the user is right about the product. But in *our current
+emulated boot*, the cycling JPEG photos are NOT the OSDSS path: they are a pre-OSDSS
+media/demo slideshow driven by the display state machine `0x27d20` (item index at
+`0x40031ad3`, a struct field — distinct from `__bOSDSSPicIdx=0x400239cc`, which stays 0).
+Reaching genuine OSDSS requires `__bPOWERONMENUInitial=1` (POWERONMENU_Initial to run to
+its store at 0x61ca4) followed by ~58 s idle — then OSDSS_Monitor calls OSDSS_Entry and
+`_bOSDSSScreenSaverMode` flips to 1. That is the precise remaining step to the *actual*
+screen saver, and it ties back to the POWERONMENU-completion gate.

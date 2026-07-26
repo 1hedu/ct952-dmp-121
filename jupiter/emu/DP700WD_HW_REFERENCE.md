@@ -311,3 +311,44 @@ Reaching genuine OSDSS requires `__bPOWERONMENUInitial=1` (POWERONMENU_Initial t
 its store at 0x61ca4) followed by ~58 s idle — then OSDSS_Monitor calls OSDSS_Entry and
 `_bOSDSSScreenSaverMode` flips to 1. That is the precise remaining step to the *actual*
 screen saver, and it ties back to the POWERONMENU-completion gate.
+
+### 12.81 Reached genuine OSDSS (OSDSS_Entry runs, _bOSDSSScreenSaverMode=1) — and the full gating chain to it
+
+Chased POWERONMENU→OSDSS. Findings (all from our binary):
+
+**POWERONMENU is event/key-triggered in this build, not an auto-boot call.** All 8
+call sites of POWERONMENU_Initial(0x61be8) are tiny wrapper functions (`save; call
+0x61be8`) reached via the message pump / key-command dispatch — none is a big
+Thread_CTKDVD that calls it synchronously. `__bPOWERONMENUInitial(0x40023a10)` is set to
+1 ONLY by POWERONMENU_Initial's own store at 0x61ca4 (the only other writer, 0x61894,
+clears it). So `__bPOWERONMENUInitial` stays 0 until a menu/stop key drives POWERONMENU.
+Under FORCE_POM, POWERONMENU_Initial runs on the message-pump thread and calls
+SOURCE_Select(0x59e90)+OSD_ChangeUI(0x4a754) before its store, and stalls there
+(cross-thread), so it doesn't complete.
+
+**OSDSS_Monitor's full gate to OSDSS_Entry** (verified by PCWATCH on the internal PCs):
+`__btPowerDown==0` → `__dwOSDSSCheckTime!=-1` → `!_bOSDSSScreenSaverMode` →
+`__dwOSDSSCheckNOData==__dwTimeNow` (reached, 40×) → `idle=OS_GetSysTimer()-
+__dwOSDSSCheckTime > 0xe260 (~58s)` (NEVER true) → `__bPOWERONMENUInitial!=0` →
+`__bCLOCKShowClock==0` → `__bAlarmState==0` → `OSDSS_Entry(0x59108)`.
+
+**Why idle never elapses:** measured at the compare (0x59244), the idle climbs only to
+~65 ms and is periodically reset by `0x59424` (an OSDSS timer-reset, called from the
+key-command handler 0x3a38 and OSDSS internals). The device is *actively running the
+demo attract slideshow*, which is legitimate activity — so OSDSS (the IDLE screen
+saver) correctly does not arm while the demo plays. At the emulated clock rate reaching
+58 s of true idle would need ~250M uninterrupted instructions.
+
+**Forced entry (CT952_SET_POM + CT952_FORCE_OSDSS):** set `__bPOWERONMENUInitial=1` and
+make the idle compare see an elapsed value; OSDSS_Monitor then called `OSDSS_Entry` on
+its own (PCWATCH: 0x59108 fires once), and `_bOSDSSScreenSaverMode` flips to **1** at
+0x59138 — the genuine OSDSS screen-saver state. `osdss_screensaver.png` is the resulting
+render. Visually identical to the demo (same built-in photos, as expected — OSDSS uses
+the same UTL_ShowJPEG_Slide path), but now it is the actual OSDSS code path.
+
+**Faithful (non-crutch) route to OSDSS**, now precisely known: inject a menu/stop key
+(CT952_IRKEY drives the real IR ISR → CC key command) so POWERONMENU_Initial runs to
+its 0x61ca4 store (`__bPOWERONMENUInitial=1`); stop the demo attract slideshow (so the
+idle timer stops being reset); let ~58 s of eCos time elapse → OSDSS_Monitor calls
+OSDSS_Entry naturally. Two crutches (SET_POM, FORCE_OSDSS) stand in for the first and
+second of these; the third is just time.

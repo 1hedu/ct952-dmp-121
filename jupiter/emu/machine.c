@@ -2039,6 +2039,21 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                     (unsigned long long)m->cpu.icount);
             ccev_done = 1;
         }
+        /* Experiment (CT952_SET_POM=<icount>): the OSDSS screen saver is gated in
+         * OSDSS_Monitor behind __bPOWERONMENUInitial != 0 (0x40023a10), which stays 0
+         * because POWERONMENU_Initial never completes. Set it to 1 once, past <icount>,
+         * to test whether OSDSS_Entry then fires after the ~58s idle timeout and the
+         * genuine OSDSS screen saver renders. */
+        { static long sp = -2; static int sp_done = 0;
+          if (sp == -2) { const char *e = getenv("CT952_SET_POM");
+              sp = e ? (long)strtoull(e, NULL, 0) : -1; }
+          if (sp >= 0 && !sp_done && m->cpu.icount > (uint64_t)sp) {
+              mem_write_raw(m->dram + 0x23a10u, 1, 1);
+              fprintf(stderr, "[SETPOM] __bPOWERONMENUInitial=1 at icount=%llu\n",
+                      (unsigned long long)m->cpu.icount);
+              sp_done = 1;
+          }
+        }
         if (!irkey_done && m->cpu.icount > irkey_at) {
             /* present a clean NEC data frame (not repeat 0x100, not invalid 0x400)
              * with the scancode in the low byte; customer=0x00 customer1=0xFF.

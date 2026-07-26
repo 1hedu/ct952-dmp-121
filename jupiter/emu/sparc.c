@@ -720,6 +720,21 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
                       (unsigned long long)c->icount);
           }
         }
+        /* Experiment (CT952_FORCE_OSDSS=<icount>): OSDSS_Monitor(0x591b4) reaches
+         * its idle-time compare at 0x59244 (`cmp %o0(idle_ms), %o2(0xe260==58s)`)
+         * but the idle never exceeds the threshold (the device is actively running
+         * the demo attract slideshow, which is legitimate activity, so the idle
+         * timer keeps getting reset). Past <icount>, force %o0 huge at 0x59244 so
+         * the idle looks elapsed; combined with __bPOWERONMENUInitial=1 (SET_POM)
+         * and clock/alarm==0, OSDSS_Monitor then calls OSDSS_Entry(0x59108) on its
+         * own -- the genuine OSDSS screen-saver entry, in-context. */
+        { static long fo = -2;
+          if (fo == -2) { const char *e = getenv("CT952_FORCE_OSDSS");
+              fo = e ? (long)strtoull(e, NULL, 0) : -1; }
+          if (fo >= 0 && c->pc == 0x59244u && c->icount >= (uint64_t)fo) {
+              sparc_set_reg(c, 8, 0x00ffffffu);   /* %o0 = idle -> huge */
+          }
+        }
         { static int ic=-1; static uint32_t seen[64]; static int nseen=0;
           if (ic<0) ic = getenv("CT952_ICALL") ? 1 : 0;
           if (ic && (c->pc==0xa720u || c->pc==0xa778u)) {

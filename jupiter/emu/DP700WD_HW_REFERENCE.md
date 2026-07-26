@@ -428,3 +428,27 @@ where a *general* key (navigation/menu) is dispatched in the slideshow state is 
 pinned. New knob: CT952_KEYWATCH=<from> (distinct-PC read watch on 0x400235ac/0x40039074).
 So the input plumbing is faithful (keys are polled); demonstrating a specific key->action
 in the slideshow is the remaining piece.
+
+### 12.85 ★ PINNED — general keys aren't dispatched because the active pump handler is the display tick, not an interactive UI
+
+Windowed read-trace of the IR key var `0x400235ac` right after injecting KEY_EXIT (0xc8)
+at 63M (`CT952_KEYWATCH`): in the whole window it is read at **exactly one PC, 0xa2d0**
+(49x) — the pump's power-key filter `0xa2c4` — and NOWHERE else. `0xa2c4` only acts on
+POWER(0x51)/LCD(0x50) and passes everything else through without dispatching or even
+clearing it. So a general key (navigation / menu / exit) sits in `0x400235ac`, gets
+polled only by the power filter, and is never routed to a handler.
+
+**Why:** the message pump (0xa6cc) only ever runs handler **msgtype 0xa0** (the display/
+slideshow tick 0x2747c) and 0x3d (§12.75). The general-key dispatch lives in the
+INTERACTIVE UI state handlers (the POWERONMENU wrapper 0x2620c, the MM-UI handlers, etc.)
+— none of which is the active pump state. So what renders is the **display/attract path**,
+not the interactive MM-UI slideshow that consumes keys. That is exactly why "keys do
+nothing in the slideshow," and it is the SAME root as POWERONMENU-never-reached (§12.75,
+§12.81): the boot never advances the pump to an interactive UI state.
+
+**Consequence for faithfulness:** the photo rendering is real, but the running state is
+attract/display-only; a faithful boot must advance to the interactive UI (POWERONMENU or
+MM-UI as the active pump handler), after which general keys dispatch and — via the menu
+idle path — OSDSS arms. The blocker is unchanged: advancing the pump past the display
+tick to an interactive UI handler. Input injection (§12.82-84) is confirmed to deliver
+keys to the key vars; the missing half is the interactive consumer being the active state.

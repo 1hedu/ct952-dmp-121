@@ -1074,13 +1074,16 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         { static long kw = -2; static uint32_t seen[32]; static int nseen = 0;
           if (kw == -2) { const char *e = getenv("CT952_KEYWATCH");
               kw = e ? (long)strtoull(e, NULL, 0) : -1; }
-          if (kw >= 0 && (addr == 0x400235acu || addr == 0x40039074u) &&
-              m->cpu.icount >= (uint64_t)kw) {
-              uint32_t pc = m->cpu.pc; int fresh = 1;
-              for (int k = 0; k < nseen; k++) if (seen[k] == pc) { fresh = 0; break; }
-              if (fresh && nseen < 32) { seen[nseen++] = pc;
-                  fprintf(stderr, "[KEYWATCH] key %08x accessed pc=%08x icount=%llu\n",
-                          addr, pc, (unsigned long long)m->cpu.icount); }
+          if (kw >= 0 && addr == 0x400235acu &&
+              m->cpu.icount >= (uint64_t)kw &&
+              m->cpu.icount < (uint64_t)kw + 200000ull) {
+              /* windowed, non-deduped: every access to the IR key var right after
+               * injection -- reader PCs and the clear (write 0xa0) name the
+               * dispatcher/consumer. (nseen counter throttles total lines.) */
+              (void)seen;
+              if (nseen < 120) { nseen++;
+                  fprintf(stderr, "[KEYWATCH] 400235ac read pc=%08x icount=%llu\n",
+                          m->cpu.pc, (unsigned long long)m->cpu.icount); }
           }
         }
         /* DECODE-status poll locator (CT952_DSTRACE): log reads of the HAL/JEPG

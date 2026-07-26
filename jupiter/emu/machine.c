@@ -94,10 +94,27 @@ static void machine_maybe_jpeg_decode(machine_t *m)
             m->jpeg_count, w, h, m->jpeg_src);
     if (getenv("CT952_DECODE_STACK")) {   /* caller chain of this decode (play path) */
         int k;
+        uint32_t fp;
         fprintf(stderr, "  [decode#%d caller PCs] o7=%08x i7=%08x recent:",
                 m->jpeg_count, sparc_get_reg(&m->cpu, 15), sparc_get_reg(&m->cpu, 31));
         for (k = 40; k < 64; k++)
             fprintf(stderr, " %08x", m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63]);
+        fprintf(stderr, "\n");
+        /* Register-window backtrace: saved %i7 at [fp+0x3c], saved %fp at
+         * [fp+0x38] -- names the firmware call chain that kicked the decode
+         * (OSDSS_Entry -> _OSDSS_PictureUpdate -> UTL_ShowJPEG_Slide -> ...). */
+        fp = sparc_get_reg(&m->cpu, 30);
+        fprintf(stderr, "  [decode#%d frames]", m->jpeg_count);
+        for (k = 0; k < 16 && fp >= 0x40000000u && fp < 0x40800000u; k++) {
+            const uint8_t *sp = machine_dram_ptr(m, fp + 0x38);
+            uint32_t nfp, ret;
+            if (!sp) break;
+            nfp = ((uint32_t)sp[0] << 24) | (sp[1] << 16) | (sp[2] << 8) | sp[3];
+            ret = ((uint32_t)sp[4] << 24) | (sp[5] << 16) | (sp[6] << 8) | sp[7];
+            fprintf(stderr, " %08x", ret);
+            if (nfp <= fp) break;
+            fp = nfp;
+        }
         fprintf(stderr, "\n");
     }
     /* keep the raster for the scan-out video-plane composite */
@@ -1465,6 +1482,22 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
                             (unsigned long long)m->cpu.icount);
                     ww++;
                 }
+            }
+        }
+        /* OSDSS screensaver-state watch (CT952_OSDSSWATCH): log writes to the
+         * candidate _bOSDSSScreenSaverMode / __bOSDSSPicIdx / __bPOWERONMENUInitial
+         * bytes over the whole run -- confirms whether the OSDSS JPEG screensaver
+         * mode turns on and the picture index advances (the cycling slideshow). */
+        if (getenv("CT952_OSDSSWATCH") && size == 1) {
+            const char *nm = NULL;
+            if (addr == 0x400239c4u) nm = "_bOSDSSScreenSaverMode";
+            else if (addr == 0x400239ccu) nm = "__bOSDSSPicIdx";
+            else if (addr == 0x40023a10u) nm = "__bPOWERONMENUInitial";
+            if (nm) {
+                static int ow; if (ow < 200) {
+                    fprintf(stderr, "[OSDSS] %-22s =%02x pc=%08x icount=%llu\n",
+                            nm, val & 0xff, m->cpu.pc,
+                            (unsigned long long)m->cpu.icount); ow++; }
             }
         }
         /* Video-plane-enable trace (CT952_VENTRACE): log writes to the software

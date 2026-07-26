@@ -207,3 +207,31 @@ built-in photo slideshow rendering — is **met**. The remaining faithful nicety
 that `--fb-out` already composites the panel (§12.76); the menu is a non-goal for this
 build. If OSDSS *screensaver* mode is specifically wanted, that is a separate, smaller
 follow-up (arm OSDSS from the idle path), but the visible slideshow is already running.
+
+### 12.78 CORRECTION — the cycling slideshow IS the OSDSS JPEG screen saver (§12.77 was wrong)
+
+§12.77's claim "this is the MM photo player, NOT the OSDSS screensaver" was **wrong**,
+and it rested on two unreliable sources I should not have trusted:
+- the `_bOSDSSScreenSaverMode` address `0x400239c4` from main.c's DUMPFLAGS list, which I
+  never verified from the binary (only `__bPOWERONMENUInitial=0x40023a10` was verified,
+  from POWERONMENU_Initial's own `stb` at `0x61ca4`), and
+- relative addresses read off `DVD909.sym` — a **909-family** build, not our CT952A
+  `dp700wd.bin`; its data/text offsets don't line up (confirmed).
+
+Grounded in our binary + `950_Files/`:
+- The photo decodes are kicked through `UTL_ShowJPEG_Slide` (utl.c:377), which is exactly
+  the primitive the **OSDSS screen saver** uses to advance pictures — `_OSDSS_PictureUpdate`
+  calls `UTL_ShowJPEG_Slide(JPEG_PARSE_TYPE_NORMAL, …)` (osdss.c:211) — writing the
+  decoded frame into `DS_FRAMEBUF_ST_SLIDESHOW` (0x40065000). Empirical decode call chain
+  (PCWATCH on the JPU-kick 0x6c500, save-aware caller walk): JPU-kick `0x6c500` ←
+  `0x6cea0` ← `0x365f4` ← `0x376b4` ← `0x1b800` ← [indirect-dispatched handler `0x1f5c0`].
+- So the built-in demo photos cycling into the SLIDESHOW frame buffer are the OSDSS JPEG
+  screen-saver slideshow. `UTL_ShowJPEG_Slide` is shared (OSDSS, thumbnails, logo path),
+  so identifying which caller is active is what still needs a clean check — but the
+  screen-saver slideshow is the correct name for the observed behaviour, per the target
+  owner. My "not OSDSS" was unfounded.
+
+Follow-up to nail down cleanly (from our binary only, no 909): verify the real
+`_bOSDSSScreenSaverMode`/`__bOSDSSPicIdx` addresses (via a function that writes them —
+OSDSS_Entry sets the mode byte TRUE right before `_OSDSS_PictureUpdate`), instead of the
+DUMPFLAGS guesses.

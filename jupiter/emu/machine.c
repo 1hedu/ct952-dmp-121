@@ -450,10 +450,26 @@ static uint32_t io_read(machine_t *m, uint32_t off)
         log_access(m, 0x80000c10u, 0, 0);
         return io_get(m, 0xc10);
     case 0x407C: {
-        /* ADCGLB: analog key-matrix ADC (panel.c PANEL_KeyScan reads bits
+        /* ADCGLB: analog key-ladder ADC (panel.c PANEL_KeyScan reads bits
          * [31:24] as the key voltage). No key pressed => high rail (~0xFF).
-         * Returning 0 reads as a pressed key. CT952_ADC overrides for A/B
-         * verification (e.g. =0x00000000 reproduces the unmodeled behavior). */
+         * CT952_ADC overrides the raw value for both reads. CT952_PANELKEY=
+         * "<r0>,<r1>" is CHANNEL-AWARE: PANEL_KeyScan selects the ladder line by
+         * writing bits [23:16] of ADCGLB (0x84 => RDATA0 line, 0xC4/0xE4 =>
+         * RDATA1 line) before each read, so a real single keypress reads as a
+         * voltage on ONE line and the idle rail on the other. Return r0<<24 when
+         * the 0x84 line is selected and r1<<24 when the 0xC4/0xE4 line is,
+         * defaulting to the 0xFF idle rail otherwise. */
+        const char *pk = getenv("CT952_PANELKEY");
+        if (pk) {
+            static int pk_init = 0; static uint32_t r0 = 0xFF, r1 = 0xFF;
+            if (!pk_init) { pk_init = 1; char b[64]; strncpy(b, pk, 63); b[63] = 0;
+                char *c = strchr(b, ','); if (c) { *c = 0; r1 = (uint32_t)strtoul(c + 1, NULL, 0); }
+                r0 = (uint32_t)strtoul(b, NULL, 0); }
+            uint32_t chan = (io_get(m, 0x407Cu) >> 16) & 0xFF;
+            if (chan == 0x84u) return (r0 & 0xFF) << 24;
+            if (chan == 0xC4u || chan == 0xE4u) return (r1 & 0xFF) << 24;
+            return 0xFF000000u;
+        }
         const char *e = getenv("CT952_ADC");
         return e ? (uint32_t)strtoul(e, NULL, 0) : 0xFF000000u;
     }

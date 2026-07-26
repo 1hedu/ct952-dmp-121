@@ -352,3 +352,31 @@ its 0x61ca4 store (`__bPOWERONMENUInitial=1`); stop the demo attract slideshow (
 idle timer stops being reset); let ~58 s of eCos time elapse → OSDSS_Monitor calls
 OSDSS_Entry naturally. Two crutches (SET_POM, FORCE_OSDSS) stand in for the first and
 second of these; the third is just time.
+
+### 12.82 Input injection confirmed — IR (end-to-end) and panel SAR/ADC (channel-aware)
+
+Confirmed both faithful input paths drive the firmware from our binary.
+
+**IR remote (CT952_IRKEY) — end-to-end.** `CT952_IRKEY=0x0c@43000000` presents a NEC
+frame to the modeled IR receiver and raises the PROC1-2nd IR interrupt (cascades to LEON
+line 10, which is in the mask). ~1400 instructions later `__bISRKey(0x40039074)` was
+written to **0xc8** at pc 0x423a0 — i.e. the firmware's own IR ISR decoded scancode 0x0c
+to `KEY_EXIT` (INPUT_KEY_GROUP11+0 = 200 = 0xc8). The whole receiver→ISR→__bISRKey path
+works.
+
+**Panel key ladder (CT952_PANELKEY) — channel-aware ADC.** `PANEL_KeyScan` (flash
+**0x5988c**, called from ~60M by the input thread, 40×/run via caller 0xa3b4) selects a
+ladder line by writing ADCGLB[23:16] (0x84 → RDATA0 line, 0xC4 → RDATA1 line) then reads
+`0x8000407C`; `RDATA = read>>24`. `<0xF0` = a key, with thresholds 0xD0/0x90/0x60/0x10
+mapping to `aScanMap[1..10]` (key.h: 1=KEY_LEFT, 2=RIGHT, 3=DOWN, 4=UP, 6=PLAY_PAUSE,
+8=POWER). The old CT952_ADC returned the same value on both lines (no real key matches
+that). New `CT952_PANELKEY="<r0>,<r1>"` reads the channel-select bits and returns r0 only
+on the 0x84 line, r1 only on 0xC4, else the 0xFF idle rail. Verified: `CT952_PANELKEY=
+0xE0,0xFF` → dump shows `RDATA0(0x40039904)=0xE0` (channel A = injected) and the channel-B
+read = `0xFF` (idle) → bGetKey=1 → `KEY_LEFT`. The voltage reaches PANEL_KeyScan and
+decodes to a real key. (A held level does not create a fresh press-edge, so the input
+debounce doesn't latch __bISRKey from a constant CT952_PANELKEY; a real "press" is a
+transition — inject then clear.)
+
+Both are the faithful hardware input paths (real ISR / real ADC scan), usable to drive
+POWERONMENU (menu/stop key) and thence the OSDSS screen saver (§12.81).

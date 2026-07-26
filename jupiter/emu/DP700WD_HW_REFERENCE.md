@@ -452,3 +452,64 @@ MM-UI as the active pump handler), after which general keys dispatch and — via
 idle path — OSDSS arms. The blocker is unchanged: advancing the pump past the display
 tick to an interactive UI handler. Input injection (§12.82-84) is confirmed to deliver
 keys to the key vars; the missing half is the interactive consumer being the active state.
+
+### 12.86 ★ CORRECTED MODEL — the boot settles in pump mode-8 = MEDIA_SELECT_DLG (a real power-on dialog), never entering POWERONMENU_Initial; keys DO reach the pump but are swallowed there
+
+This turn re-derived the late-boot state with clean PC-based tracers (not the stale-register
+reads that produced earlier misreads), and corrected two substantive errors in the prior UI
+model.
+
+**Corrected UI numbering (ground truth `osd.h`), fixing §12.77/§12.85 labels:**
+- pump/OSD **UI 8 = `OSD_UI_MEDIA_SELECT_DLG`** — the power-on *media-source select dialog*,
+  NOT "attract". Its 5-entry "source chain" (§12.40, `mode8_stayflag` 0x40032b3b built by
+  0x299c0) is the list of selectable media sources; predicate 0x272a8 stays in mode-8 while
+  that count > 0.
+- **UI 17 (0x11) = `OSD_UI_POWERON_MENU`**, **UI 12 (0xc) = `OSD_UI_SCREEN_SAVER`** (OSDSS),
+  **UI 18 (0x12) = `OSD_UI_COPY_DELETE_DLG`** (NOT "MM interactive slideshow" — that summary
+  label was wrong).
+
+**Two distinct "ChangeUI" primitives — don't conflate:**
+- `0xafd8(mode,sub)` = LOW-LEVEL pump active-mode set. Non-blocking: looks up the mode's
+  record (`0xae50`), calls its enter-handler `[rec+4]`, and on nonzero stores the record ptr
+  to the active-UI slot `0x40020ec8` (`st %i0,[%l0+0x2c8]` at 0xb038 — this is the
+  "activeUI -> rec=40024ce0 id=8" trace). Returns.
+- `0x4a754` = HIGH-LEVEL `OSD_ChangeUI(ui,mode)` (the C API POWERONMENU_Initial calls).
+
+**Verified facts (full recipe `VDEC_IDLE=1 VSYNC_KEEP=1 TICK_FAST_AT=48000000,512
+--skip-panelcfg`, runs to 260M):**
+1. **`OSD_ChangeUI` (0x4a754) is NEVER called** (new `CT952_UICHANGE` PC-tracer, 0 hits in
+   260M). The high-level UI genuinely never transitions.
+2. **`POWERONMENU_Initial()` is never ENTERED.** It would call `OSD_ChangeUI(17)` (step 4)
+   AND set `__bPOWERONMENUInitial=1` (step 8, watch on 0x40023a10) — neither happens. So
+   `Thread_CTKDVD` (cc.c:1283: `INITIAL_System → INITIAL_PowerONStatus → POWERONMENU_Initial`)
+   **stops before the POWERONMENU_Initial call.** Build config confirms it is compiled in
+   (`SUPPORT_POWERON_MENU` defined, `SUPPORT_PLAY_MEDIA_DIRECTLY_POWER_ON` off, `Winav.h`).
+3. **The boot-init tail 0x41b00-0x41b58 calls `0xafd8(8)` (set MEDIA_SELECT), which returns**
+   (mode-8 record activated at 60.7M). So the mode-set is NOT the block; the block is later
+   on Thread_CTKDVD's path to POWERONMENU_Initial — consistent with a media-select wait that
+   never resolves because no media source is modeled present.
+4. **Without the recipe knobs the pump 0xa6cc never runs at all** (0xa720/0xa778 dispatch =
+   0 hits to 50M via `CT952_ICALL`); the steady state is the eCos **idle thread** (tight loop
+   0x40001014-0x40001060 + window traps at 0x40000060), waking only to decode the next demo
+   photo. This corrects the prior "pump loops the display tick" framing for the no-knob case.
+5. **Steady state (with knobs): pump event var `0x40020ec8` alternates `0xa0` (idle) and
+   `0x3d` (the ~13M-period slideshow-advance event) forever** (`CT952_PUMPARG`/`PUMPREC`).
+   The demo slideshow cycling IS this 0x3d event; it is a display/timer path, independent of
+   the parked Thread_CTKDVD.
+6. **Keys DO reach the pump.** Injecting IR scancode 0x0c at 65,002,861 posts pump event
+   **`0xc8` at 65,004,477** (~1600 instr later) into `0x40020ec8`, then it clears back to
+   `0xa0`. So the key is received by the message pump — but in mode-8 (media-select) it is
+   processed as a no-op and produces no UI transition. (Refines §12.85: keys are not merely
+   unrouted; they are delivered to the pump and swallowed by the media-select state.)
+
+**Unified faithful gap (unchanged root, now precisely characterized):** `Thread_CTKDVD` sets
+pump mode-8 (MEDIA_SELECT_DLG) and blocks before `POWERONMENU_Initial()`, waiting on a
+media-source resolution that never comes (no card/USB/internal source is modeled present).
+The demo photos we render are mode-8's background slideshow. The faithful event to model is
+**media-source presence/selection** so the media-select resolves, Thread_CTKDVD returns and
+calls `POWERONMENU_Initial()` → `OSD_ChangeUI(17)` → the interactive menu, where general keys
+(already delivered to the pump, §12.86.6) navigate and the menu idle path arms OSDSS.
+
+**New diagnostics this turn (all opt-in, inert unless env-set):** `CT952_UICHANGE` (PC-trace
+OSD_ChangeUI 0x4a754), `CT952_PUMPARG[=<icount>]` (mode-handler dispatch arg at 0xa720 +
+message-record fetch at 0xa6ec), `CT952_POKE` (one-shot DRAM write, for gate experiments).

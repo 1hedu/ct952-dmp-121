@@ -735,6 +735,45 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
               sparc_set_reg(c, 8, 0x00ffffffu);   /* %o0 = idle -> huge */
           }
         }
+        /* UI-transition tracer (CT952_UITRACE): log every OSD_ChangeUI(0x4a754)
+         * call -- %o0=UI index, %o1=mode (0=ENTER,1=EXIT,...), %o7=caller. This
+         * directly shows the UI progression during boot and reveals whether the
+         * interactive MM-UI (0x12) is ever entered on its own, or the boot parks
+         * in the attract/display UI. */
+        { static int ut=-1;
+          if (ut<0) ut = getenv("CT952_UICHANGE") ? 1 : 0;
+          if (ut && c->pc==0x4a754u) {
+              fprintf(stderr, "[UICHANGE] ui=%02x mode=%x caller=%08x icount=%llu\n",
+                  sparc_get_reg(c,8)&0xff, sparc_get_reg(c,9)&0xff,
+                  sparc_get_reg(c,15), (unsigned long long)c->icount);
+          }
+        }
+        /* Pump-arg tracer (CT952_PUMPARG[=<from_icount>]): at the mode-handler
+         * dispatch 0xa720 (call %o1), log the message-type arg %o0 and handler
+         * %o1 the active-UI handler receives. Reveals the stream of pump messages
+         * -- and whether an injected key ever arrives as a non-idle message type
+         * (i.e. whether keys reach the interactive dispatch). Rate-limited. */
+        { static long pa=-2; static int pn=0;
+          if (pa==-2) { const char *e=getenv("CT952_PUMPARG");
+              pa = e ? (long)strtoull(e,NULL,0) : -1; }
+          if (pa>=0 && c->pc==0xa720u && c->icount>=(uint64_t)pa && pn<400) {
+              fprintf(stderr, "[PUMP] arg=%02x handler=%08x icount=%llu\n",
+                  sparc_get_reg(c,8)&0xff, sparc_get_reg(c,9),
+                  (unsigned long long)c->icount);
+              pn++;
+          }
+          /* Also log the message-record fetch result at 0xa6ec (delay slot after
+           * call 0xb090): %o0 = active-UI record ptr (or 0 = none). Shows whether
+           * an active UI record even exists to dispatch through. */
+          if (pa>=0 && c->pc==0xa6ecu && c->icount>=(uint64_t)pa && pn<400) {
+              uint32_t rec = sparc_get_reg(c,8);
+              int f=0; uint32_t t=rec&0xff;
+              /* rate-limit identical consecutive by low byte via static */
+              static uint32_t last=0xdeadbeef; if (t!=(last&0xff)||rec!=last){f=1; last=rec;}
+              if (f) { fprintf(stderr, "[PUMPREC] rec=%08x icount=%llu\n",
+                  rec, (unsigned long long)c->icount); pn++; }
+          }
+        }
         { static int ic=-1; static uint32_t seen[64]; static int nseen=0;
           if (ic<0) ic = getenv("CT952_ICALL") ? 1 : 0;
           if (ic && (c->pc==0xa720u || c->pc==0xa778u)) {

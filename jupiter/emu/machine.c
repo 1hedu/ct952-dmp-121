@@ -2106,6 +2106,26 @@ uint64_t machine_run(machine_t *m, uint64_t n)
               sp_done = 1;
           }
         }
+        /* Experiment (CT952_POKE="<hexaddr>=<val>[:<size>]@<icount>"): one-shot
+         * byte/word write into DRAM past <icount>, to test whether forcing a gate
+         * (e.g. the display-tick transition gate 0x4002fb48=1) advances the pump to
+         * an interactive UI handler and makes keys dispatch. */
+        { static long pk_at = -2; static int pk_done = 0;
+          static uint32_t pk_addr = 0, pk_val = 0, pk_sz = 1;
+          if (pk_at == -2) { const char *e = getenv("CT952_POKE"); pk_at = -1;
+              if (e) { char b[96]; strncpy(b, e, 95); b[95] = 0;
+                  char *at = strchr(b, '@'); if (at) { *at = 0; pk_at = (long)strtoull(at + 1, NULL, 0); }
+                  char *sz = strchr(b, ':'); if (sz) { *sz = 0; pk_sz = (uint32_t)strtoul(sz + 1, NULL, 0); }
+                  char *eq = strchr(b, '='); if (eq) { *eq = 0; pk_val = (uint32_t)strtoul(eq + 1, NULL, 0); }
+                  pk_addr = (uint32_t)strtoul(b, NULL, 0); } }
+          if (pk_at >= 0 && !pk_done && m->cpu.icount > (uint64_t)pk_at &&
+              pk_addr >= 0x40000000u) {
+              mem_write_raw(m->dram + (pk_addr - 0x40000000u), pk_val, (int)pk_sz);
+              fprintf(stderr, "[POKE] *%08x = %u (size %u) at icount=%llu\n",
+                      pk_addr, pk_val, pk_sz, (unsigned long long)m->cpu.icount);
+              pk_done = 1;
+          }
+        }
         if (!irkey_done && m->cpu.icount > irkey_at) {
             /* present a clean NEC data frame (not repeat 0x100, not invalid 0x400)
              * with the scancode in the low byte; customer=0x00 customer1=0xFF.

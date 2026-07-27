@@ -1198,3 +1198,31 @@ firmware's unknown-media path. The remaining faithful work is one of:
       classify that returns "playable" pre-mount), i.e. why classify != 1 here.
 Both are now fully decompilable via ghidra_re/. This supersedes the "parse never raises READY"
 framing (§12.96): the parse is never *started* because the card takes the menu path by design.
+
+### 12.110 ★★ THREAD #1 traced to root: the menu is empty because the file ENUMERATION reports 0 files
+
+Decompiled the whole "auto-play vs menu" decision + source-list path (ghidra_re/):
+- `FUN_00025ef4` (boot media decision): `FUN_00026e44` (USB) + `FUN_00026f38` (SD). If SD returns
+  "playable" -> success (-> FUN_00029348 -> FUN_0001b48c -> parser start); else prints "usb no
+  playable file" / "no SD card" (0xe7668/0xe7698) -> `OSD_ChangeUI(7)` (the media-select menu).
+- `FUN_00026f38` = mount (`FUN_00024d0c`, param 3 = SD) then `FUN_000254a4` (playable check).
+- `FUN_000254a4` -> `FUN_00025d58` -> `FUN_00012e18`: the file **count** = sum of per-file-type
+  counts in the info.a table at `_DAT_40021db8+8` (42 categories; extension table at 0xe6ab8:
+  MP3/WMA/JPG/JPEG/BMP/AVI/... -> classifier func_0x123d4). count>0 => playable.
+
+**Verified empirically + by dump:**
+- The card image is a valid FAT16 (root dir @ sector 35; entries SDTEST/02/03.JPG, attr 0x20,
+  correct clusters/sizes).
+- The firmware **reads the root dir correctly into DRAM** (dump of 0x401ff260 shows all 3 JPEG
+  entries intact).
+- **JPG is a recognized extension** (0xe6ad0, classifier case 3, unconditional).
+- Yet the enumerated file count `_DAT_40032aa0` is written **0 every time** (pc 0x25dcc). So the
+  info.a per-category count table is empty -> `FUN_000254a4` sees 0 files -> `FUN_00026f38` fails
+  -> "no SD card" -> menu with nothing to list.
+
+**Root of thread #1:** the firmware has a valid FAT with recognized JPEGs and reads the directory,
+but the info.a **classification/enumeration never populates the file-type counts** (`_DAT_40021db8+8`).
+So auto-play and the source menu both see an empty card. The last remaining question is purely why
+the mount-time enumeration (info.a FMLISTMultivolume / `FUN_0002374c`, and the classifier
+`func_0x123d4`) does not count the directory entries the FS already read -- i.e. whether info.a's
+own VFS dir-walk fails on this image, or the count-building parse is gated off. Fully decompilable.

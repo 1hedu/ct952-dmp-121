@@ -784,9 +784,14 @@ init chain and **CMD18-reads the FAT**: block 0 (BPB) → blocks 32-35 (root dir
 the root, finds the JPEGs, and reads the first one. **The OSD then changes from the empty gray
 box to a full blue/white dialog** — proof the card-present path drives a different UI.
 
-**Where it stops (next step):** the blue screen is a centered white-text dialog, not yet the
-interactive photo browser; KEY_NEXT/ENTER injected on it don't advance to reading 02/03.JPG or
-decoding a card photo to the video plane (only the built-in demo 0x401dc000 decodes). So the
-storage+enumeration layer is faithful and complete; the remaining work is the UI transition from
-this post-detect dialog into the photo browser/slideshow of the card's files. New knobs:
-`CT952_SDCARD`, `CT952_SDCTRACE`; helper `mkfatimg.py`.
+**Where it stops (next step):** the blue screen is the **COBY power-on splash** (user-identified;
+GDI-drawn blue field + white COBY logo, no JPEG). With the card in, the firmware takes the
+branded card-present boot branch: draw splash → enumerate card (BPB, root dir, 01.JPG header)
+→ then **parks at the splash** — zero JPEG decodes in a 220 M-instr run, no further block reads,
+and KEY_NEXT/ENTER are inert. So the storage+FS layer is faithful and complete (card mounts and
+its files are found), but the firmware does not advance from the splash into decoding/displaying
+the card's photos. The remaining work is that **splash → card-photo display transition**: find
+what the splash waits on after enumeration (a slideshow/auto-play trigger, a "photos indexed"
+event, or a further read the model isn't satisfying) and model it, then wire the JPU decode of a
+card JPEG (from its DMA'd DRAM buffer, e.g. 0x401ec000) through the existing decode path. New
+knobs: `CT952_SDCARD`, `CT952_SDCTRACE`; helper `mkfatimg.py`.

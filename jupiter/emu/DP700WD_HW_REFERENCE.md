@@ -824,3 +824,55 @@ files enumerate, 01.JPG delivered correctly). The card-photo *display* transitio
 card side. Cracking it means reversing the precompiled `info.a`/`card.a` parse/auto-play state
 machine to find which CC event should advance it after the header read, and what should post
 that event. That is a distinct, research-grade effort, not a near-term finish.
+
+### 12.96 Card-photo stall re-pinned with fresh data: parse loads 01.JPG but never signals READY
+
+Re-ran the card boot (`CT952_SDCARD=/tmp/sdcard.img CT952_TICK_MULT=64`) with a per-CMD18
+sector trace, a media-state scan, and a JPU-source watch. Corrects several assumptions in
+§12.94/95.
+
+**Exact SD sequence (all CMD18, TICK_MULT=64):**
+- 31.51M: full init chain CMD0/8/ACMD41/CMD2/CMD3/CMD9/CMD7/ACMD6/ACMD51/CMD6.
+- 31.56M: READ sec 0 ×1 → 0x400293c8 (BPB).
+- 31.58M: READ sec 0 ×4 → 0x401ff480 (BPB+reserved).
+- 31.60M: READ sec 32 ×4 → 0x401fec60 (FAT2 tail + root-dir sector 35).
+- 32.38M: READ sec 67 ×32 (**16 KB**) → **0x401ec000** (01.JPG file data, byte-correct).
+- After 32.38M: **only the 200 ms card-detect STAT poll** (`0xa0001124`→0x00070000, PCs
+  0x163fc/0x0c993c) forever. No more reads, no init retry.
+
+**Verified facts (this turn):**
+- The 16 KB read is a full file-data load (not a header peek). Backtrace at the load:
+  `0xcb328 ← 0xcb51c ← 0x16e2c ← 0x190b4 ← info.a ← 0x6308 ← 0x74cc` — info.a's virtual-dispatch
+  VFS (`ld [p+0xc]; call` indirections; retry-on-`-11` loop calling DRAM module 0x4001e138).
+- After the load, info.a runs refcount cleanup (0xd5440: decrements a refcount, frees the buffer
+  via DRAM mem-mgr 0x4001e918/0x4001e948) — consistent with the file parse *finishing*.
+- **`jpeg_src` is ONLY EVER 0x401dc000 across the whole run** — the card buffer 0x401ec000 is
+  never decoded. The 40 decodes are the demo/COBY-splash buffer.
+- **UI stays mode-8 (MEDIA_SELECT_DLG)** the entire time; OSDSS screensaver is not active.
+- **No MediaInfo state write after the load.** MediaInfo bStates are bitflags
+  (INSERT=1/RECOGNIZE=2/PARSING=4/READY=8/WRONG=0x10). Scanning byte writes of those values in
+  0x40020000–0x40040000 after 32.4M: **none** — no READY(8), no WRONG(0x10). So the parse result
+  is never converted into a media-ready (or wrong-media) state that would drive auto-play.
+
+**Refined keystone:** the SD + FAT + file-load path is complete and byte-faithful — the card's
+first photo is correctly in DRAM at 0x401ec000. What never happens is the **info.a→media-manager
+"parse done, media READY" handoff**: no MediaInfo→READY, no auto-play, no JPU decode of the card
+buffer. It is NOT a data-corruption bug, NOT a WRONG-media rejection, and NOT the idle CC flags
+(§12.75) or the demo JPU chain (§12.79). The parse reads everything correctly and then goes quiet
+without raising READY.
+
+**Delayed-insert test (disproves the edge-timing hypothesis).** Added `CT952_SDCARD_AT=<icount>`
+to model the user inserting the card *after* power-on (STAT reports no-card until <icount>, giving
+a clean insert edge). Ran with the card appearing at 40M. Result: **no card init at all** — zero
+SD commands, decode stays 0x401dc000. The firmware polls card-detect only in a narrow boot window
+(last STAT read 30.5M, returning 0=no-card), then **stops polling entirely**; when the card
+appears at 40M nothing re-probes it. So media recognition here is effectively a **one-shot
+boot-window probe** that requires the card present at ~30M. Present-from-boot is therefore the
+faithful setup (real photo frames: card in, then power on) and the only path that reaches the
+parse. Delaying the insert is strictly worse.
+
+**Net:** present-from-boot → card inits + FAT enumerated + 01.JPG loaded to 0x401ec000 (byte-exact)
+→ then parked with no READY. The remaining work is purely the info.a parse-complete→READY signal
+(the flash `0xcxxxx/0xdxxxx` + DRAM `0x4001exxx` info.a module), which never raises the media-ready
+state. New diagnostics landed for it: per-CMD18 sector trace + `CT952_SDCBT` load backtrace,
+`CT952_MSCAN=<icount>` media-state-bitflag scan, `CT952_SDCARD_AT=<icount>` delayed insert.

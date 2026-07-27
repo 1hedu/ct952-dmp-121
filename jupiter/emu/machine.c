@@ -1052,6 +1052,17 @@ static void sdc_do_cmd(machine_t *m, uint32_t cmd_reg, uint32_t tran_mode)
         /* CCS=1 (SDHC) => ARG is a block number */
         sdc_dma_to_dram(m, dma, arg * 512u, blkcnt * blksz);
         m->sdc_int_stat |= SDCI_TRAN_COMPLETE;
+        if (getenv("CT952_SDCTRACE"))
+            fprintf(stderr, "[SDC] READ%d sector=%u count=%u -> dram=%08x pc=%08x icount=%llu\n",
+                    idx, arg, blkcnt, dma, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        { const char *bt_e = getenv("CT952_SDCBT");
+          if (bt_e && dma == (uint32_t)strtoul(bt_e, NULL, 0)) {
+            uint32_t bt[32]; int nb = sparc_win_backtrace(&m->cpu, bt, 32), bi;
+            fprintf(stderr, "[SDCBT] READ%d sector=%u count=%u dram=%08x winframes:",
+                    idx, arg, blkcnt, dma);
+            for (bi = 0; bi < nb; bi++) fprintf(stderr, " %08x", bt[bi]);
+            fprintf(stderr, " icount=%llu\n", (unsigned long long)m->cpu.icount);
+          } }
         break; }
     default: break;
     }
@@ -1074,8 +1085,18 @@ static uint32_t sdc_read(machine_t *m, uint32_t off)
             m->sdc_int_stat |= SDCI_TRAN_COMPLETE;
         }
         return v; }
-    case 0x24: /* STAT: card inserted, stable, CD pin low(present); not busy */
-        return (m->sd_img ? (SDCS_CARD_INS | SDCS_STABLE | SDCS_CD_PIN) : 0);
+    case 0x24: { /* STAT: card inserted, stable, CD pin low(present); not busy */
+        /* Delayed-insert (CT952_SDCARD_AT=<icount>): model the user inserting the
+         * card AFTER power-on -- report "no card" until <icount>, giving a clean
+         * insert EDGE once the media subsystem is running (tests whether a
+         * present-from-boot card is missed because its edge is processed too
+         * early). */
+        static long ins_at = -2;
+        if (ins_at == -2) { const char *e = getenv("CT952_SDCARD_AT");
+                            ins_at = e ? (long)strtoull(e, NULL, 0) : -1; }
+        if (!m->sd_img) return 0;
+        if (ins_at >= 0 && m->cpu.icount < (uint64_t)ins_at) return 0;
+        return (SDCS_CARD_INS | SDCS_STABLE | SDCS_CD_PIN); }
     case 0x2c: { /* CLK_CTRL(0x2c)/TIMEOUT(0x2e)/SW_RESET(0x2f) */
         uint32_t w = m->sdc_reg[0x2c >> 2];
         uint32_t clk = (w >> 16) & 0xffff;      /* halfword at 0x2c = bits[31:16] */
@@ -1729,6 +1750,23 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
+        /* Media-state scan (CT952_MSCAN=<start_icount>): log byte writes of the
+         * MediaInfo bitflag values (INSERT=1/RECOGNIZE=2/PARSING=4/READY=8/
+         * WRONG=0x10) in the game-variable region past <start_icount>, to watch
+         * the media state machine advance on card insert. §12.96: with the card
+         * present from boot, NONE of these fire after the 01.JPG load (32.4M) --
+         * the info.a parse never raises MediaInfo->READY. */
+        { static long ms_at = -2;
+          if (ms_at == -2) { const char *e = getenv("CT952_MSCAN");
+                             ms_at = e ? (long)strtoull(e, NULL, 0) : -1; }
+          if (ms_at >= 0 && size == 1 && m->cpu.icount > (uint64_t)ms_at
+              && ((val&0xff)==1||(val&0xff)==2||(val&0xff)==4||(val&0xff)==8||(val&0xff)==0x10)
+              && addr >= 0x40020000u && addr < 0x40040000u) {
+              static int msn; if (msn < 4000) {
+                  fprintf(stderr, "[MSCAN] %08x=%u pc=%08x icount=%llu\n",
+                          addr, val & 0xff, m->cpu.pc, (unsigned long long)m->cpu.icount);
+                  msn++; }
+          } }
         /* Screensaver-gate write-watch (CT952_WWATCH): trace the exact writes
          * that decide the OSDSS slideshow -- __bPOWERONMENUInitial (0x40023a10,
          * the gate), __dwOSDSSCheckTime (0x400239b8, reset by OSDSS_ResetTime

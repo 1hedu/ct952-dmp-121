@@ -1048,3 +1048,24 @@ never *submitted* for display. The blocker is upstream — the **MM auto-play** 
 would point the JPU/display at 0x401ec000 never runs. So the next target is the media-READY →
 MM-auto-play trigger: confirm whether the parse signals READY and what should launch auto-play.
 Per-op engine model + SMWATCH diagnostics landed; model stays gated (CT952_JPUENG).
+
+### 12.104 Post-engine: the item is finished and an event is signalled (0x4003d6a8) — handoff to a consumer thread
+
+Followed the code right after the engine wait (0x9bcd0→0x9bd60→0x9be40): it indexes the current
+item ([ctx+0x4d0]), checks per-item flag bits (0xc000/0x9000), reads a state byte at 0x4003d6a8+0x40,
+sets a per-item done flag ([ctx+4+idx]=1), and **signals an eCos event/semaphore at 0x4003d6a8**
+(`call 0x595d4`, i.e. flag-set/sem-post) to wake a consumer thread. So the parse side DOES finish
+the photo item and post a completion event.
+
+So the chain is now: info.a stages photo → 0x80000800 engine (modeled) → post-process + signal
+0x4003d6a8 → [consumer thread] → (should) display. The photo never displays and the demo stops, so
+the consumer side of 0x4003d6a8 either never runs the display or is gated out. This is the same
+eCos event-handoff machinery as the CC-worker keystone (§12.49-75), now reached from the card side
+one layer deeper.
+
+**Honest position after the path-1 rounds:** the card-photo stall's ROOT CAUSE is cracked and
+mapped (the 0x80000800 2D/JPEG engine, §12.98-100), and the post-parse handoff is now traced to a
+specific event object (0x4003d6a8). Getting an actual photo on screen requires reversing the
+consumer of that event through the DSP/MM display machinery (0x70240 SM, main-JPU kick) — a
+sustained multi-layer effort across info.a + the eCos event system, not a near-term finish. All
+diagnostics gated/landed; default emulator remains honest (spins on the unmodeled engine).

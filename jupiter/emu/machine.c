@@ -1605,7 +1605,8 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
      * the state machine's inputs ever change or are frozen. */
     if (getenv("CT952_SMWATCH") &&
         (addr == 0xb0000190u || addr == 0x40039f1cu || (addr & ~1u) == 0x40039f24u
-         || addr == 0x40039f60u)) {
+         || addr == 0x40039f60u || (addr & ~3u) == 0x40039cd0u || addr == 0x40022f06u
+         || addr == 0x4003263cu || addr == 0x4003277cu)) {
         static int smw; if (smw < 300) {
             fprintf(stderr, "[SMW] %08x <- %08x (sz%d) pc=%08x icount=%llu\n",
                     addr, val, size, m->cpu.pc, (unsigned long long)m->cpu.icount); smw++; }

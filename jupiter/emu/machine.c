@@ -62,13 +62,22 @@ static void machine_maybe_jpeg_decode(machine_t *m)
         return;
     src = m->dram + (m->jpeg_src - 0x40000000u);
     avail = (0x40000000u + MACH_DRAM_SIZE) - m->jpeg_src;
+    if (getenv("CT952_JPEGTRACE")) {
+        static int jt; if (jt < 40) { jt++;
+            fprintf(stderr, "[JPGTRY] src=%08x SOI=%02x%02x icount=%llu\n",
+                    m->jpeg_src, src[0], src[1], (unsigned long long)m->cpu.icount); }
+    }
     if (src[0] != 0xFF || src[1] != 0xD8)   /* need a JPEG SOI staged */
         return;
     sig = jpeg_stage_sig(src, avail);
     if (sig == m->jpeg_sig)           /* same frame as last time -> done */
         return;
-    if (emu_jpeg_decode(src, avail, &rgb, &w, &h) != 0)
+    if (emu_jpeg_decode(src, avail, &rgb, &w, &h) != 0) {
+        if (getenv("CT952_JPEGTRACE"))
+            fprintf(stderr, "[JPGTRY] decode FAILED src=%08x icount=%llu\n",
+                    m->jpeg_src, (unsigned long long)m->cpu.icount);
         return;
+    }
     m->jpeg_sig = sig;
     m->jpeg_count++;
     /* Faithful decode-completion: the decoder has produced a frame and settled

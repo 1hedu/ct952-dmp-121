@@ -182,6 +182,21 @@ typedef struct machine {
     uint32_t ehci_ctrldss, ehci_periodic, ehci_async, ehci_configflag;
     uint32_t ehci_portsc[4];
 
+    /* SD Host Controller (standard SDHC spec, base 0xa0001100) + a FAT image as
+     * the inserted card. Lets the firmware's SDC driver (card.a/sdc.o) init the
+     * card and CMD18-DMA-read blocks, so the media manager enumerates the card
+     * and the browse UI populates. sd_img is the raw card image (FAT). */
+    uint8_t  *sd_img;
+    uint32_t  sd_size;
+    uint32_t  sdc_reg[64];        /* register file, word-indexed by offset>>2 */
+    uint32_t  sdc_int_stat;       /* REG_SDC_INT_STAT accumulator (0x30) */
+    uint32_t  sdc_resp[4];        /* command response registers */
+    int       sdc_acmd;           /* previous command was CMD55 (APP_CMD) */
+    uint32_t  sdc_rca;            /* card relative address */
+    uint8_t   sdc_data[512];      /* PIO read buffer (small data: SCR/switch/status) */
+    uint32_t  sdc_data_len;       /* valid bytes in sdc_data */
+    uint32_t  sdc_data_pos;       /* DATA_PORT read cursor */
+
     uint64_t cycles;
     int watchdog_fired;
 } machine_t;

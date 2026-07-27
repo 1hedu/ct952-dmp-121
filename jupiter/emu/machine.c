@@ -930,6 +930,174 @@ static void ehci_write(machine_t *m, uint32_t off, uint32_t val)
     }
 }
 
+/* ---- SD Host Controller model (standard SDHC spec, base 0xa0001100) ---------
+ * Presents m->sd_img (a FAT card image) as an inserted SDHC card. The retail
+ * SDC driver (card.a/sdc.o) does CMD0/8/ACMD41/2/3/9/7/ACMD6/CMD6 init then
+ * CMD18 multi-block DMA reads into DRAM; we serve blocks from sd_img and drive
+ * the INT_STAT CMD_COMPLETE/TRAN_COMPLETE handshake. Register offsets are from
+ * ctkav_sdc.h; SDC_BASE low 8 bits below (0x00..0xfc). §12.94. */
+#define SDC_BASE_ADDR 0xA0001100u
+/* INT_STAT bits */
+#define SDCI_CMD_COMPLETE   (1u<<16)
+#define SDCI_TRAN_COMPLETE  (1u<<17)
+#define SDCI_DMA_INT        (1u<<19)
+#define SDCI_BUF_RD_RDY     (1u<<21)
+#define SDCI_CARD_INS       (1u<<22)
+/* STAT bits */
+#define SDCS_CARD_INS       (1u<<16)
+#define SDCS_STABLE         (1u<<17)
+#define SDCS_CD_PIN         (1u<<18)
+
+/* fill sdc_resp[0..3] from a 16-byte CID/CSD (big-endian, [0]=bits127:120);
+ * the SDHC R2 response register holds CID/CSD[127:8] (CRC byte dropped). */
+static void sdc_resp_r2(machine_t *m, const uint8_t *b)
+{
+    m->sdc_resp[0] = ((uint32_t)b[11]<<24)|((uint32_t)b[12]<<16)|((uint32_t)b[13]<<8)|b[14];
+    m->sdc_resp[1] = ((uint32_t)b[7]<<24)|((uint32_t)b[8]<<16)|((uint32_t)b[9]<<8)|b[10];
+    m->sdc_resp[2] = ((uint32_t)b[3]<<24)|((uint32_t)b[4]<<16)|((uint32_t)b[5]<<8)|b[6];
+    m->sdc_resp[3] = ((uint32_t)b[0]<<16)|((uint32_t)b[1]<<8)|b[2];
+}
+
+/* copy `len` bytes from the card image at byte offset `src` to DRAM at `dst`. */
+static void sdc_dma_to_dram(machine_t *m, uint32_t dst, uint32_t src, uint32_t len)
+{
+    uint8_t *d = machine_dram_ptr(m, dst);
+    uint32_t i;
+    if (!d) return;
+    for (i = 0; i < len; i++)
+        d[i] = (m->sd_img && src + i < m->sd_size) ? m->sd_img[src + i] : 0;
+}
+
+/* Deliver a small read-data block for the command: DMA to DRAM if TRAN_MODE
+ * selects DMA, else stage it for PIO DATA_PORT reads (BUFF_READ_RDY). */
+static void sdc_data_block(machine_t *m, const uint8_t *buf, uint32_t len,
+                           uint32_t tran_mode)
+{
+    if (tran_mode & 1) {                 /* DMA */
+        uint8_t *d = machine_dram_ptr(m, m->sdc_reg[0]);
+        if (d) { uint32_t i; for (i = 0; i < len; i++) d[i] = buf[i]; }
+        m->sdc_int_stat |= SDCI_TRAN_COMPLETE;
+    } else {                             /* PIO via DATA_PORT */
+        if (len > sizeof m->sdc_data) len = sizeof m->sdc_data;
+        memcpy(m->sdc_data, buf, len);
+        m->sdc_data_len = len; m->sdc_data_pos = 0;
+        m->sdc_int_stat |= SDCI_BUF_RD_RDY;
+    }
+}
+
+/* Execute an SD command written to REG_SDC_CMD. */
+static void sdc_do_cmd(machine_t *m, uint32_t cmd_reg, uint32_t tran_mode)
+{
+    uint32_t idx = (cmd_reg >> 8) & 0x3f;
+    uint32_t arg = m->sdc_reg[2];                 /* 0x08 ARG */
+    int acmd = m->sdc_acmd;
+    m->sdc_acmd = 0;
+    m->sdc_resp[0] = 0x00000900;                  /* default R1: card status ready(tran) */
+    m->sdc_int_stat |= SDCI_CMD_COMPLETE;
+
+    if (acmd) {
+        switch (idx) {
+        case 41: /* ACMD41 SD_SEND_OP_COND: OCR, ready + CCS=1 (SDHC/block addr) */
+            m->sdc_resp[0] = 0xC0FF8000u; return;
+        case 6:  /* ACMD6 SET_BUS_WIDTH */ return;
+        case 51: { /* ACMD51 SEND_SCR: 8-byte SCR (SD spec v2, 1+4-bit bus) */
+            static const uint8_t scr[8] = {0x02,0x35,0x80,0x00,0x00,0x00,0x00,0x00};
+            sdc_data_block(m, scr, 8, tran_mode); return; }
+        case 13: { /* ACMD13 SD_STATUS: 64 bytes, zero-filled */
+            uint8_t z[64]; memset(z, 0, sizeof z);
+            sdc_data_block(m, z, 64, tran_mode); return; }
+        default: return;
+        }
+    }
+
+    switch (idx) {
+    case 0:  /* GO_IDLE */ break;
+    case 8:  /* SEND_IF_COND: R7 echoes voltage(0x1)+check pattern(0xAA) */
+        m->sdc_resp[0] = arg & 0xFFF; break;
+    case 55: /* APP_CMD */ m->sdc_acmd = 1; break;
+    case 2: { /* ALL_SEND_CID: R2 */
+        static const uint8_t cid[16] = {0x03,'S','D','E','M','U','0','0',
+                                        0x10,0x12,0x34,0x56,0x78,0x01,0x40,0x01};
+        sdc_resp_r2(m, cid); break; }
+    case 3:  /* SEND_RELATIVE_ADDR: R6 = (RCA<<16)|status */
+        m->sdc_rca = 1; m->sdc_resp[0] = (m->sdc_rca << 16) | 0x0500; break;
+    case 9: { /* SEND_CSD: R2, CSD v2 (SDHC), C_SIZE=0x1FFF => 4GB */
+        static const uint8_t csd[16] = {0x40,0x0E,0x00,0x32,0x5B,0x59,0x00,0x00,
+                                        0x1F,0xFF,0x7F,0x80,0x0A,0x40,0x00,0x01};
+        sdc_resp_r2(m, csd); break; }
+    case 7:  /* SELECT_CARD: R1b */ break;
+    case 16: /* SET_BLOCKLEN */ break;
+    case 12: /* STOP_TRANSMISSION: R1b */ break;
+    case 13: /* SEND_STATUS: R1 */ break;
+    case 6: { /* SWITCH_FUNC: R1 + 64-byte switch-status block */
+        uint8_t sw[64]; memset(sw, 0, sizeof sw);
+        sw[13] = 0x01;                    /* function group 1 = high-speed supported */
+        sw[16] = 0x01;                    /* selected function group 1 = 1 */
+        sdc_data_block(m, sw, 64, tran_mode); break; }
+    case 17: case 18: { /* READ_SINGLE/MULTIPLE_BLOCK: DMA from card image */
+        uint32_t blkcnt = (idx == 17) ? 1u : (m->sdc_reg[1] & 0xffff);   /* 0x06 BLK_COUNT */
+        uint32_t blksz  = (m->sdc_reg[1] >> 16) & 0xfff;                 /* 0x04 BLK_SIZE low 12b */
+        uint32_t dma    = m->sdc_reg[0];                                 /* 0x00 DMA_ADDR */
+        if (!blksz) blksz = 512;
+        if (!blkcnt) blkcnt = 1;
+        /* CCS=1 (SDHC) => ARG is a block number */
+        sdc_dma_to_dram(m, dma, arg * 512u, blkcnt * blksz);
+        m->sdc_int_stat |= SDCI_TRAN_COMPLETE;
+        break; }
+    default: break;
+    }
+}
+
+static uint32_t sdc_read(machine_t *m, uint32_t off)
+{
+    switch (off & 0xfc) {
+    case 0x10: return m->sdc_resp[0];
+    case 0x14: return m->sdc_resp[1];
+    case 0x18: return m->sdc_resp[2];
+    case 0x1c: return m->sdc_resp[3];
+    case 0x20: { /* DATA_PORT: serve staged PIO read data, word at a time */
+        uint32_t v = 0, i;
+        for (i = 0; i < 4; i++)
+            if (m->sdc_data_pos < m->sdc_data_len)
+                v |= (uint32_t)m->sdc_data[m->sdc_data_pos++] << (24 - i * 8);
+        if (m->sdc_data_pos >= m->sdc_data_len) {  /* buffer drained: transfer done */
+            m->sdc_int_stat &= ~SDCI_BUF_RD_RDY;
+            m->sdc_int_stat |= SDCI_TRAN_COMPLETE;
+        }
+        return v; }
+    case 0x24: /* STAT: card inserted, stable, CD pin low(present); not busy */
+        return (m->sd_img ? (SDCS_CARD_INS | SDCS_STABLE | SDCS_CD_PIN) : 0);
+    case 0x2c: { /* CLK_CTRL(0x2c)/TIMEOUT(0x2e)/SW_RESET(0x2f) */
+        uint32_t w = m->sdc_reg[0x2c >> 2];
+        uint32_t clk = (w >> 16) & 0xffff;      /* halfword at 0x2c = bits[31:16] */
+        if (clk & 0x1) clk |= 0x2;              /* INCLK_ENABLE -> INCLK_STABLE */
+        /* SW_RESET (byte 0x2f = bits[7:0]) is self-clearing: report reset done */
+        return (clk << 16) | (w & 0x0000ff00u); }
+    case 0x30: return m->sdc_int_stat;
+    case 0xfc: return 0x00000001u;              /* HOST_VER (0xfe) small nonzero */
+    default: return m->sdc_reg[(off & 0xfc) >> 2];
+    }
+}
+
+static void sdc_write(machine_t *m, uint32_t off, uint32_t val, int size)
+{
+    uint32_t widx = (off & 0xfc) >> 2, w = m->sdc_reg[widx];
+    if (size == 4) w = val;
+    else if (size == 2) { if (off & 2) w = (w & 0xffff0000u) | (val & 0xffff);
+                          else         w = (w & 0x0000ffffu) | ((val & 0xffff) << 16); }
+    else { int sh = (3 - (off & 3)) * 8; w = (w & ~(0xffu << sh)) | ((val & 0xffu) << sh); }
+    m->sdc_reg[widx] = w;
+
+    if ((off & 0xfc) == 0x30)                    /* INT_STAT: write-1-to-clear */
+        { m->sdc_int_stat &= ~val; m->sdc_reg[widx] = 0; return; }
+    /* CMD register is the halfword at 0x0e (low 16b of word 0x0c). A write that
+     * touches 0x0e (halfword there, or a word write to 0x0c) issues the command. */
+    if (((off == 0x0e) && size == 2) || ((off & 0xfc) == 0x0c && size == 4)) {
+        uint32_t word = m->sdc_reg[0x0c >> 2];
+        sdc_do_cmd(m, word & 0xffff /*CMD @0x0e*/, (word >> 16) & 0xffff /*TRAN_MODE @0x0c*/);
+    }
+}
+
 static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
 {
     *fault = 0;
@@ -1305,6 +1473,19 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         if (size == 1) return (v >> ((3 - (addr & 3)) * 8)) & 0xFF;
         return (v >> ((addr & 2) ? 0 : 16)) & 0xFFFF;
     }
+    /* SD host controller (0xa0001100..0xa00011ff): active only when a card image
+     * is loaded; otherwise the region stubs to 0 (SDC_STAT card-inserted bit clear
+     * => no card), preserving the card-less behaviour. */
+    if (m->sd_img && addr >= SDC_BASE_ADDR && addr < SDC_BASE_ADDR + 0x100u) {
+        uint32_t off = addr - SDC_BASE_ADDR;
+        uint32_t v = sdc_read(m, off & 0xfc);
+        if (getenv("CT952_SDCTRACE"))
+            fprintf(stderr, "[SDC] rd %08x -> %08x (sz%d) pc=%08x icount=%llu\n",
+                    addr, v, size, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        if (size == 4) return v;
+        if (size == 1) return (v >> ((3 - (addr & 3)) * 8)) & 0xFF;
+        return (v >> ((addr & 2) ? 0 : 16)) & 0xFFFF;
+    }
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 0, 0);
         return 0;                        /* FCR/SDC/NFC stub */
@@ -1669,6 +1850,13 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         ehci_write(m, off, val);
         return;
     }
+    if (m->sd_img && addr >= SDC_BASE_ADDR && addr < SDC_BASE_ADDR + 0x100u) {
+        if (getenv("CT952_SDCTRACE"))
+            fprintf(stderr, "[SDC] wr %08x <- %08x (sz%d) pc=%08x icount=%llu\n",
+                    addr, val, size, m->cpu.pc, (unsigned long long)m->cpu.icount);
+        sdc_write(m, addr - SDC_BASE_ADDR, val, size);
+        return;
+    }
     if (addr >= 0xA0000000u && addr < 0xA0010000u) {
         log_access(m, addr & ~3u, 1, val);
         return;
@@ -1842,6 +2030,31 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
     memset(m->bram, 0, 0x10000u);
     m->flash_size = flash_size;
     m->uart_echo = 1;
+
+    /* Optional SD card image (CT952_SDCARD=<path>): a FAT image presented as an
+     * inserted card by the SD host controller model, so the media manager
+     * enumerates it and the browse UI populates (§12.94). */
+    m->sd_img = NULL; m->sd_size = 0;
+    {
+        const char *e = getenv("CT952_SDCARD");
+        if (e && *e) {
+            FILE *sf = fopen(e, "rb");
+            if (sf) {
+                fseek(sf, 0, SEEK_END); long sz = ftell(sf); fseek(sf, 0, SEEK_SET);
+                if (sz > 0) {
+                    m->sd_img = (uint8_t *)malloc((size_t)sz);
+                    if (m->sd_img && fread(m->sd_img, 1, (size_t)sz, sf) == (size_t)sz)
+                        m->sd_size = (uint32_t)sz;
+                    else { free(m->sd_img); m->sd_img = NULL; }
+                }
+                fclose(sf);
+                fprintf(stderr, "[SDCARD] loaded %s (%u bytes) as inserted card\n",
+                        e, m->sd_size);
+            } else {
+                fprintf(stderr, "[SDCARD] could not open %s\n", e);
+            }
+        }
+    }
 
     /* display field-rate divider for the VSYNC IRQ (see machine_cycle) */
     {

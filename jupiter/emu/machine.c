@@ -1603,7 +1603,15 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
      * (0x80000a3c <- 1) so the status read reports "done". */
     if (getenv("CT952_JPUENG")) {
         if (addr == 0x80000a20u) m->eng_src = val;
-        if (addr == 0x80000a3cu && (val & 1u)) m->eng_done = 1;
+        if (addr == 0x80000a3cu && (val & 1u)) {
+            m->eng_done = 1;
+            if (getenv("CT952_ENGTRACE")) {
+                uint32_t bt[32]; int nb = sparc_win_backtrace(&m->cpu, bt, 32), bi;
+                fprintf(stderr, "[ENGGO] src=%08x pc=%08x winframes:", m->eng_src, m->cpu.pc);
+                for (bi = 0; bi < nb; bi++) fprintf(stderr, " %08x", bt[bi]);
+                fprintf(stderr, " icount=%llu\n", (unsigned long long)m->cpu.icount);
+            }
+        }
     }
 
     /* CT952_UITRACE: watch the OSD active-UI-record pointer (0x40020ec8) and the

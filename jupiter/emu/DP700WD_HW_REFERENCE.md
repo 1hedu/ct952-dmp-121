@@ -980,3 +980,30 @@ real decoded result, not just a flag) and the screen is unchanged (COBY splash).
 next phase is to emulate the engine: decode the JPEG at 0x80000a20 and deliver its result via the
 0x80000a30 status bits and/or the 0x80010200 dest, matching what info.a reads, so the photo is
 accepted and auto-played. That is a scoped but non-trivial hardware-block emulation task.
+
+### 12.101 The 0x80000800 engine is shared with the display path — minimal model isn't faithful
+
+Deepened §12.98-100. Key correction to earlier guesses (which were over-interpretations of single
+byte-writes, now retracted): the value-8 at 0x40036ee0 is an OSD element descriptor, and the
+value-0x10 at 0x40036e73 is an incidental struct-copy byte (pc 0x6f1a0 is a field-copy loop) —
+NEITHER is a MediaInfo state, so there is no evidence the parse "rejected" the photo.
+
+Solid new facts:
+- The engine block layout matches the modeled GPU 2-D engine (SRC/DEST at offsets 0x94/0x98):
+  0x80000800 is a second instance of the same 2D/JPEG/scaler engine (modeled one is at
+  0xa0002880). It is **shared with the display path** — 0x80000894 is also written (0x1000) at
+  pc 0x851bc during normal demo operation, independent of the card.
+- info.a reads back ONLY the status (0x80000a30, once) from the engine — never the raw JPEG, the
+  0x80010000 dest region, or any other engine register. So the parse's use of the engine needs
+  only a correct completion/status, not a decoded-pixel readback.
+- GO is issued ONCE for the card (src=0x401ec000, caller 0x8323c→0x9b9ac). With the minimal
+  "done" model the 0x9bcb4 spin clears, but the flow then reaches a media/display state machine
+  at 0x70240 (gated on 0x40039f60 / 0x40039f24) that does not advance, AND the demo slideshow
+  stops — i.e. a card thread now spins in the eCos scheduler/window-flush (0x4001d050). So the
+  minimal model trades one spin for a downstream one; a faithful model must reproduce the engine's
+  real per-op semantics (busy→done transition per op, shared cleanly with the display path),
+  not a latched permanent "done".
+
+**Status:** root cause = the 0x80000800 2D/JPEG engine (verified, mapped). A faithful photo
+display needs (a) proper per-op engine semantics, then (b) resolving the 0x70240 media/display
+state machine that gates auto-play. Both scoped; neither done. Model stays gated (CT952_JPUENG).

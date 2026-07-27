@@ -1430,6 +1430,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
          * progress (0x3f) once the engine has been kicked (GO at 0x80000a3c). */
         if (off == 0x0a30u && m->eng_done)
             v = (v & ~(0x3fu << 16)) | (0x3fu << 16);
+        if (getenv("CT952_ENGTRACE") && ((off >= 0x0a00u && off < 0x0a80u)
+                                         || (addr >= 0x80010000u && addr < 0x80011000u))) {
+            static int er; if (er < 120) {
+                fprintf(stderr, "[ENGrd] %08x=%08x pc=%08x icount=%llu\n",
+                        addr, v, m->cpu.pc, (unsigned long long)m->cpu.icount); er++; } }
         /* IR-injection trace (CT952_IRTRACE): log the firmware reading the IR
          * data/status regs and the PROC1-2nd pending -- proves the injected IR
          * interrupt drove the real ISR/DSR (INPUT_RemoteScan) path (10.38). */
@@ -1596,8 +1601,10 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
      * bits[16:21] until it exceeds 0x1f. Without a model the field stays 0 and
      * the parse spins forever (0x9bcb4). Capture the source and the GO
      * (0x80000a3c <- 1) so the status read reports "done". */
-    if (addr == 0x80000a20u) m->eng_src = val;
-    if (addr == 0x80000a3cu && (val & 1u)) m->eng_done = 1;
+    if (getenv("CT952_JPUENG")) {
+        if (addr == 0x80000a20u) m->eng_src = val;
+        if (addr == 0x80000a3cu && (val & 1u)) m->eng_done = 1;
+    }
 
     /* CT952_UITRACE: watch the OSD active-UI-record pointer (0x40020ec8) and the
      * __bPOWERONMENUInitial gate (0x40023a10). Logs every UI-mode transition and
@@ -2397,7 +2404,23 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                  if (at && *at == '@') irkey_at = strtoull(at + 1, NULL, 0); }
         else irkey_done = 1;
     }
+    static long snap_at = -2; static int snap_done = 0;
+    if (snap_at == -2) { const char *e = getenv("CT952_SNAP");
+                         snap_at = e ? (long)strtoull(e, NULL, 0) : -1; }
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
+        /* One-shot call-chain snapshot (CT952_SNAP=<icount>): dump the winframe
+         * backtrace + recent-PC ring once past <icount> -- names the info.a
+         * functions in the post-engine recursion loop (§12.98). */
+        if (snap_at >= 0 && !snap_done && m->cpu.icount > (uint64_t)snap_at) {
+            uint32_t bt[32]; int nb = sparc_win_backtrace(&m->cpu, bt, 32), bi, k;
+            fprintf(stderr, "[SNAP] pc=%08x winframes:", m->cpu.pc);
+            for (bi = 0; bi < nb; bi++) fprintf(stderr, " %08x", bt[bi]);
+            fprintf(stderr, "\n[SNAP] recent-PC ring:");
+            for (k = 20; k < 64; k++)
+                fprintf(stderr, " %08x", m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63]);
+            fprintf(stderr, " icount=%llu\n", (unsigned long long)m->cpu.icount);
+            snap_done = 1;
+        }
         /* One-shot CC event-flag poke (CT952_CCEVENT=<icount>): the CC/boot
          * thread spins in a wait-for-event dispatcher polling the flag object at
          * 0x40026EA4 for bit 0x1000 (peek-and-clear via flash 0x66a0), redrawing

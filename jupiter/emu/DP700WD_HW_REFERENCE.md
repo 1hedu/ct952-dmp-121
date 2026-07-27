@@ -923,3 +923,31 @@ stall). So 0x80000800 is the JPEG parse/decode engine info.a uses to inspect eac
 modeling its completion is what lets the parse continue. Next: confirm the parse now reaches
 MediaInfo→READY and decodes the card photo (long run in progress), and refine the engine so any
 output the firmware reads back is correct.
+
+### 12.99 Engine model advances the parse but does NOT display the photo — gated as opt-in
+
+Honest status after §12.98. Modeling the 0x80000800 engine's completion removes the `0x9bcb4`
+spin, but the on-screen result is UNCHANGED: the card boot still shows the COBY splash (the same
+loading screen it showed before, §12.94) — no photo decode, no visual progress. What changed is
+purely internal (the parse runs further). Do not read the splash as progress.
+
+Findings on the engine consumer:
+- The firmware reads **only** 0x80000a30 (status) back from the engine — once, at the spin
+  (`0x9bca0`), value 0x003f0000 from the model. It never reads the raw JPEG at 0x401ec000
+  (RDWATCH=0), nor the 0x80010000 region (the 0x80000a34<-0x80010200 target). So info.a relies
+  entirely on the engine to process the photo and takes its result from... a channel not yet
+  located (likely a DRAM output buffer set by the sibling register writes at 0x9b900, or extra
+  bits of 0x80000a30 that the model zeroes).
+- With the faked "done", info.a appears to REJECT the photo: MSCAN shows value 0x10 (MEDIA_WRONG)
+  written to 0x40036e73/0x40036f53 (pc 0x6f1a0) right after the parse, and 02/03.JPG are never
+  enumerated (no further SD reads). A spurious/empty engine result → wrong-media.
+- Post-engine the CPU runs the eCos scheduler / CC-worker idle loop (window-flush at 0x4001d050
+  driven from 0x70240→0x596a0), i.e. idle, not a hard hang.
+
+Conclusion: the 0x80000800 JPEG engine is the verified root-cause of the long-standing card
+stall (§12.49-69 keystone), but a *faithful* fix requires emulating what it actually produces
+(decoded dimensions/validity) so info.a accepts the photo — the minimal "done" is not enough and
+sends the firmware down the wrong-media path. Model is therefore **gated behind CT952_JPUENG** so
+the default emulator stays honest (spins on the unmodeled engine). Next: locate the engine's real
+output channel (disassemble the 0x9b800/0x9b900 setup that ran before the GO) and produce a valid
+decode result, then re-check whether info.a accepts the card and auto-plays.

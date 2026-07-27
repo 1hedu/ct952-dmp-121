@@ -1847,7 +1847,7 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
           if (ms_at == -2) { const char *e = getenv("CT952_MSCAN");
                              ms_at = e ? (long)strtoull(e, NULL, 0) : -1; }
           if (ms_at >= 0 && size == 1 && m->cpu.icount > (uint64_t)ms_at
-              && ((val&0xff)==1||(val&0xff)==2||(val&0xff)==4||(val&0xff)==8||(val&0xff)==0x10)
+              && ((val&0xff)>=1 && (val&0xff)<=4)
               && addr >= 0x40020000u && addr < 0x40040000u) {
               static int msn; if (msn < 4000) {
                   fprintf(stderr, "[MSCAN] %08x=%u pc=%08x icount=%llu\n",

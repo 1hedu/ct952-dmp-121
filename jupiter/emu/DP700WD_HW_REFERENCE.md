@@ -1094,3 +1094,32 @@ the firmware still does neither on its own. The remaining *faithful* gap is prec
 auto-play trigger that would (1) load the full photo into the decode buffer and (2) kick the JPU —
 gated on media READY, which needs the info.a incremental enumeration to finish all files (it
 currently stops after item 1) and raise the parse-OK status. Probe gated (not default).
+
+### 12.106 Last-mile: unfakeable proof set up; recognition never reports READY_MEDIA (honest wall)
+
+Proof harness: rebuilt the card image with a DISTINCT test JPEG at sector 67 (bold color bands +
+"SD-CARD / TEST IMAGE / not in demo album" text + cyan ellipse — nothing in the demo album). The
+CT952_CARDSHOW probe renders exactly that image (decode #2: 640x360 from 0x401ec000) — so any
+faithful render of it is unforgeable proof the SD path ran. Saved card_test_probe.png. Also
+confirmed the demo slideshow is genuinely faithful (clean no-crutch boot renders a barn/Tetons
+photo cycling, no STAGE_PHOTO/CARDSHOW) — the "faithful photo render" milestone is real; the card
+photos are just the same album images, so the card path adds a code path, not a new picture (hence
+the distinct test image).
+
+Last-mile findings:
+- The media-monitor thread stays alive after the parse (card-detect STAT polled every 200ms out to
+  54M, sees card present) — it is NOT starved. But NO media-state byte transitions after the parse
+  (no value-3/READY write in 0x40020000-0x40040000 past 31M). So the async USBSRC/CC-worker parse
+  completes but never reports READY_MEDIA back to the manager -> no MM auto-play -> the display
+  worker (0x830c8, polls 0x9b2cc for items) gets no "display photo" item -> splash stays.
+- The recognition/READY gate hinges on the 0x80000800 engine's RESULT, but its output contract is
+  opaque: dest 0x80010200 is unmapped (io array is only 0x8000), and info.a reads back ONLY the
+  status reg 0x80000a30 (which the model already reports done). So faithfully satisfying recognition
+  needs the engine's real decoded result (dimensions/valid), whose delivery channel is not
+  determinable from the trace alone.
+
+**Honest wall:** the faithful card auto-play is blocked on the 0x80000800 engine's output semantics
+(a hardware JPEG header/thumbnail block) which can't be reversed from execution traces alone —
+it needs hardware docs or the info.a/USBSRC source. Everything else is proven end-to-end (SD read,
+FAT, full-file load, decode, scanout — via the distinct-image probe). Diagnostics all gated;
+default emulator honest.

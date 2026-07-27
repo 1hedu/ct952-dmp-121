@@ -755,3 +755,38 @@ to end (input → firmware UI handler → OSD redraw → panel scan-out). The fu
 thumbnail/menu grid (vs this status bar) would appear in the browse UI, which needs a
 browsable media source; that (and any OSD-geometry widening past the 24 KB clamp for a
 full-screen menu) is the only remaining polish. New debug knob: `CT952_OSD_ONLY`.
+
+### 12.94 ★★ SD-CARD MODEL — the firmware inits a modeled SD card and enumerates its FAT filesystem; card presence changes the on-screen UI
+
+Built a standard SD Host Controller model (SDHC spec, base 0xa0001100) backed by a FAT image
+(`CT952_SDCARD=<path>`; image built by `mkfatimg.py`). Active only when a card image is loaded,
+else the region stubs to 0 (card-less behaviour preserved). Confirmed the config from
+`platform.h:27` (`CT909P_IC_SYSTEM`) → native SDC card reader; driver bodies are precompiled in
+`card.a`/`sdc.o` (built from `/working/DMP_121_952/card/sdc.c`), register map = `ctkav_sdc.h`.
+
+**Model:** `SDC_STAT` reports card-inserted/stable/CD-pin (0x24); `SW_RESET` (0x2f) self-clears;
+`CLK_CTRL` (0x2c) reports internal-clock stable; responds to the full init chain
+CMD0 / CMD8(R7) / ACMD41(OCR, CCS=1) / CMD2(CID R2) / CMD3(RCA R6) / CMD9(CSD v2 R2) / CMD7 /
+ACMD6 / CMD6 / ACMD51(SCR) / CMD13; **CMD17/18 block reads DMA** straight into DRAM from the
+image (`ARG`=block#, ×512), small reads (SCR/switch/status) via **PIO** DATA_PORT+BUFF_READ_RDY;
+drives the INT_STAT CMD_COMPLETE / TRAN_COMPLETE handshake.
+
+**Wake path (the make-or-break, confirmed):** with a card present, `CC_DVD_MainLoop`'s
+`MEDIA_MonitorStatus` (every 200 ms, cc.c:1049) posts `USBSRC_CMD_CHECK_DEVICE`, waking
+`USBSRC_Thread` (usbsrc.c:252, blocked on flag `_fUSBSRCCmdd`), which brings up the SD
+controller and reads the card. So the media monitor DOES run — the card-less menu was empty
+purely for lack of media, not because the monitor was dead.
+
+**Verified end to end (runtime, `CT952_SDCTRACE`):** SW_RESET self-clear fix removed a 3.7 M-poll
+hang; PIO DATA_PORT fix removed a 2.9 M INT_STAT-poll hang; then the firmware runs the whole
+init chain and **CMD18-reads the FAT**: block 0 (BPB) → blocks 32-35 (root directory — all three
+`01/02/03.JPG` 8.3 entries) → blocks 67-98 (01.JPG's data). i.e. it mounts the FS, enumerates
+the root, finds the JPEGs, and reads the first one. **The OSD then changes from the empty gray
+box to a full blue/white dialog** — proof the card-present path drives a different UI.
+
+**Where it stops (next step):** the blue screen is a centered white-text dialog, not yet the
+interactive photo browser; KEY_NEXT/ENTER injected on it don't advance to reading 02/03.JPG or
+decoding a card photo to the video plane (only the built-in demo 0x401dc000 decodes). So the
+storage+enumeration layer is faithful and complete; the remaining work is the UI transition from
+this post-detect dialog into the photo browser/slideshow of the card's files. New knobs:
+`CT952_SDCARD`, `CT952_SDCTRACE`; helper `mkfatimg.py`.

@@ -795,3 +795,32 @@ what the splash waits on after enumeration (a slideshow/auto-play trigger, a "ph
 event, or a further read the model isn't satisfying) and model it, then wire the JPU decode of a
 card JPEG (from its DMA'd DRAM buffer, e.g. 0x401ec000) through the existing decode path. New
 knobs: `CT952_SDCARD`, `CT952_SDCTRACE`; helper `mkfatimg.py`.
+
+### 12.95 Card-photo stall pinned to the CC-event worker (the known keystone); SD DMA verified byte-correct
+
+Pushed on the splash→photo transition, re-reading the verified facts first to avoid circling:
+- The `0x40026e9c`/`0x40026ea4` flag-waits the media thread cycles on are **normal idle
+  polling** (§12.75), NOT the stall — do not chase them.
+- The hot `0x6c3xx` region is the demo slideshow's own JPU-kick chain (`0x6c500`, §12.79),
+  not the card path.
+
+New, verified this turn:
+- **SD DMA is byte-correct.** Dumped `0x401ec000` after the block-67 read: it is 01.JPG's exact
+  bytes (`FFD8FFE0…JFIF…Exif`), matching `950_Files/01.jpg` for the full 16 KB. So the storage
+  path delivers valid JPEG data; the stall is not a data-corruption bug.
+- **The card read runs in the CC-event worker.** Backtrace at the CMD18 issue PC `0xcb11c`
+  (`SDC_ReadSector`): `0xcb11c ← 0xcb508 ← 0x16e2c ← 0x190b4 ← 0xd3dbc/0xd179c/0xcfdd0/0xd1310/
+  0xcce48/0xd4d9c/0xd4e18` (card.a/info.a FS stack) `← 0x6308 ← 0x74cc` (the CC worker loop:
+  `call 0x61b4; call 0x5969c` yield; dispatch). So parsing/loading the card is driven by the
+  same CC-event worker that drives the demo slideshow.
+- After reading 01.JPG's header the worker handler returns and yields; the next step (read the
+  rest / decode / advance the MEDIA_Management state) needs a follow-on CC event that doesn't
+  advance it — the firmware never points the JPU at the card buffer (`0x401ec000` never appears
+  as `jpeg_src`, `CT952_JPEGTRACE`), so no card-photo decode is ever kicked.
+
+**Honest verdict:** the SD-controller + FAT model is complete and byte-faithful (card mounts,
+files enumerate, 01.JPG delivered correctly). The card-photo *display* transition sits at the
+**CC-event-worker keystone** (§12.49-69) — the hardest long-standing item — reached now from the
+card side. Cracking it means reversing the precompiled `info.a`/`card.a` parse/auto-play state
+machine to find which CC event should advance it after the header read, and what should post
+that event. That is a distinct, research-grade effort, not a near-term finish.

@@ -1171,3 +1171,30 @@ a web of DSP-state (DAT_4003996c) + command flags.
 but it is routed away from the recognize->`FUN_0001b48c`->`FUN_0001b5c8` (parser-start, DSP mode 9)
 path by `DAT_40022f5e==1`. The remaining work is tracing what sets DAT_40022f5e=1 (pc 0x24e34) and
 the `FUN_00022494` / `_DAT_4002fb52` gate — all now tractable in decompiled C via ghidra_re/.
+
+### 12.109 ★★ COMPLETE decompiler model: card mounts + reaches media-select menu by design; auto-parse gated on classify==playable
+
+Fully traced the card media flow in Ghidra C. The picture is now coherent and complete:
+
+- Recognize `FUN_0001f2e4` calls classifier `FUN_000180d4(src, cmd)`. For the pre-mount pass the
+  card classifies as **unknown/non-playable** (the file-info table `*(0x40022590[src]+0x10)` is
+  empty before enumeration; classify returns 0xffff / low byte != 1).
+- So `FUN_0001f2e4` takes the classify!=1 branch: `FUN_00024d0c` (File Manager MOUNT — prints
+  "...SD...", enumerates via FMLISTMultivolume, sets `DAT_40022f5e=1`) then `OSD_ChangeUI(7)`.
+  This is the **media-select menu** (the mode-8 dialog actually on screen). By design: unknown
+  card -> mount -> menu.
+- The later parser command **0x32 (CMD_START)** arrives AFTER mount (DAT_40022f5e=1), so
+  `FUN_0001f4d0` routes it to `FUN_00022494` (post-mount dispatcher). For cmd 0x32 that function
+  remaps commands (->0x82/0x4d), toggles DSP-state flags, but **never calls the parser-enable**
+  (`FUN_0001b48c`/`FUN_0001b5c8`). So the post-mount path does not start the parser.
+- Parser-enable (`DAT_4003274a=1`, DSP event7->mode9) therefore only comes from the *pre-mount*
+  recognize when classify==1 (immediately-playable). The card never hits that.
+
+**So the card correctly boots to the MEDIA_SELECT menu** — not a bug in the parse chain; it is the
+firmware's unknown-media path. The remaining faithful work is one of:
+  (a) the menu should list the card (needs the mounted file list surfaced into the menu's source
+      list) so the user can select it -> then parse+play, or
+  (b) determine whether real hardware auto-selects/auto-plays a photo card (a config/BOOK-type
+      classify that returns "playable" pre-mount), i.e. why classify != 1 here.
+Both are now fully decompilable via ghidra_re/. This supersedes the "parse never raises READY"
+framing (§12.96): the parse is never *started* because the card takes the menu path by design.

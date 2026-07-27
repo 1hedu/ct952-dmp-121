@@ -1123,3 +1123,33 @@ Last-mile findings:
 it needs hardware docs or the info.a/USBSRC source. Everything else is proven end-to-end (SD read,
 FAT, full-file load, decode, scanout — via the distinct-image probe). Diagnostics all gated;
 default emulator honest.
+
+### 12.107 ★★ GHIDRA-VERIFIED full card-parse call chain — the gap is the parse-decision is never invoked
+
+Using Ghidra (ghidra_re/), decompiled the entire card→display trigger chain to C. Definitive
+(not hand-disassembly). The chain that SHOULD fire on card-present:
+
+1. `FUN_0001b5c8` = PARSER-start (INFOFILTER_TriggerParsingInfo): sets `DAT_4003274a=1`
+   (parser-enable), `DAT_40022f06=0`, and posts DSP **event 7** via `FUN_0005abb4(7)`.
+2. `FUN_0005abb4` = DSP/buffer-mode SM (0x5abb4, the §12.68 keystone). In C: event 7 **remaps to
+   mode 9 iff `DAT_4003274a!=0`**. Mode 9's case wires the card buffer `0x401ec000` + decode buffer
+   `0x401dc000` and posts a DSP command `FUN_0005b028(0x42)`. `DAT_40039949` is the live mode.
+3. `FUN_0001b5c8` is called ONLY from `FUN_0001b48c` (parse-decision): parses iff
+   `DAT_40032780!=0 || FUN_000297f0()` (playable-file check, walks the file list `DAT_40032850`
+   via `FUN_000255b4`); else does `OSD_ChangeUI(7)` (menu).
+4. `FUN_0001b48c` is called from `FUN_0001f2e4` (media-recognize dispatch): calls the classifier
+   `FUN_000180d4(src, cmd=DAT_4002fb2a)`; only when it returns 1 (bit 0x100 set — happens for
+   cmd 0x32/0x41) does it reach `FUN_0001b48c`; otherwise `OSD_ChangeUI(7)`.
+
+**Empirically (SMWATCH, card boot with JPUENG):**
+- `DAT_4003274a` (parser-enable) is **only ever written 0, never 1** → `FUN_0001b5c8` never runs.
+- Both branch markers of `FUN_0001b48c` (`DAT_40022f81` for menu, `DAT_4003274a` for parse) are
+  never set → **`FUN_0001b48c` is never called at all**.
+- `DAT_40039949` (DSP mode) reaches 7 once (10.8M) but never 9 (parse mode).
+
+**So the gap, precisely:** the card-present media event never drives `FUN_0001f2e4` down the
+"recognized playable, start parse" path (cmd 0x32/0x41 with classifier=1). Without that,
+`FUN_0001b48c`→`FUN_0001b5c8` never fire, the DSP SM never enters mode 9, the parser never runs,
+media never reaches READY, and the boot parks at the MEDIA_SELECT menu / splash. The next thread:
+who calls `FUN_0001f2e4`, and what command/classifier result the card produces (`FUN_000180d4`,
+`FUN_000255b4` file list) — all now decompilable in one place.

@@ -1069,3 +1069,28 @@ specific event object (0x4003d6a8). Getting an actual photo on screen requires r
 consumer of that event through the DSP/MM display machinery (0x70240 SM, main-JPU kick) — a
 sustained multi-layer effort across info.a + the eCos event system, not a near-term finish. All
 diagnostics gated/landed; default emulator remains honest (spins on the unmodeled engine).
+
+### 12.105 ★ CARD PHOTO RENDERS through the real pipeline (diagnostic probe) — remaining gap isolated to the auto-play trigger
+
+Two clean facts nailed the decode model:
+- **0x2a20 (JPU bit-stream source) is NEVER written** in either the card or the no-card boot. The
+  emulator defaults jpeg_src=0x401dc000 and decodes whatever is staged there on a JPU kick. So the
+  firmware displays a photo by DMA'ing it into the fixed decode buffer 0x401dc000, not by
+  repointing the source.
+- Buffer dump at 40M (card boot): 0x401dc000 holds the COBY splash (a valid 150-dpi JPEG),
+  0x401ec000 holds 01.JPG (byte-identical to 950_Files/01.jpg). The card photo is never copied
+  into the decode buffer -> the splash stays on screen.
+
+**Diagnostic probe CT952_CARDSHOW=<icount>:** stage the FULL 01.JPG (card sector 67, 64KB — info.a
+only loads the first 16KB header, which is why a decode of the parked buffer truncates) into
+0x401ec000, point jpeg_src there, force one machine_maybe_jpeg_decode. Result: **JPEG decode #2:
+720x405 from 0x401ec000** and the framebuffer shows the card photo (a pink rose) rendered correctly
+through the real JPU + scanout path. Saved: jupiter/emu/card_photo_probe.png.
+
+**What this proves (and doesn't):** the entire pipeline downstream of the auto-play trigger — SD +
+FAT + full-file load + JPEG decode + tiled-YUV writeback + scanout — handles the card image
+end-to-end. It is NOT the faithful boot: the probe force-loads the full file and forces the decode;
+the firmware still does neither on its own. The remaining *faithful* gap is precisely the MM
+auto-play trigger that would (1) load the full photo into the decode buffer and (2) kick the JPU —
+gated on media READY, which needs the info.a incremental enumeration to finish all files (it
+currently stops after item 1) and raise the parse-OK status. Probe gated (not default).

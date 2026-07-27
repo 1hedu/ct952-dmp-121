@@ -762,6 +762,16 @@ static void io_write(machine_t *m, uint32_t off, uint32_t v)
          * as a bit-stream base; ignore other writes (control/config aliases). */
         if ((v & 0xF0000000u) == 0x40000000u) m->jpeg_src = v;
         m->biu_drained = 0;
+        /* JPU-source selection trace (CT952_JSRCBT): who programs the display
+         * photo pointer, and its caller chain -- to find the "current photo"
+         * selection that picks 0x401dc000 (demo) but never the card 0x401ec000. */
+        if (getenv("CT952_JSRCBT")) {
+            uint32_t bt[32]; int nb = sparc_win_backtrace(&m->cpu, bt, 32), bi;
+            static int jn; if (jn < 30) {
+                fprintf(stderr, "[JSRCBT] 0x2a20 <- %08x pc=%08x winframes:", v, m->cpu.pc);
+                for (bi = 0; bi < nb; bi++) fprintf(stderr, " %08x", bt[bi]);
+                fprintf(stderr, " icount=%llu\n", (unsigned long long)m->cpu.icount); jn++; }
+        }
         io_set(m, off, v);
         return;
     case R_GPU_FONT_IDX:
@@ -2428,7 +2438,37 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     static long snap_at = -2; static int snap_done = 0;
     if (snap_at == -2) { const char *e = getenv("CT952_SNAP");
                          snap_at = e ? (long)strtoull(e, NULL, 0) : -1; }
+    /* DIAGNOSTIC PROBE (CT952_CARDSHOW=<icount>): past <icount>, point the JPU
+     * decode source at the card photo buffer 0x401ec000 (info.a loaded 01.JPG
+     * there). Proves the display pipeline decodes the card image end-to-end --
+     * isolating the remaining gap to the firmware's auto-play trigger (which
+     * would DMA the photo into the decode buffer / kick the JPU). NOT faithful;
+     * a probe only. */
+    static long cardshow_at = -2;
+    if (cardshow_at == -2) { const char *e = getenv("CT952_CARDSHOW");
+                             cardshow_at = e ? (long)strtoull(e, NULL, 0) : -1; }
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
+        if (cardshow_at >= 0 && m->cpu.icount > (uint64_t)cardshow_at) {
+            static int cardshow_done = 0;
+            if (!cardshow_done) {
+                /* info.a loads only the first 16KB (header) of the photo; for the
+                 * probe, stage the FULL 01.JPG (card sector 67, contiguous) into
+                 * the decode buffer so the whole image decodes. */
+                uint8_t *dst = machine_dram_ptr(m, 0x401ec000u);
+                if (m->sd_img && dst) {
+                    uint32_t foff = 67u * 512u, flen = 0x10000u; /* 64KB covers 01.JPG */
+                    if (foff + flen <= m->sd_size)
+                        memcpy(dst, m->sd_img + foff, flen);
+                }
+                m->jpeg_src = 0x401ec000u;
+                m->biu_drained = 0;
+                m->jpeg_sig = 0;              /* force re-decode */
+                machine_maybe_jpeg_decode(m);
+                cardshow_done = 1;
+                fprintf(stderr, "[CARDSHOW] forced full-photo decode of card 0x401ec000 at icount=%llu\n",
+                        (unsigned long long)m->cpu.icount);
+            }
+        }
         /* One-shot call-chain snapshot (CT952_SNAP=<icount>): dump the winframe
          * backtrace + recent-PC ring once past <icount> -- names the info.a
          * functions in the post-engine recursion loop (§12.98). */

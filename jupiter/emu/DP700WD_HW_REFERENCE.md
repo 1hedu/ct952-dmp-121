@@ -876,3 +876,25 @@ parse. Delaying the insert is strictly worse.
 (the flash `0xcxxxx/0xdxxxx` + DRAM `0x4001exxx` info.a module), which never raises the media-ready
 state. New diagnostics landed for it: per-CMD18 sector trace + `CT952_SDCBT` load backtrace,
 `CT952_MSCAN=<icount>` media-state-bitflag scan, `CT952_SDCARD_AT=<icount>` delayed insert.
+
+### 12.97 The staged card file is ABANDONED — post-load processing never runs (read-watch proof)
+
+Two decisive probes past §12.96:
+
+- **Read-watch on the load buffer (`CT952_RDWATCH`).** After info.a DMA-loads 01.JPG's 16 KB into
+  0x401ec000 (32.38M), **nothing ever reads it back** — 0 reads across the whole run, on *both*
+  the 0x40 and 0xC0 (uncached) DRAM aliases. Combined with "`jpeg_src` never = 0x401ec000" (JPU
+  never decodes it), the staged file is completely unused: no CPU header-parse, no decode. info.a
+  enumerates the FAT, stages file #1, then **abandons it** — the post-load processing step (parse
+  header → mark file valid → raise READY, or decode → display) never executes.
+
+- **ENTER keypress does nothing (`CT952_IRKEY=0x13@33M`).** Delivered cleanly (IR ISR fires,
+  IR_DATA=0x13, P1_2nd interrupt raised) but produces no UI change and no card decode — because
+  the MEDIA_SELECT dialog (mode 8) has no READY source entry to select. Disproves the
+  "waiting for user to pick the card" hypothesis; it loops back to the same missing READY.
+
+**Keystone, sharpest form:** the parse loads the first photo correctly and then the processing
+step that would inspect/decode it and raise MediaInfo→READY is never scheduled. It is not an SD
+interrupt gap (the SD path is polling — firmware reads INT_STAT at 0xa0001130, no IRQ needed),
+not edge-timing (§12.96), not user-select, not data. The trigger for the post-load step lives in
+the precompiled info.a parse engine (flash 0xc/0xd + DRAM 0x4001e module) and is the next target.

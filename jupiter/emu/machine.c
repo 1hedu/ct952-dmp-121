@@ -1398,10 +1398,26 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
          * waking the real (asleep) USB source thread, so it changed nothing.
          * The faithful fix is to model the USB/card host controller, not fake
          * the flags -- deferred to the event-starvation work.) */
+        /* Read-watch on the card JPEG load buffer (CT952_RDWATCH): log the PC that
+         * reads the info.a-loaded 01.JPG data at 0x401ec000 -- pinpoints the
+         * parse-decision code that inspects the JPEG header (§12.96/97). */
+        { static long rw = -2; if (rw == -2) rw = getenv("CT952_RDWATCH") ? 1 : 0;
+          if (rw > 0 && addr >= 0x401ec000u && addr < 0x401ec040u) {
+              static int rwn; if (rwn < 200) {
+                  fprintf(stderr, "[RDWATCH] rd %08x (sz%d) pc=%08x icount=%llu\n",
+                          addr, size, m->cpu.pc, (unsigned long long)m->cpu.icount);
+                  rwn++; } } }
         return mem_read_raw(m->dram + (addr - 0x40000000u), size);
     }
-    if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE)
+    if (addr >= 0xC0000000u && addr + (uint32_t)size <= 0xC0000000u + MACH_DRAM_SIZE) {
+        { static long rw = -2; if (rw == -2) rw = getenv("CT952_RDWATCH") ? 1 : 0;
+          if (rw > 0 && addr >= 0xC01ec000u && addr < 0xC01ec040u) {
+              static int rwn; if (rwn < 200) {
+                  fprintf(stderr, "[RDWATCH] rd %08x (sz%d, C0-alias) pc=%08x icount=%llu\n",
+                          addr, size, m->cpu.pc, (unsigned long long)m->cpu.icount);
+                  rwn++; } } }
         return mem_read_raw(m->dram + (addr - 0xC0000000u), size);
+    }
     if (addr >= 0x80000000u && addr < 0x80000000u + MACH_IO_SIZE) {
         uint32_t off = (addr - 0x80000000u) & ~3u;
         uint32_t v = io_read(m, off);

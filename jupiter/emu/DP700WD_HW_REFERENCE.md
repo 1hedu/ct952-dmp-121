@@ -1027,3 +1027,24 @@ engine "done" is sufficient for the *parse*; the remaining gap is this OSD/displ
 advancing to actually decode+show the photo. That is the next target, and it is a genuine
 reverse-engineering effort on config-gated display logic (0x70240 / 0x70890 / 0x71028), not a
 one-line fix. Engine model stays gated (CT952_JPUENG).
+
+### 12.103 Path-1 round: the display SM runs but no card-photo command is ever issued (blocker is upstream MM auto-play)
+
+Watched the 0x70240 gate vars live (`CT952_SMWATCH`, JPUENG on):
+- NVRAM `0xb0000190` **cycles** 0x11→0x80→0x21 repeatedly (writers 0x6f3f8/0x6f440), *identically*
+  with and without a card (fires at 10.7M/18M in the demo, and 32M during the card parse). So the
+  0x70240 display SM is alive and cycling — NOT frozen — but it is doing background refresh.
+- OSD display-command `0x40039f60` stays **0** the whole time (only cleared at 0x70270, never set).
+  0x70240 compares it to 0x21 and always takes the "nothing to display" exit. So no photo command
+  is ever queued into it.
+- The command-post fn 0x6f3c0 writes a command (%i1) + params (%i2) to a queue and mirrors
+  0xb0000190, gated on the DSP state `0x40039948`==4 (the §12.67 7→0xd display-state var). This is
+  the shared DSP display-event machinery, not card-specific.
+- Confirmed the card never programs the **main JPU** either: `jpeg_src` never becomes 0x401ec000
+  (the same path the demo uses for 0x401dc000). So the card photo gets no display kick by ANY route.
+
+**Conclusion of this round:** the display subsystem is healthy and idle-cycling; the card photo is
+never *submitted* for display. The blocker is upstream — the **MM auto-play** that (on media READY)
+would point the JPU/display at 0x401ec000 never runs. So the next target is the media-READY →
+MM-auto-play trigger: confirm whether the parse signals READY and what should launch auto-play.
+Per-op engine model + SMWATCH diagnostics landed; model stays gated (CT952_JPUENG).

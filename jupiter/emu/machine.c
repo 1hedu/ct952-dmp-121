@@ -1590,6 +1590,16 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
         fprintf(stderr, "[BUFWATCH] wr %08x <- %08x pc=%08x icount=%llu\n",
                 addr, val, m->cpu.pc, (unsigned long long)m->cpu.icount);
     }
+    /* Display-SM state watch (CT952_SMWATCH): writes to the 0x70240 gate vars --
+     * NVRAM 0xb0000190 and OSD state 0x40039f1c/f24/f60 (§12.102). Shows whether
+     * the state machine's inputs ever change or are frozen. */
+    if (getenv("CT952_SMWATCH") &&
+        (addr == 0xb0000190u || addr == 0x40039f1cu || (addr & ~1u) == 0x40039f24u
+         || addr == 0x40039f60u)) {
+        static int smw; if (smw < 300) {
+            fprintf(stderr, "[SMW] %08x <- %08x (sz%d) pc=%08x icount=%llu\n",
+                    addr, val, size, m->cpu.pc, (unsigned long long)m->cpu.icount); smw++; }
+    }
     /* Engine-register trace (CT952_ENGTRACE): all writes to the 0x80000800 block
      * (base+0x200..0x240 = the JPEG/DMA engine info.a kicks for the card parse). */
     if (getenv("CT952_ENGTRACE") && addr >= 0x80000800u && addr < 0x80000a80u) {

@@ -1592,7 +1592,7 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
     }
     /* Engine-register trace (CT952_ENGTRACE): all writes to the 0x80000800 block
      * (base+0x200..0x240 = the JPEG/DMA engine info.a kicks for the card parse). */
-    if (getenv("CT952_ENGTRACE") && addr >= 0x80000a00u && addr < 0x80000a80u) {
+    if (getenv("CT952_ENGTRACE") && addr >= 0x80000800u && addr < 0x80000a80u) {
         fprintf(stderr, "[ENG] wr %08x <- %08x (sz%d) pc=%08x icount=%llu\n",
                 addr, val, size, m->cpu.pc, (unsigned long long)m->cpu.icount);
     }

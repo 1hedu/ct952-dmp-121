@@ -951,3 +951,32 @@ sends the firmware down the wrong-media path. Model is therefore **gated behind 
 the default emulator stays honest (spins on the unmodeled engine). Next: locate the engine's real
 output channel (disassemble the 0x9b800/0x9b900 setup that ran before the GO) and produce a valid
 decode result, then re-check whether info.a accepts the card and auto-plays.
+
+### 12.100 Full register map of the 0x80000800 parse engine (for the faithful-decode phase)
+
+Complete programming captured (`CT952_ENGTRACE`, widened to 0x80000800-0x80000a80) at the card
+parse (icount 32.384M, all from the setup fn at flash 0x9b8a4-0x9b9a4):
+```
+80000800 <- 00020000 then 00020001   control: mode bit17, then |1 = enable/start
+80000894 <- 00000200 (=512)          width / stride
+80000898 <- 00000240 (=576)          height?
+80000820 <- 00080008                 block/MCU geometry (8x8)
+8000080c <- 00000800 (=2048)
+8000082c <- 00000000
+80000844 <- 00040000 ; 80000848 <- 0010000c
+80000a20 <- 401ec000                 SOURCE = staged 01.JPG
+80000a28 <- 00000004
+80000a34 <- 80010200                 DEST
+80000a3c <- 00000001                 GO
+80000a30  (read) bits[16:21]          STATUS/progress; firmware spins until >0x1f (0x9bcb4)
+```
+The same block is also written elsewhere (`80000894<-0x1000` at pc 0x851bc, seen at 10.6/18.2/
+32.2M), so 0x80000800 is a shared 2D/JPEG/scaler engine, not card-only — but the card parse is
+the only path that then *spins* on 0x80000a30 (no-card boot never enters 0x9bcb4, verified).
+
+**Where it stands:** root cause of the card stall = this unmodeled engine (verified). Minimal
+"done" model (CT952_JPUENG) clears the spin but the firmware then rejects the photo (needs the
+real decoded result, not just a flag) and the screen is unchanged (COBY splash). The faithful
+next phase is to emulate the engine: decode the JPEG at 0x80000a20 and deliver its result via the
+0x80000a30 status bits and/or the 0x80010200 dest, matching what info.a reads, so the photo is
+accepted and auto-played. That is a scoped but non-trivial hardware-block emulation task.

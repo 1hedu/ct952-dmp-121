@@ -1226,3 +1226,22 @@ So auto-play and the source menu both see an empty card. The last remaining ques
 the mount-time enumeration (info.a FMLISTMultivolume / `FUN_0002374c`, and the classifier
 `func_0x123d4`) does not count the directory entries the FS already read -- i.e. whether info.a's
 own VFS dir-walk fails on this image, or the count-building parse is gated off. Fully decompilable.
+
+### 12.111 ★ CORRECTION to §12.110 — the card IS enumerated (3 files); I watched the wrong counter
+
+§12.110 was WRONG. `_DAT_40032aa0` (which I watched) is category-0's count (always 0), not the
+total. Dumping the real info.a count table (`*(0x40021db8)=0x40032290`, table @+8, stride 0xc):
+**category 4 (JPEG) = 3** — my 3 card JPEGs ARE counted, incrementally 1->2->3 at 31.61-31.62M
+(pc 0x12d54), right after mount. So `FUN_00012e18` returns total=3 (`*param2`), `FUN_000254a4`
+returns 0 = PLAYABLE (total != 0), and `FUN_00026f38` returns 1 = playable. **The card is fully
+recognized as having 3 playable photos.** The FS/enumeration/classification all WORK.
+
+So the real blocker is downstream and matches §12.108: the card is recognized, the parser command
+0x32 (CMD_START) is posted (32.19M), but post-mount (DAT_40022f5e=1) it routes to `FUN_00022494`
+which — for DSP state 0x20, DAT_40039b08=0x30 (not 0x60) — remaps cmd 0x32 -> 0x82 and never calls
+the parser-enable (`FUN_0001b48c`/`FUN_0001b5c8`, DAT_4003274a stays 0). The parser-enable only
+comes from the *pre-mount* recognize (classify==1) which the card doesn't hit (empty table before
+enumeration). Net: recognized-but-not-auto-played; sits at the mode-8 media-select dialog. An
+injected ENTER (0x13) does nothing (card not a selectable menu entry yet). Next: the media-select
+dialog's source-status (`_bSourceMenuMediaStatus`) and its select action, or why post-mount cmd
+routing skips the parser-enable.

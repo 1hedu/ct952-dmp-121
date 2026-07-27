@@ -1062,6 +1062,10 @@ static void sdc_do_cmd(machine_t *m, uint32_t cmd_reg, uint32_t tran_mode)
                     idx, arg, blkcnt, dma);
             for (bi = 0; bi < nb; bi++) fprintf(stderr, " %08x", bt[bi]);
             fprintf(stderr, " icount=%llu\n", (unsigned long long)m->cpu.icount);
+            { int k; fprintf(stderr, "[SDCBT] recent-PC ring:");
+              for (k = 24; k < 64; k++)
+                  fprintf(stderr, " %08x", m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63]);
+              fprintf(stderr, "\n"); }
           } }
         break; }
     default: break;

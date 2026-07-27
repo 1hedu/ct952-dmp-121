@@ -1608,7 +1608,7 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
          || addr == 0x40039f60u || (addr & ~3u) == 0x40039cd0u || addr == 0x40022f06u
          || addr == 0x4003263cu || addr == 0x4003277cu
          || addr == 0x40039949u || addr == 0x4003274au
-         || addr == 0x40022f81u || addr == 0x40032780u)) {
+         || addr == 0x40022f81u || addr == 0x40032780u || addr == 0x4002fb2au || addr == 0x40022f5eu || addr == 0x40022f00u)) {
         static int smw; if (smw < 300) {
             fprintf(stderr, "[SMW] %08x <- %08x (sz%d) pc=%08x icount=%llu\n",
                     addr, val, size, m->cpu.pc, (unsigned long long)m->cpu.icount); smw++; }

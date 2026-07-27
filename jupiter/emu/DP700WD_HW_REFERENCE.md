@@ -1153,3 +1153,21 @@ Using Ghidra (ghidra_re/), decompiled the entire card→display trigger chain to
 media never reaches READY, and the boot parks at the MEDIA_SELECT menu / splash. The next thread:
 who calls `FUN_0001f2e4`, and what command/classifier result the card produces (`FUN_000180d4`,
 `FUN_000255b4` file list) — all now decompilable in one place.
+
+### 12.108 The parse command IS sent (0x32) but mis-routed — fork at DAT_40022f5e
+
+Traced further with Ghidra. The media manager DOES post parser command **0x32 (CMD_START)** for the
+card (DAT_4002fb2a<-0x32 at 32.19M, pc 0x261a0). The command handler is `FUN_0001f4d0`:
+- if `DAT_40022f5e==0`: call `FUN_0001f2e4` (recognize -> parse-decision -> parser start).
+- else: if `DAT_4003274a==0` -> `FUN_00022494`; else `FUN_0001bec0`.
+
+Empirically `DAT_40022f5e` is set to **1** at 31.59M (pc 0x24e34) BEFORE the 0x32 arrives, and
+`DAT_40022f00` (the recognize parse-branch marker) is never written. So the command takes the
+"already-recognized" else-branch and (DAT_4003274a always 0) routes to `FUN_00022494` instead of
+recognize->parse. `FUN_00022494` is itself gated first on `_DAT_4002fb52 & 0x100` (else no-op), then
+a web of DSP-state (DAT_4003996c) + command flags.
+
+**Net (fully decompiler-verified now):** the whole trigger chain exists and the parse command fires,
+but it is routed away from the recognize->`FUN_0001b48c`->`FUN_0001b5c8` (parser-start, DSP mode 9)
+path by `DAT_40022f5e==1`. The remaining work is tracing what sets DAT_40022f5e=1 (pc 0x24e34) and
+the `FUN_00022494` / `_DAT_4002fb52` gate — all now tractable in decompiled C via ghidra_re/.

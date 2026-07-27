@@ -197,6 +197,12 @@ typedef struct machine {
     uint32_t  sdc_data_len;       /* valid bytes in sdc_data */
     uint32_t  sdc_data_pos;       /* DATA_PORT read cursor */
 
+    /* info.a JPEG-parse engine (0x80000800 block, §12.98): src at +0x220,
+     * status at +0x230 (bits[16:21] progress, firmware waits >0x1f), GO at
+     * +0x23c. Modeled: on GO, mark done so the parse's completion poll exits. */
+    uint32_t  eng_src;            /* 0x80000a20 source address */
+    uint32_t  eng_done;           /* set when GO written; drives 0x80000a30 */
+
     uint64_t cycles;
     int watchdog_fired;
 } machine_t;

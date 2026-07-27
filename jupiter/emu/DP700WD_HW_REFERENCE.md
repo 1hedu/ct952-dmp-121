@@ -898,3 +898,28 @@ step that would inspect/decode it and raise MediaInfo→READY is never scheduled
 interrupt gap (the SD path is polling — firmware reads INT_STAT at 0xa0001130, no IRQ needed),
 not edge-timing (§12.96), not user-select, not data. The trigger for the post-load step lives in
 the precompiled info.a parse engine (flash 0xc/0xd + DRAM 0x4001e module) and is the next target.
+
+### 12.98 ★★ CRACKED THE STALL — info.a kicks an unmodeled 0x80000800 JPEG engine and spins on its status
+
+Traced the abandoned-buffer consumer (§12.97) with a value-watch (`CT952_BUFWATCH`, logs any
+write carrying 0x401ec000). Right after the 16 KB load, the info.a parse hands the buffer to a
+hardware engine at base **0x80000800**:
+```
+wr 80000a20 <- 401ec000   (source = the staged 01.JPG)   pc=0x9b968
+wr 80000a28 <- 00000004   (param / unit count)
+wr 80000a34 <- 80010200   (config / descriptor)
+wr 80000a3c <- 00000001   (GO)
+```
+then polls **0x80000a30** bits[16:21] until they exceed 0x1f (spin at flash `0x9bcb4`). The
+emulator did not model this block, so 0x80000a30 read 0 forever → infinite spin. Proof it is
+card-specific: the `0x9bcb4` spin is the dominant loop *only* after a card parse; a no-card boot
+never enters it (`CT952_PCSAMP` A/B).
+
+**Model added** (machine.c): capture the source (0x80000a20) and GO (0x80000a3c); the status read
+at 0x80000a30 reports full progress (bits[16:21]=0x3f) once kicked. Result: the `0x9bcb4` spin is
+**gone** — the parse advances into new info.a code (DRAM module 0x4001d7xx: a find-first-set-bit
+scan `0x4001d7e4` driven from deep recursive calls, i.e. real structure-walking work, not a hard
+stall). So 0x80000800 is the JPEG parse/decode engine info.a uses to inspect each photo, and
+modeling its completion is what lets the parse continue. Next: confirm the parse now reaches
+MediaInfo→READY and decodes the card photo (long run in progress), and refine the engine so any
+output the firmware reads back is correct.

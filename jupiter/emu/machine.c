@@ -1425,6 +1425,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
     if (addr >= 0x80000000u && addr < 0x80000000u + MACH_IO_SIZE) {
         uint32_t off = (addr - 0x80000000u) & ~3u;
         uint32_t v = io_read(m, off);
+        /* info.a JPEG-parse engine completion (§12.98): 0x80000a30 bits[16:21]
+         * is the progress/done field the parse polls (>0x1f). Report full
+         * progress (0x3f) once the engine has been kicked (GO at 0x80000a3c). */
+        if (off == 0x0a30u && m->eng_done)
+            v = (v & ~(0x3fu << 16)) | (0x3fu << 16);
         /* IR-injection trace (CT952_IRTRACE): log the firmware reading the IR
          * data/status regs and the PROC1-2nd pending -- proves the injected IR
          * interrupt drove the real ISR/DSR (INPUT_RemoteScan) path (10.38). */
@@ -1569,6 +1574,30 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
                    int size, int *fault)
 {
     *fault = 0;
+
+    /* Buffer-handoff watch (CT952_BUFWATCH): log ANY write (any region) whose
+     * VALUE is the staged card JPEG buffer 0x401ec000 -- catches info.a handing
+     * the file to a hardware engine (thumbnail/validation decoder) or another
+     * pointer slot. The SDC DMA_ADDR write at pc 0xcb0d8 is the known one; any
+     * OTHER site taking 0x401ec000 is the abandoned-buffer's real consumer. */
+    if (getenv("CT952_BUFWATCH") && (val == 0x401ec000u || val == 0xC01ec000u)
+        && m->cpu.pc != 0x000cb0d8u) {
+        fprintf(stderr, "[BUFWATCH] wr %08x <- %08x pc=%08x icount=%llu\n",
+                addr, val, m->cpu.pc, (unsigned long long)m->cpu.icount);
+    }
+    /* Engine-register trace (CT952_ENGTRACE): all writes to the 0x80000800 block
+     * (base+0x200..0x240 = the JPEG/DMA engine info.a kicks for the card parse). */
+    if (getenv("CT952_ENGTRACE") && addr >= 0x80000a00u && addr < 0x80000a80u) {
+        fprintf(stderr, "[ENG] wr %08x <- %08x (sz%d) pc=%08x icount=%llu\n",
+                addr, val, size, m->cpu.pc, (unsigned long long)m->cpu.icount);
+    }
+    /* info.a JPEG-parse engine (§12.98): the card parse programs a source
+     * (0x80000a20 <- 0x401ec000) then polls a completion field at 0x80000a30
+     * bits[16:21] until it exceeds 0x1f. Without a model the field stays 0 and
+     * the parse spins forever (0x9bcb4). Capture the source and the GO
+     * (0x80000a3c <- 1) so the status read reports "done". */
+    if (addr == 0x80000a20u) m->eng_src = val;
+    if (addr == 0x80000a3cu && (val & 1u)) m->eng_done = 1;
 
     /* CT952_UITRACE: watch the OSD active-UI-record pointer (0x40020ec8) and the
      * __bPOWERONMENUInitial gate (0x40023a10). Logs every UI-mode transition and

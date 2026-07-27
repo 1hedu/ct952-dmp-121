@@ -1007,3 +1007,23 @@ Solid new facts:
 **Status:** root cause = the 0x80000800 2D/JPEG engine (verified, mapped). A faithful photo
 display needs (a) proper per-op engine semantics, then (b) resolving the 0x70240 media/display
 state machine that gates auto-play. Both scoped; neither done. Model stays gated (CT952_JPUENG).
+
+### 12.102 Per-op engine semantics ruled out; the real downstream blocker is the 0x70240 display SM
+
+Tested option-1 (per-op engine status: clear done on each new 0x80000a20 source write, set on GO)
+instead of the permanent latch. Result: NO change — the demo still stops after the card parse
+(only decode #1). So the engine-status model is not what stalls things; the card-parse thread
+genuinely spins downstream and starves the demo thread.
+
+The downstream blocker is the state machine at flash **0x70240** (reached only past the engine
+spin). Its gate `0x70890` branches on:
+- BRAM/NVRAM byte **0xb0000190** (persistent config; bit4/0x10 tested — and 0x70204 writes 0x10
+  there), and
+- OSD state bytes 0x40039f1c / 0x40039f24 (hword) / 0x40039f60 (state, cmp 0x21/0x80).
+
+So the auto-play/display after parse is gated by a config-dependent OSD state machine, not the
+engine. Since info.a reads back ONLY the engine status (not decoded output, §12.101), a faithful
+engine "done" is sufficient for the *parse*; the remaining gap is this OSD/display state machine
+advancing to actually decode+show the photo. That is the next target, and it is a genuine
+reverse-engineering effort on config-gated display logic (0x70240 / 0x70890 / 0x71028), not a
+one-line fix. Engine model stays gated (CT952_JPUENG).

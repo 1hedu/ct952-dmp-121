@@ -1602,7 +1602,10 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
      * the parse spins forever (0x9bcb4). Capture the source and the GO
      * (0x80000a3c <- 1) so the status read reports "done". */
     if (getenv("CT952_JPUENG")) {
-        if (addr == 0x80000a20u) m->eng_src = val;
+        /* per-op: a new source write re-arms the engine (clears done); GO
+         * completes the op. Avoids a permanent latch that could bleed into the
+         * display path's own use of the shared engine. */
+        if (addr == 0x80000a20u) { m->eng_src = val; m->eng_done = 0; }
         if (addr == 0x80000a3cu && (val & 1u)) {
             m->eng_done = 1;
             if (getenv("CT952_ENGTRACE")) {

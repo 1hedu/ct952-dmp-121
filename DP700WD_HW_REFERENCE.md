@@ -6153,3 +6153,13 @@ flash above untouched. The full [0:0x160000] firmware image UZIPs to 0x7f33c (we
 So the update pipeline is complete for a self-built AP: `mksectionap --image` builds a
 loader-compatible, compressed, section-table AP, and `--apload` runs it through the real
 ROMLD loader (decompress -> flasher -> resident driver -> gate-level controller -> flash).
+
+**Full-image result (completed):** the whole [0:0x160000] firmware image (22 sectors)
+reflashed byte-exact through the real loader -- **352 erase + 5632 program** SPI ops
+(22x16 erase; 22x256 pages), flash[0:0x160000] == the new image, differing from the
+original by exactly the 18-byte SETD marker, with the photo + COPY above 0x160000 intact.
+And the reflashed dump **boots identically to the original** (pc/npc/psr/tbr/cwp/wim
+match at 20M instrs). So the complete update path -- compressed section-table AP -> real
+ROMLD decompress -> flasher app from DRAM -> firmware flash driver -> gate-level controller
+-> flash -> bootable image -- is verified end-to-end for a full firmware image built from
+our own binary. (Needed a 600M single-step budget for the 1.4 MB decompress + reflash.)

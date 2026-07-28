@@ -268,7 +268,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ct952_text_obj, 5, 5, ct952_text);
 // hardware decoder; the reconstructed frame lands on the video plane, which
 // the display composites under the OSD. `addr` must be a DRAM address.
 static mp_obj_t ct952_decode_jpeg(mp_obj_t addr_in) {
-    uint32_t addr = (uint32_t)mp_obj_get_int(addr_in);
+    uint32_t addr = (uint32_t)mp_obj_get_int_truncated(addr_in);
     IOREG(R_JPU_SRC) = addr;      /* MCU-BIU bitstream source -> jpeg_src */
     IOREG(R_GPU_CTL0) = 0;        /* JPU op (CTL0[28]=0): run the decode   */
     return mp_const_none;
@@ -290,14 +290,17 @@ static MP_DEFINE_CONST_FUN_OBJ_0(ct952_ir_poll_obj, ct952_ir_poll);
 // peek32(addr) / poke32(addr, val) -- raw 32-bit access to any modeled
 // register or memory. The whole SoC is reachable from the REPL.
 static mp_obj_t ct952_peek32(mp_obj_t addr_in) {
-    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(uint32_t)mp_obj_get_int(addr_in);
+    // Truncated accessor: addresses (and register values) >= 2^31 -- e.g. the
+    // I/O regions 0x80000000/0xa0000000/0x98000000 -- don't fit a signed
+    // mp_int_t; mp_obj_get_int_truncated takes the raw 32-bit bit pattern.
+    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(uint32_t)mp_obj_get_int_truncated(addr_in);
     return mp_obj_new_int_from_uint(*p);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(ct952_peek32_obj, ct952_peek32);
 
 static mp_obj_t ct952_poke32(mp_obj_t addr_in, mp_obj_t val_in) {
-    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(uint32_t)mp_obj_get_int(addr_in);
-    *p = (uint32_t)mp_obj_get_int(val_in);
+    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(uint32_t)mp_obj_get_int_truncated(addr_in);
+    *p = (uint32_t)mp_obj_get_int_truncated(val_in);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(ct952_poke32_obj, ct952_poke32);
@@ -307,7 +310,7 @@ static MP_DEFINE_CONST_FUN_OBJ_2(ct952_poke32_obj, ct952_poke32);
 static mp_obj_t ct952_poke_bytes(mp_obj_t addr_in, mp_obj_t data_in) {
     mp_buffer_info_t bi;
     mp_get_buffer_raise(data_in, &bi, MP_BUFFER_READ);
-    memcpy((void *)(uintptr_t)(uint32_t)mp_obj_get_int(addr_in), bi.buf, bi.len);
+    memcpy((void *)(uintptr_t)(uint32_t)mp_obj_get_int_truncated(addr_in), bi.buf, bi.len);
     return MP_OBJ_NEW_SMALL_INT(bi.len);
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(ct952_poke_bytes_obj, ct952_poke_bytes);
@@ -317,9 +320,9 @@ static MP_DEFINE_CONST_FUN_OBJ_2(ct952_poke_bytes_obj, ct952_poke_bytes);
 // Only meaningful in the embedded "app" build, where Python runs inside the
 // live firmware and shares its address space + calling convention.
 static mp_obj_t ct952_call(size_t n_args, const mp_obj_t *args) {
-    uint32_t addr = (uint32_t)mp_obj_get_int(args[0]);
+    uint32_t addr = (uint32_t)mp_obj_get_int_truncated(args[0]);
     mp_int_t a[4] = {0, 0, 0, 0};
-    for (size_t i = 1; i < n_args && i <= 4; i++) a[i - 1] = mp_obj_get_int(args[i]);
+    for (size_t i = 1; i < n_args && i <= 4; i++) a[i - 1] = mp_obj_get_int_truncated(args[i]);
     typedef mp_int_t (*fw_fn_t)(mp_int_t, mp_int_t, mp_int_t, mp_int_t);
     fw_fn_t f = (fw_fn_t)(uintptr_t)addr;
     mp_int_t r = f(a[0], a[1], a[2], a[3]);

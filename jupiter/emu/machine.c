@@ -1630,6 +1630,11 @@ static uint32_t bus_rd(machine_t *m, uint32_t addr, int size, int *fault)
         if (addr == 0x98080014u)
             return m->proc2_on ? m->cpu2.npc
                    : 0x40002000u + (uint32_t)((m->cycles >> 4) & 0x3FFFu) * 4u + 4u;
+        /* Diagnostic (for the concurrent PROC2 debugger, §12.82): expose PROC1's
+         * live PC/nPC so Python running on PROC2 can watch the firmware execute
+         * while it runs. Read-only. */
+        if (addr == 0x98080020u) return m->cpu.pc;
+        if (addr == 0x98080024u) return m->cpu.npc;
         return 0;
     }
 
@@ -2985,17 +2990,51 @@ uint64_t machine_run(machine_t *m, uint64_t n)
         if (!pyapp_done && getenv("CT952_PYAPP") &&
             ((pyapp_hook && m->cpu.pc == pyapp_hook) ||
              (pyapp_at >= 0 && m->cpu.icount > (uint64_t)pyapp_at))) {
-            m->cpu.pc  = 0x40500000u;               /* payload entry stub */
-            m->cpu.npc = 0x40500004u;
-            sparc_set_reg(&m->cpu, 14, 0x407F0000u);/* %sp: top of the payload window */
-            sparc_set_reg(&m->cpu, 30, 0);          /* %fp = 0 */
-            /* Mask device interrupts (PIL=15) so eCos's timer tick can't
-             * context-switch PROC1 away from the Python app; window/flush traps
-             * are not maskable by PIL, so the NLR longjmp still works. */
-            m->cpu.psr |= 0x00000F00u;
-            fprintf(stderr, "[PYAPP] launched Python app (seized PROC1 -> 0x40500000) "
-                    "at icount=%llu pc-was-hook=%d\n",
-                    (unsigned long long)m->cpu.icount, pyapp_hook ? 1 : 0);
+            /* Optional experiment script (CT952_PYAPP_SCRIPT=<file>): stage it at
+             * 0x40740000 as [magic "PYSC"][len][NUL-terminated source]; the
+             * payload runs it instead of the REPL. */
+            const char *scr = getenv("CT952_PYAPP_SCRIPT");
+            if (scr) {
+                FILE *sf = fopen(scr, "rb");
+                uint8_t *sd = machine_dram_ptr(m, 0x40740000u);
+                if (sf && sd) {
+                    fseek(sf, 0, SEEK_END); long sl = ftell(sf); fseek(sf, 0, SEEK_SET);
+                    if (sl > 0 && sl < 0x10000) {
+                        sd[0]=0x50; sd[1]=0x59; sd[2]=0x53; sd[3]=0x43;      /* "PYSC" */
+                        sd[4]=(uint8_t)(sl>>24); sd[5]=(uint8_t)(sl>>16);
+                        sd[6]=(uint8_t)(sl>>8); sd[7]=(uint8_t)sl;
+                        if (fread(sd+8, 1, (size_t)sl, sf) == (size_t)sl) sd[8+sl]=0;
+                    }
+                }
+                if (sf) fclose(sf);
+            }
+            if (getenv("CT952_PYAPP_PROC2")) {
+                /* Concurrent debugger: run the payload on PROC2, leaving PROC1
+                 * running the firmware. Python then peeks/pokes shared DRAM and
+                 * watches PROC1 (0x98080020) live. §12.82. */
+                sparc_reset(&m->cpu2, &m->bus2);
+                m->cpu2.pc  = 0x40500000u;
+                m->cpu2.npc = 0x40500004u;
+                sparc_set_reg(&m->cpu2, 14, 0x407F0000u);
+                m->cpu2.psr = 0xF3000FA0u;           /* S=1 so it can wr psr/wim/tbr */
+                m->cpu2.halted = 0;
+                m->proc2_on = 1;
+                fprintf(stderr, "[PYAPP] launched Python app on PROC2 (firmware keeps "
+                        "running on PROC1) at icount=%llu\n",
+                        (unsigned long long)m->cpu.icount);
+            } else {
+                m->cpu.pc  = 0x40500000u;               /* payload entry stub */
+                m->cpu.npc = 0x40500004u;
+                sparc_set_reg(&m->cpu, 14, 0x407F0000u);/* %sp: top of the payload window */
+                sparc_set_reg(&m->cpu, 30, 0);          /* %fp = 0 */
+                /* Mask device interrupts (PIL=15) so eCos's timer tick can't
+                 * context-switch PROC1 away from the Python app; window/flush traps
+                 * are not maskable by PIL, so the NLR longjmp still works. */
+                m->cpu.psr |= 0x00000F00u;
+                fprintf(stderr, "[PYAPP] launched Python app (seized PROC1 -> 0x40500000) "
+                        "at icount=%llu pc-was-hook=%d\n",
+                        (unsigned long long)m->cpu.icount, pyapp_hook ? 1 : 0);
+            }
             pyapp_done = 1;
         }
         if (cardshow_at >= 0 && m->cpu.icount > (uint64_t)cardshow_at) {

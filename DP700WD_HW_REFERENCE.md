@@ -5741,3 +5741,40 @@ application programming via the on-device debugger -- `ct952.call` the erase
 straight from the REPL. Both avoid decapping the part. (Reflashing is
 brick-risky: verify the erase/program signatures and keep the boot loader's
 recovery/boot-block path intact before writing.)
+
+### 12.82 Concurrent (PROC2) debugger: watch the firmware run live
+
+Built a non-freezing variant of the on-device debugger: the Python payload runs
+on **PROC2** while the firmware keeps running on **PROC1**, so we observe and
+poke the live system without pausing it.
+
+- Emulator: `CT952_PYAPP_PROC2=1` starts the payload on cpu2 (own trap table,
+  supervisor PSR) and leaves cpu1 running; `CT952_PYAPP_SCRIPT=<file>` stages an
+  experiment script at 0x40740000 ("PYSC" header) that the payload runs instead
+  of the REPL (no keyboard needed for the second core). A diagnostic register
+  exposes PROC1's live PC/nPC to PROC2 at 0x98080020 / 0x98080024.
+- Fix that unblocked it: `ct952.peek32/poke32/call` extracted the address with
+  `mp_obj_get_int` (signed), so any address >= 2^31 -- i.e. the whole I/O map
+  (0x80000000 / 0xa0000000 / 0x98000000) -- overflowed and returned nil. Switched
+  to `mp_obj_get_int_truncated` (raw 32-bit pattern). Every low-address peek had
+  worked by luck; high-address peeks now work too.
+
+**Result (script on PROC2, firmware live on PROC1, seized at 100M):**
+```
+PROC2 watching PROC1 execute (pc, npc):
+0 0x40001044 0x4001e6d8 0
+1 0x4001d090 0x400010b0 0
+2 0x4001d80c 0x00070268 0
+...                          # PROC1's PC moves every sample -> genuinely concurrent
+9 0x00059848 0x40001058 0    # __bPOWERONMENUInitial stays 0 throughout
+```
+PROC1's PC cycles through `0x40001040..0x400010b0` (eCos scheduler/dispatch) and
+`0x4001d000..0x4001e708` (the poll-thread bodies) -- the §12.73 park watched
+live: the threads spin on their mbox-gets and the scheduler round-robins, with
+nothing ever posting the source-present message.
+
+This is the tool the park needs: poke a candidate source-present gate on PROC2
+and watch PROC1's PC in real time -- if it leaves the `0x4001dxxx` poll region
+for the POWERONMENU path, that gate is the producer. (Caveat: calling firmware
+*functions* from PROC2 while PROC1 also runs them races on unlocked state; peek/
+poke of data is the safe concurrent primitive.)

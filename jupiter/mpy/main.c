@@ -104,20 +104,29 @@ int pyapp_main(void) {
     #endif
     mp_init();
 
-    if (usb_kbd_bringup()) {
-        mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
-    } else {
-        mp_hal_stdout_tx_strn("[pyapp] REPL on UART1 RX\n", 25);
-    }
-
     #if MICROPY_ENABLE_COMPILER
-    // Bind the hardware module into the REPL's global namespace up front, so
-    // the operator can use ct952.peek32/poke32/call without an import.
+    // Bind the hardware module up front (ct952.peek32/poke32/call).
     do_str("import ct952", MP_PARSE_FILE_INPUT);
-    mp_hal_stdout_tx_strn("[pyapp] the firmware is live: ct952.peek32/poke32/call\n", 55);
-    for (;;) {
-        if (pyexec_friendly_repl() != 0) {
-            break;
+
+    // An experiment script staged by the emulator (CT952_PYAPP_SCRIPT) at
+    // 0x40740000 with a "PYSC" header runs non-interactively -- used by the
+    // concurrent PROC2 debugger, where there is no keyboard.
+    volatile uint32_t *shdr = (volatile uint32_t *)0x40740000u;
+    if (shdr[0] == 0x50595343u) {   /* "PYSC" */
+        mp_hal_stdout_tx_strn("[pyapp] running staged script\n", 30);
+        do_str((const char *)0x40740008u, MP_PARSE_FILE_INPUT);
+        mp_hal_stdout_tx_strn("[pyapp] script done\n", 20);
+    } else {
+        if (usb_kbd_bringup()) {
+            mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
+        } else {
+            mp_hal_stdout_tx_strn("[pyapp] REPL on UART1 RX\n", 25);
+        }
+        mp_hal_stdout_tx_strn("[pyapp] the firmware is live: ct952.peek32/poke32/call\n", 55);
+        for (;;) {
+            if (pyexec_friendly_repl() != 0) {
+                break;
+            }
         }
     }
     #endif

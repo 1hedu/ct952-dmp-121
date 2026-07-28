@@ -1424,3 +1424,26 @@ but spins there without driving a new file-read/engine-GO for photo 2 (0 READ18,
 The precise sub-cause inside the parser re-entry (why `FUN_000375a0` / the `DAT_4003263c` state
 machine advances for the initial photo but not for the post-advance photo) is not yet pinned — that
 is the open thread, not the mailbox event.
+
+### 12.116-REFINED ★★ The advance re-parses but on STALE data — the next-file load never triggers
+
+Watching the parser header state `DAT_4003263c` across a NEXT run gives the accurate picture:
+
+- **Photo 1 (working):** 274a=1 (parser enable, pc 0x1b5d8, 33.40M) → 263c 0 → **1** (pc 0x1cc9c,
+  44.94M) → **2** (pc 0x59838/0x1beb8, 45.92M) = header parse completes; photo 1 decodes.
+- **After NEXT (46M):** the advance resets 263c→0 (pc 0x1d28c, 46.19M), re-enables 274a=1, and the
+  parser **re-runs and completes exactly like photo 1**: 263c 0 → **1** (pc 0x1cc9c, 55.10M) → **2**
+  (55.11M). So PARSERHEADER does NOT spin forever — it fully re-parses ~9M instructions later.
+
+The catch: across that whole window there is **no READ18 for 02.JPG and no engine GO** (§12.116). So
+the parser re-completes on the **stale photo-1 bytes still resident in 0x401ec000** — the info.a
+file-manager never loads the *next* file for the advanced index. A re-decode of identical bytes is
+suppressed by the jpeg-signature dedup, so no new frame appears.
+
+**Accurate stall statement.** Input dispatch → advance → parser re-arm → parser re-parse ALL work.
+The single missing step is the **info.a next-file fetch**: FUN_0001d41c increments the photo index
+(`DAT_40032748`) but the file-manager read that should pull 02.JPG's sectors into 0x401ec000 for the
+new index is not triggered, so every advance re-parses photo 1's buffer. Closing multi-photo
+iteration = wiring the advance's index change to an info.a bm_read_file for that index (the
+`0xcb328←…←0x190b4←info.a←0x6308←0x74cc` VFS path that loaded 01.JPG at 44.85M). That is the open
+thread; everything upstream of it is verified working.

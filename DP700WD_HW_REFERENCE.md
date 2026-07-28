@@ -6131,7 +6131,9 @@ the flasher reached its own `ta 0`, but the firmware driver/loader leaves traps 
 (ET=1), so `ta 0` took a REAL trap to the vector (tbr 0x40000000 | tt 0x80<<4 = 0x40000800)
 and executed the section-table bytes as code -> illegal instruction. Fix: the flasher
 clears ET (`rd %psr; andn 0x20; wr %psr`) before `ta 0`, so the halt is error-mode
-regardless of ET. It now stops cleanly at its own `ta 0` (trap 0x80 @ 0x405000e4). On
+regardless of ET. It now stops cleanly at its own `ta 0` (trap 0x80 @ 0x405000e4) --
+confirmed on the FULL 22-sector compressed-image reflash too (352 erase + 5632 program,
+flash[0:0x160000] == the new image, and the reflashed dump boots identically). On
 hardware the AP reboots here instead; the `ta 0` halt is only the emulator's end marker.
 
 So the COMPLETE on-device update path -- AP_INFO validation, MoveSectionTable, the real

@@ -1245,3 +1245,25 @@ enumeration). Net: recognized-but-not-auto-played; sits at the mode-8 media-sele
 injected ENTER (0x13) does nothing (card not a selectable menu entry yet). Next: the media-select
 dialog's source-status (`_bSourceMenuMediaStatus`) and its select action, or why post-mount cmd
 routing skips the parser-enable.
+
+### 12.112 ★★ RESOLVED (understanding): the card IS recognized and reaches the media-select dialog BY DESIGN
+
+Complete, decompiler+runtime-verified model of the card boot:
+- Mount + enumerate: 3 JPEGs counted (info.a table cat4=3 by 31.62M). Card recognized.
+- `FUN_00025ef4` (boot media decision) -> `FUN_00026f38` (SD) reaches its **success path**
+  (`DAT_40020d8a<-5` at 31.63M, pc 0x19e78) => card is PLAYABLE at the decision point.
+- Success (not "no SD card") -> `FUN_00050444` registers callback `func_0x25e60` at
+  `_DAT_400396a0`; that callback emits a **message code 8 = MEDIA_SELECT_DLG**.
+- So the recognized card is routed to the **mode-8 media-select dialog** — the screen we see.
+  This is faithful: card present + recognized -> show media-select for the user to pick, then play.
+
+This supersedes every earlier "card stalls / never parses / empty / never READY" framing (12.96,
+12.108-111 partial): the FS, enumeration, classification, and recognition ALL work. The emulator
+faithfully reaches the media-select dialog with a recognized SD photo source.
+
+**The only thing left is the dialog interaction**: the card must appear as a selectable entry and
+be chosen (KEY_SELECTMEDIA / navigate / confirm), which then starts the parser+slideshow. Injected
+keys (ENTER 0x13, and scancode 8 -> keycode 0xf0) did not yet drive it — next is confirming the
+dialog's source list shows the card and which key/sequence selects it (ref: media.c
+MEDIA_MediaSelection_ProcessKey uses KEY_SELECTMEDIA/KEY_UP/KEY_DOWN). That is UX wiring on top of
+a fully-working recognition path -- the hard part (does the emulator recognize the card) is DONE.

@@ -1343,3 +1343,30 @@ So the two cards exercise one recognition path to opposite ends: a card with a J
 playable → play → parser → decode from 0x401ec000 (the photo appears); a FAT‑valid card with no JPEG
 → enumerate → not‑playable → no play, no decode. The slideshow render is genuinely gated on the
 card's real contents.
+
+### 12.115 ★ Multi-photo card: render is general; slideshow ADVANCE blocked at the input-pump gap
+
+Tested a 3-photo card (01.JPG RED 640×360, 02.JPG GREEN 512×384, 03.JPG BLUE 448×336 — distinct
+content and sizes, each <16 KB so it fully loads in the single chunk read).
+
+**Render — general and faithful.** The card is enumerated and the first photo plays exactly as in
+§12.113: decode #3 = 640×360 from 0x401ec000 reproducing 01.JPG pixel‑for‑pixel (RED field, white
+border + circle, "PHOTO 1 of 3"). Together with the §12.113 SDTEST (magenta) render this proves the
+0x80000800 engine decode is content‑general — it renders whatever card JPEG is staged, not a
+hardcoded image.
+
+**Advance — does NOT happen.** Neither trigger moves the slideshow off photo 1:
+- *Auto‑advance:* 90M instructions of free‑running produced only the one card decode.
+- *NEXT key:* injected via the modeled IR path at 46M/58M/70M (new `CT952_IRKEYS` multi‑key
+  injector). Each press **decodes correctly** — raw‑key `0x400235ac <- 0x3d` (KEY_NEXT) at pc
+  0x42414 — and the key **debounce (FUN_0000a2c4 @0xa2cc) runs**, called from the OSD/display loop
+  (o7≈0x59840). But the media command dispatchers **FUN_0001f4d0 and FUN_00022494 get ZERO hits**:
+  the debounced key is never turned into a media command, so there is no "load next file → re‑GO the
+  engine". No sector read for 02.JPG occurs after NEXT.
+
+**Diagnosis.** This is the pre‑existing input‑pump gap (tasks #9–#11), not a render defect. In this
+playback state the app‑level input consumer (INPUT / CC_DVD main‑loop → media command dispatch) that
+would route a debounced KEY_NEXT into FUN_0001f4d0/FUN_00022494 is not pumping, so keys decode and
+debounce but never dispatch. The single‑photo render is complete and faithful; multi‑photo iteration
+is gated on closing that input‑dispatch gap (the same one that blocks all interactive key handling
+after the boot plateau).

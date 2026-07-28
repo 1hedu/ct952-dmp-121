@@ -5977,3 +5977,47 @@ model. Verified end-to-end:
    sector is never actually executed during erase), so the stub verifies flashing
    *logic*, not hardware-safe driver placement. A hardware-ready body must embed
    the DRAM driver + the correct AP start offset — safest lifted from an OEM AP.
+
+### 12.89 Gate-level 0x80002800 SPI/PROM controller model -- real DRAM driver reflashes
+
+Modeled the serial-flash controller at the register level so the firmware's OWN
+DRAM-resident flash driver reprograms the emulated flash -- no WriteSPF shortcut.
+
+**Controller register banks** (per-channel, stride 4, channel byte [0x400238d3]=1):
+- CMD    `0x80002a20 + c*4` -- write issues an SPI transaction; word = the 24-bit
+  address stored LSB-first in the upper 3 bytes | opcode in the low byte.
+- STATUS `0x80002a24 + c*4` -- fw writes a control/clear value, then polls a "done"
+  bit (WREN/SE:0x1000, PP:0x800, RDSR:0x1000; model sets 0x4|0x800|0x1000).
+- DATA   `0x80002a2c + c*4` -- page-program byte stream.
+- RESULT `0x80002a30 + c*4` -- RDSR status byte read back.
+
+**Reversed command flow** (all from the decompressed TEXT driver):
+- dispatch `0x4001fe20`: st ctrl->STATUS, st cmdWord->CMD, poll STATUS & mask.
+- RDSR poll `0x40020324`: st 0->STATUS, st RDSR->CMD, poll STATUS&0x1000, RESULT&m==exp.
+- sector erase `0x4001ff80`: WREN -> RDSR(WEL) -> SE(0x20)+addr -> RDSR(WIP).
+- page program `0x400200a0`: per 256-byte page: WREN -> first byte to DATA -> PP(0x02)
+  at the page addr -> stream the remaining 255 bytes to DATA (RDSR-WIP between each).
+- post-erase unlock `0x400204c0` -> `0x4002046c`: WRSR(0x01) to clear protection.
+
+**Model** (`spi_ctrl_*` in machine.c, armed by m->spi_ctrl_on): standard serial
+NOR -- WREN(0x06)->WEL, WRDI(0x04)/WRSR(0x01)->clear WEL, RDSR(0x05)->WIP(=0)|WEL,
+SE(0x20)/BE(0xD8)->erase the sector to 0xFF, PP(0x02)->OPEN a streaming page-program
+at the addressed byte. The key subtlety: PP is a *stream* -- the command programs the
+bytes buffered before it and arms a running address; each later DATA write programs
+one more byte at that address (RDSR polls in between must NOT disturb it). Ops
+complete instantly (WIP reads 0) so every fw poll passes first try.
+
+**Two bugs the test caught (kept for the record):**
+1. WRSR (0x01, from 0x4002046c) wasn't clearing WEL, so 0x400204c0's `(RDSR&3)==0`
+   wait spun forever -> the whole call burned its budget. Fix: handle WRSR.
+2. Accumulate-then-flush was wrong (and mid-stream RDSR cleared the buffer): only the
+   first byte of each 256-byte page landed, the rest stayed 0xFF. Fix: stream each
+   DATA byte into the open page-program.
+
+**Verified:** boot normally (populates the driver config + decompresses TEXT/DATA
+into DRAM), arm the model, then CALL the real `WriteSPF(0x3d0fc)` via
+`--spitest ADDR:SIZE`. The real SE/PP helpers issue real SPI commands the model
+services against m->flash: SIZE bytes at ADDR match the staged sentinel exactly,
+16 erase + 16 program ops (the 64 KB sector + 0x1000-byte payload), and the surrounding flash is untouched. This is the
+faithful counterpart to the WriteSPF-contract model (12.88) -- same net effect,
+but driven end-to-end by the firmware's own driver code.

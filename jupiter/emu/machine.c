@@ -384,8 +384,14 @@ static void uart_tx(machine_t *m, int ch, uint32_t v)
 
 /* ---- I/O page ---- */
 
+static int spi_ctrl_read(machine_t *m, uint32_t off, uint32_t *out);
+
 static uint32_t io_read(machine_t *m, uint32_t off)
 {
+    if (m->spi_ctrl_on) {
+        uint32_t sv;
+        if (spi_ctrl_read(m, off, &sv)) return sv;
+    }
     switch (off) {
     case R_UART1_STAT:
         /* TX always ready; RX ready iff bytes are queued (host -> device) */
@@ -659,8 +665,125 @@ static void gpu_exec(machine_t *m, uint32_t ctl0)
     m->gpu_fontn = 0;   /* consume the font-index queue */
 }
 
+/* --- Gate-level SPI/PROM flash controller model (0x80002800) --------------- *
+ * Reversed from the firmware's DRAM flash driver (WriteSPF 0x3d0fc -> SPI SE/PP
+ * helpers 0x4001ff80 / 0x400200a0, command dispatch 0x4001fe20, RDSR poll
+ * 0x40020324). Register banks are per-channel (stride 4, channel index byte at
+ * DRAM 0x400238d3, =1 on this build):
+ *   CMD    0x2a20 + c*4   write = issue an SPI transaction (opcode in low byte,
+ *                          24-bit address byte-reversed in the upper 3 bytes)
+ *   STATUS 0x2a24 + c*4   fw writes a control/clear value, then polls a done bit
+ *                          (WREN/SE:0x4, PP:0x800, RDSR:0x1000)
+ *   DATA   0x2a2c + c*4   page-program byte FIFO (fw streams bytes here)
+ *   RESULT 0x2a30 + c*4   fw reads the RDSR status byte here
+ * The device is a standard serial NOR: WREN(0x06)->WEL, RDSR(0x05)->WIP|WEL,
+ * WRSR(0x01)->clear WEL, SE(0x20)->erase the 4 KB sector to 0xFF, PP(0x02)->
+ * OPEN a page-program at the command's address. The firmware's page-program is a
+ * STREAM: it writes the first data byte, issues PP at the page address, then
+ * writes the remaining bytes to the DATA reg one at a time (with RDSR polls in
+ * between) -- the controller programs each to the next address. So a PP command
+ * programs the bytes buffered before it and arms a streaming address; each later
+ * DATA write programs one more byte at the running address. Erase/program act on
+ * m->flash so the real driver reflashes for real; ops complete instantly (WIP
+ * always reads 0) so every fw poll passes on the first read. §12.89. */
+#define SPI_DONE_BITS 0x00001804u        /* 0x4 | 0x800 | 0x1000 (all fw polls) */
+
+static int spi_ctrl_bank(machine_t *m, uint32_t off, uint32_t *bank)
+{
+    uint32_t c = 0;
+    if (!m->spi_ctrl_on) return 0;
+    if (off < 0x2a20u || off > 0x2a3cu) return 0;
+    if (0x400238d3u - 0x40000000u < MACH_DRAM_SIZE)
+        c = m->dram[0x400238d3u - 0x40000000u];      /* active channel index */
+    if      (off == 0x2a20u + c*4u) { *bank = 0; return 1; }   /* CMD    */
+    else if (off == 0x2a24u + c*4u) { *bank = 1; return 1; }   /* STATUS */
+    else if (off == 0x2a2cu + c*4u) { *bank = 2; return 1; }   /* DATA   */
+    else if (off == 0x2a30u + c*4u) { *bank = 3; return 1; }   /* RESULT */
+    return 0;
+}
+
+static void spi_ctrl_cmd(machine_t *m, uint32_t word)
+{
+    uint32_t opcode = word & 0xFFu;
+    /* address bytes were placed LSB-first in the upper 3 bytes (0x4001ff80) */
+    uint32_t addr = ((word >> 24) & 0xFFu)
+                  | (((word >> 16) & 0xFFu) << 8)
+                  | (((word >> 8)  & 0xFFu) << 16);
+    switch (opcode) {
+    case 0x06:                                        /* WREN: arm a fresh op */
+        m->spi_wel = 1; m->spi_pp_active = 0; m->spi_fifo_len = 0; break;
+    case 0x04:                                        /* WRDI */
+        m->spi_wel = 0; m->spi_pp_active = 0; break;
+    case 0x01:                                        /* WRSR (unprotect) -- consumes WEL */
+        m->spi_wel = 0; m->spi_pp_active = 0; m->spi_fifo_len = 0; break;
+    case 0x05:                                        /* RDSR -> WIP(bit0)=0, WEL(bit1) */
+        m->spi_result = m->spi_wel ? 0x02u : 0x00u; break;  /* mid-stream: keep pp state */
+    case 0x20: case 0xD8:                             /* sector erase (4K/64K) */
+        if (m->spi_wel) {
+            uint32_t sz = (opcode == 0xD8) ? 0x10000u : 0x1000u;
+            uint32_t base = addr & ~(sz - 1u);
+            if ((uint64_t)base + sz <= m->flash_size) {
+                memset(m->flash + base, 0xFF, sz);
+                m->spi_erases++;
+            }
+        }
+        m->spi_wel = 0; m->spi_pp_active = 0; m->spi_fifo_len = 0; break;
+    case 0x02:                                        /* PP: open the page-program stream */
+        if (m->spi_wel) {
+            uint32_t i;
+            for (i = 0; i < m->spi_fifo_len; i++)     /* bytes buffered before PP */
+                if (addr + i < m->flash_size)
+                    m->flash[addr + i] &= m->spi_fifo[i];
+            m->spi_pp_addr = addr + m->spi_fifo_len;
+            m->spi_pp_active = 1;
+            m->spi_programs++;
+        }
+        /* The program completes instantly, so WEL auto-clears (the fw waits
+         * WEL==0 before the next page's WREN); streaming is gated on pp_active,
+         * not WEL, so clearing it here does not stop the current page. */
+        m->spi_wel = 0; m->spi_fifo_len = 0; break;
+    default:                                          /* READ/RDID/etc: no-op */
+        break;
+    }
+    m->spi_status |= SPI_DONE_BITS;                   /* signal completion */
+}
+
+static int spi_ctrl_write(machine_t *m, uint32_t off, uint32_t v)
+{
+    uint32_t bank;
+    if (!spi_ctrl_bank(m, off, &bank)) return 0;
+    switch (bank) {
+    case 0: spi_ctrl_cmd(m, v); break;                          /* CMD: execute */
+    case 1: m->spi_status = v & ~SPI_DONE_BITS; break;          /* STATUS: fw clears/arms */
+    case 2:                                                     /* DATA */
+        if (m->spi_pp_active) {                                 /* stream into open program */
+            if (m->spi_pp_addr < m->flash_size)
+                m->flash[m->spi_pp_addr] &= (uint8_t)(v & 0xFFu);
+            m->spi_pp_addr++;
+        } else if (m->spi_fifo_len < sizeof(m->spi_fifo)) {     /* buffer the pre-PP byte */
+            m->spi_fifo[m->spi_fifo_len++] = (uint8_t)(v & 0xFFu);
+        }
+        break;
+    case 3: m->spi_result = v; break;
+    }
+    return 1;
+}
+
+static int spi_ctrl_read(machine_t *m, uint32_t off, uint32_t *out)
+{
+    uint32_t bank;
+    if (!spi_ctrl_bank(m, off, &bank)) return 0;
+    switch (bank) {
+    case 1: *out = m->spi_status; break;                        /* STATUS (done bits) */
+    case 3: *out = m->spi_result; break;                        /* RESULT (RDSR value) */
+    default: *out = 0; break;
+    }
+    return 1;
+}
+
 static void io_write(machine_t *m, uint32_t off, uint32_t v)
 {
+    if (m->spi_ctrl_on && spi_ctrl_write(m, off, v)) return;
     /* Display bring-up trace (CT952_DISPTRACE): log writes to the OSD
      * size/enable register (0x1a54, bit28=OSD_EN), the OSD region regs
      * (0x1a40..0x1a5c), and the GAM_OSD palette (0x1c00..0x1cff) with PC +

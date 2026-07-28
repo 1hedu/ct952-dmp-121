@@ -173,10 +173,22 @@ ct952emu dp700wd.bin --aprun out.AP --flash-out after.bin --instr 5000000   # CT
 as the loader (`0x3e48`) does — under a **`WriteSPF`-contract flash-write model**
 (`CT952_FLASHWRITE`): it intercepts `WriteSPF` at its entry and applies the reversed
 erase+program to the emulated flash. `--flash-out` dumps the result to diff. This
-is a *contract-level* model (the reversed boundary), not a gate-level model of the
-`0x80002800` controller. Verified: a targeted sector write touches only that sector
-(boot region intact); a 4-sector reflash keeps the header + section table intact and
-the reflashed image **boots identically to the original**.
+is a *contract-level* model (the reversed boundary). Verified: a targeted sector
+write touches only that sector (boot region intact); a 4-sector reflash keeps the
+header + section table intact and the reflashed image **boots identically to the
+original**.
+
+For the *gate-level* alternative — driving the firmware's OWN DRAM-resident flash
+driver against a modeled `0x80002800` SPI controller (no `WriteSPF` shortcut):
+```sh
+ct952emu dp700wd.bin --rom-load --spitest 0x1a0000:0x1000 --flash-out after.bin
+```
+This boots normally (populating the driver config + decompressing the driver into
+DRAM), arms the controller model, and CALLs the real `WriteSPF` — whose real
+`SE`/`PP` helpers issue real SPI commands (WREN/RDSR/WRSR/SE/streaming-PP) that the
+model services against `m->flash`. Verified byte-exact against a staged sentinel
+(16 erase + 16 program ops, surrounding flash untouched). See §12.89 in
+`DP700WD_HW_REFERENCE.md`.
 
 ### Two constraints on a *hardware-ready* body (do not skip)
 1. **Size / compression.** A full `0..0x166000` image cannot be carried **raw**

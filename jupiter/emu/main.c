@@ -38,6 +38,9 @@ int main(int argc, char **argv)
     const char *snap_out = NULL, *snap_in = NULL;
     const char *aprun_path = NULL;    /* --aprun: run a UPG952A.AP body as a self-flasher */
     const char *flashout_path = NULL; /* --flash-out: dump the (possibly reflashed) flash */
+    int spitest = 0;                  /* --spitest: drive the REAL flash driver via the SPI ctrl model */
+    uint32_t spi_addr = 0x1a0000u, spi_size = 0x1000u;
+    uint64_t spi_boot = 20000000ull;   /* enough to run flash-init (PROM_Config...Ok) */
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -101,6 +104,13 @@ int main(int argc, char **argv)
             aprun_path = argv[++i];
         else if (!strcmp(argv[i], "--flash-out") && i + 1 < argc)
             flashout_path = argv[++i];
+        else if (!strcmp(argv[i], "--spitest") && i + 1 < argc) {
+            char *cp; spi_addr = (uint32_t)strtoul(argv[++i], &cp, 0);
+            if (cp && *cp == ':') spi_size = (uint32_t)strtoul(cp + 1, NULL, 0);
+            spitest = 1;
+        }
+        else if (!strcmp(argv[i], "--spitest-boot") && i + 1 < argc)
+            spi_boot = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -303,6 +313,52 @@ int main(int argc, char **argv)
                     "entry=0x%08x, flash-write model ON\n", bodylen, entry);
         }
         free(ap);
+    }
+
+    /* --spitest ADDR:SIZE: prove the gate-level SPI controller model by running
+     * the firmware's OWN DRAM-resident flash driver against it. Boot normally
+     * (populating the driver's config + decompressing TEXT/DATA into DRAM), arm
+     * the controller model, stage a sentinel in DRAM, then CALL the real WriteSPF
+     * (0x3d0fc) -- which runs the real SE/PP helpers, issuing real SPI commands
+     * that the model services against m->flash. --flash-out dumps the result.
+     * §12.89. Needs --rom-load so the driver is actually resident. */
+    if (spitest) {
+        uint8_t *src;
+        int rc;
+        fprintf(stderr, "[spitest] booting %llu instrs to populate the flash driver...\n",
+                (unsigned long long)spi_boot);
+        machine_run(m, spi_boot);
+        fprintf(stderr, "[spitest] boot pc=0x%08x; arming SPI controller model\n", m->cpu.pc);
+        m->spi_ctrl_on = 1;
+        m->spi_erases = m->spi_programs = 0;
+        src = machine_dram_ptr(m, 0x40700000u);      /* scratch source buffer */
+        if (!src) { fprintf(stderr, "[spitest] scratch DRAM unmapped\n"); return 1; }
+        {
+            uint32_t k; static const char pat[] = "CT952A-SPICTRL-REAL-DRIVER-";
+            for (k = 0; k < spi_size; k++) src[k] = pat[k % (sizeof(pat) - 1)];
+        }
+        fprintf(stderr, "[spitest] calling real WriteSPF(0x3d0fc)(flash=0x%06x, "
+                "src=0x40700000, size=0x%x)\n", spi_addr, spi_size);
+        rc = machine_call(m, 0x3d0fcu, spi_addr, 0x40700000u, spi_size,
+                          0x40760000u, 20000000ull);
+        fprintf(stderr, "[spitest] WriteSPF returned rc=%d (%%o0=0x%x); SPI ops: "
+                "%llu erase, %llu program\n", rc, sparc_get_reg(&m->cpu, 8),
+                (unsigned long long)m->spi_erases, (unsigned long long)m->spi_programs);
+        /* verify: flash[spi_addr..+size] should now equal the staged sentinel */
+        {
+            uint32_t k, bad = 0;
+            for (k = 0; k < spi_size; k++)
+                if (m->flash[spi_addr + k] != src[k]) bad++;
+            fprintf(stderr, "[spitest] flash vs sentinel: %s (%u mismatched byte(s))\n",
+                    bad ? "MISMATCH" : "MATCH", bad);
+        }
+        if (flashout_path) {
+            FILE *ff = fopen(flashout_path, "wb");
+            if (ff) { fwrite(m->flash, 1, m->flash_size, ff); fclose(ff);
+                fprintf(stderr, "[spitest] dumped flash to %s\n", flashout_path); }
+        }
+        machine_free(m); free(m);
+        return 0;
     }
 
     if (gdb_port) {

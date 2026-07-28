@@ -55,6 +55,20 @@ typedef struct machine {
     uint8_t *bram;          /* 0xB0000000 scratch SRAM (firmware RW use) */
     uint32_t io[MACH_IO_SIZE / 4];
 
+    /* Gate-level SPI/PROM flash controller model (0x80002800 banks; §12.89).
+     * When armed (spi_ctrl_on), the firmware's own DRAM-resident erase/program
+     * routines (WriteSPF 0x3d0fc -> SE/PP over this controller) drive m->flash
+     * for real. Kept inert during normal boot; the test harness arms it. */
+    int      spi_ctrl_on;      /* 1 => model the controller banks */
+    uint8_t  spi_wel;          /* SPI write-enable latch (WREN sets, PP/SE clear) */
+    uint32_t spi_status;       /* STATUS bank backing (done bits polled by fw) */
+    uint32_t spi_result;       /* RESULT bank backing (RDSR value read by fw) */
+    uint8_t  spi_fifo[512];    /* pre-PP data bytes (before the page-program opens) */
+    uint32_t spi_fifo_len;
+    int      spi_pp_active;    /* a page-program is streaming */
+    uint32_t spi_pp_addr;      /* next flash address the stream programs */
+    uint64_t spi_erases, spi_programs;   /* op counters for the harness */
+
     /* timers */
     uint32_t presc_cnt;
     uint64_t t3_value;

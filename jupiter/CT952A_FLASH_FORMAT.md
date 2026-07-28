@@ -89,29 +89,32 @@ the body to DRAM `0x4009a000`, verifies the body checksum, and **jumps into the
 AP**. That loaded AP performs the persistent serial-flash reprogram of the AP
 area (driver primitives at `0x3d0fc` / `0x3d1cc`, 64 KB-aligned erase-then-program).
 
-### Header (512 bytes = `0x200`, big-endian) — what the loader enforces
-| off | size | field | requirement | proof |
-|---|---|---|---|---|
-| `0x00` | u32 | magic0 | `0x43543930` (`"CT90"`) | `0x4260`–`0x426c` |
-| `0x04` | u32 | magic1 | `0x392d4150` (`"9-AP"`) → 8 bytes = `CT909-AP` | `0x4274`–`0x4280` |
-| `0x08` | u32 | force flag | `1` ⇒ allow oversize + reboot-on-fail | `0x4304` |
-| `0x0C` | u32 | AP total size | `≤ 0x166000`, 4-byte aligned | `0x42f0`–`0x42fc` |
-| `0x10` | u32 | checksum-enable | `1` ⇒ body checksum verified | `0x4054`–`0x405c` |
-| `0x14` | u32 | APPacker version | `≥ 5` (`> 4`) | `0x4324`–`0x432c` |
-| `0x18` | u32 | chip / auto-upgrade code | **`0x41`** (952**A**, `'A'`) or `0x01` (universal) | `0x41dc`–`0x41e8`, helper `0x414c` |
-| `0x2E` | u16 | body checksum | `(Σ bytes[0x200 .. size]) & 0xFFFF` | `0x4090`–`0x4098`, routine `0x40320` |
-| `0x30`,`0x34` | u32 | AP entry / launch params | consumed at jump | `0x412c`/`0x4138` |
-| `0x1C`–`0x2D`, `0x36`–`0x1FF` | — | copied but not read by this layer | undetermined | — |
+### Header = the firmware's `AP_INFO` struct (512 bytes = `0x200`, big-endian)
+Field names/semantics are the firmware's own source (`aploader.h` `AP_INFO`,
+`aploader.c` `AP_Identify`/`AP_Loader`), each cross-checked against `dp700wd.bin`.
 
-Device-side (not file fields): DRAM-type detect (`0x40260`) must not be the
-`0x50000000` "unknown" sentinel; the "now" chip code compared at `0x18` is the
-hard-wired constant `0x41`.
+| off | field (`AP_INFO`) | requirement | source ↔ binary |
+|---|---|---|---|
+| `0x00` | `dwIdentify[0]` | `0x43543930` (`"CT90"`) | `CT909AP_IDENTIFY1` ↔ `0x4260` |
+| `0x04` | `dwIdentify[1]` | `0x392d4150` (`"9-AP"`) → `CT909-AP` | `CT909AP_IDENTIFY2` ↔ `0x4274` |
+| `0x08` | `dwAP_Type` | AP id; `1` = `AP_AUTO_UPGRADE` | `aploader.h` |
+| `0x0C` | `dwAP_Size` | `≤ 0x166000`, 4-byte aligned | `AP_Identify` ↔ `0x42f0` |
+| `0x10` | `dwExternalFlag` | `TRUE` ⇒ checksum verified + section-loaded | `AP_Loader` STEP4 |
+| `0x14` | `dwVersionAP` | `> 4` | `AP_Identify` ↔ `0x4324` |
+| `0x18` | `dwChipVersion` | **`0x41`** (`IC_VERSION_952A`) or `0x01` | `Winav.h` ↔ `0x41dc` (both = `0x41`) |
+| `0x1C`–`0x2B` | `dwDescription[4]` | free text | — |
+| `0x2C` | `dwCheckSum` | low WORD = `HAL_CheckSum(body[0x200:size])` | `hsystem.c` ↔ `0x40320` |
+| `0x30` | `dwAP_SP` | loaded-AP stack pointer (**not** an entry) | `AP_Loader` STEP6 |
+| `0x34` | `dwAP_UNZIP_BUF` | UZIP work buffer for section decompress | `AP_Loader` STEP6 |
+| `0x38`–`0x1FF` | `dwReserved[114]` | — | — |
 
-### The two checksums — both plain 16-bit additive byte-sums (NOT CRCs)
-1. **Per flash section**: `Σ(unpacked bytes) & 0xFFFF` in section-table entry `+0x14`.
-2. **AP body**: `Σ(file bytes 0x200 .. size) & 0xFFFF`, big-endian at header `0x2E`,
-   verified only when header `0x10 == 1`. Seed 0, no polynomial, no reflection.
-   Word-stepped, so **`size` must be 4-byte aligned**; the 512-byte header is excluded.
+### The two checksums — both `HAL_CheckSum` (16-bit additive byte-sum, NOT CRCs)
+`HAL_CheckSum` (`hsystem.c`) sums every byte over `[start,end)` into a 16-bit WORD,
+stepping by DWORD (so the range must be 4-byte aligned):
+1. **Per flash section**: over the *unpacked* section bytes, in section-table entry `+0x14`.
+2. **AP body**: over `body[0x200 .. dwAP_Size]`, low WORD of `dwCheckSum` (`0x2C`),
+   verified when `dwExternalFlag == TRUE`. The `0x2E` u16 `ctkap` reads is exactly
+   that low word (big-endian `dwCheckSum` at `0x2C`; high word 0).
 
 ### Flash write range / recoverability
 The reserved **AP code area is `0x166000` bytes** and the size check bounds the AP to

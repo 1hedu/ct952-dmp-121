@@ -70,27 +70,41 @@ def uzip_compress(data):
     hdr = struct.pack(">III", w0 ^ UZIP_KEY, w1 ^ UZIP_KEY, w2 ^ UZIP_KEY) + b"\x5a"
     return hdr + stream
 
-# ---- CT909-AP update-container header (512 bytes), all big-endian ------------
-AP_MAGIC0 = 0x43543930   # "CT90"
-AP_MAGIC1 = 0x392d4150   # "9-AP"   -> first 8 bytes = "CT909-AP"
-AP_HDR_LEN   = 0x200
-AP_MAX_SIZE  = 0x166000   # reserved AP code area
-OFF_FORCE    = 0x08       # u32: 1 => allow oversize + reboot-on-fail
-OFF_SIZE     = 0x0c       # u32: total AP size (incl. header), <= 0x166000, 4-aligned
-OFF_CKEN     = 0x10       # u32: 1 => body checksum is verified
-OFF_PKVER    = 0x14       # u32: APPacker version, must be >= 5
-OFF_CHIP     = 0x18       # u32: chip/auto-upgrade code, 0x41 (952A) or 0x01 (universal)
-OFF_CKSUM    = 0x2e       # u16: sum16(body[0x200:size])
-OFF_ENTRY    = 0x30       # u32: AP entry address; loader jumps here after copying the
-                          #      body to DRAM. Body is copied to AP_BODY_DRAM, entry ==
-                          #      the stub's _start there.
+# ---- AP_INFO update-container header (512 bytes), all big-endian -------------
+# Field layout is the firmware's own `AP_INFO` struct (aploader.h), and every
+# requirement is the loader's own source (AP_Identify/AP_Loader in aploader.c),
+# cross-checked against dp700wd.bin: chip code 0x41 (IC_VERSION_952A, Winav.h) is
+# the constant the binary's validator compares; the AP body is copied to
+# DS_AP_CODE_AREA = 0x4009a000 (verified: 13 sethi hits in the binary; the repo's
+# dvd_dram_16m.h 0x4008b000 is a different build variant); the checksum is
+# HAL_CheckSum (hsystem.c) -- an additive byte-sum into a 16-bit WORD.
+AP_MAGIC0 = 0x43543930   # "CT90"  (CT909AP_IDENTIFY1)
+AP_MAGIC1 = 0x392d4150   # "9-AP"  (CT909AP_IDENTIFY2) -> first 8 bytes = "CT909-AP"
+AP_HDR_LEN   = 0x200      # sizeof(AP_INFO)
+AP_MAX_SIZE  = 0x166000   # reserved AP code area (DRAM end - DS_AP_CODE_AREA)
+OFF_APTYPE   = 0x08       # u32 dwAP_Type       (AP id; AP_AUTO_UPGRADE = 1)
+OFF_SIZE     = 0x0c       # u32 dwAP_Size       (total, incl. header; <= AP_MAX_SIZE, 4-aligned)
+OFF_EXTFLAG  = 0x10       # u32 dwExternalFlag  (TRUE => body checksum verified + section-loaded)
+OFF_PKVER    = 0x14       # u32 dwVersionAP     (APPacker version, must be > 4)
+OFF_CHIP     = 0x18       # u32 dwChipVersion   (== IC_VERSION_ID 0x41=952A, or 0x01 reserved)
+OFF_CKSUM    = 0x2e       # low WORD of u32 dwCheckSum @0x2c = HAL_CheckSum(body[0x200:size])
+OFF_AP_SP    = 0x30       # u32 dwAP_SP         (stack pointer for the loaded AP; NOT an entry)
+OFF_UNZIP    = 0x34       # u32 dwAP_UNZIP_BUF  (UZIP work buffer for section decompression)
 
 # ---- self-flashing AP body --------------------------------------------------
-# The firmware AP loader (0x3e48) copies the body (file[0x200:size]) to this DRAM
-# address and jumps to OFF_ENTRY. APSTUB_BIN is a tiny SPARC V8 (big-endian) stub
-# (source: apstub.S) whose _start sits at the body base. It reads a descriptor the
-# packer places at body+0x100 and loops the firmware's XIP WriteSPF (flash 0x3d0fc)
-# over a carried image, 64 KB per call, then signals + halts. Descriptor (BE):
+# NOTE ON FORMAT (per aploader.c): a REAL loader-accepted AP body is a *section-
+# table image* -- AP_Info(0x200) + [image header 0x10][section table] + compressed
+# sections. AP_Loader copies it to DS_AP_CODE_AREA (0x4009a000), checksums it, then
+# ROMLD_BOOT_LoadSectionAndRun DECOMPRESSES the AP's sections into DRAM and runs it
+# (so the AP's flash driver runs from DRAM -- the "DRAM-driver relocation" is inherent
+# to this format). The `mkflasher` body below is instead a RAW code stub for the
+# emulator's direct-jump harness (--aprun / --apflash), which proves the flash
+# mechanism but is NOT what the on-device loader section-loads. A loader-compatible
+# AP needs the section-table wrapper (future `mksectionap`).
+#
+# APSTUB_BIN is a tiny SPARC V8 (big-endian) stub (source: apstub.S) whose _start
+# sits at the body base. It reads a descriptor at body+0x100 and loops the firmware's
+# XIP WriteSPF (flash 0x3d0fc) over a carried image, 64 KB/call, then signals + halts.
 #   +0x100  u32 nchunks
 #   +0x104  nchunks * { u32 dstFlashAddr; u32 srcBodyOff; u32 size }
 #   +....   image bytes (srcBodyOff is a byte offset within the body)
@@ -171,9 +185,10 @@ def cmd_repack(in_path, out_path):
     return 0
 
 def _ap_fields(d):
-    return dict(magic0=be32(d,0), magic1=be32(d,4), force=be32(d,OFF_FORCE),
-                size=be32(d,OFF_SIZE), cken=be32(d,OFF_CKEN), pkver=be32(d,OFF_PKVER),
-                chip=be32(d,OFF_CHIP), cksum=be16(d,OFF_CKSUM))
+    return dict(magic0=be32(d,0), magic1=be32(d,4), aptype=be32(d,OFF_APTYPE),
+                size=be32(d,OFF_SIZE), extflag=be32(d,OFF_EXTFLAG), pkver=be32(d,OFF_PKVER),
+                chip=be32(d,OFF_CHIP), cksum=be16(d,OFF_CKSUM), cksum_hi=be16(d,0x2c),
+                ap_sp=be32(d,OFF_AP_SP), unzip=be32(d,OFF_UNZIP))
 
 def cmd_apinfo(path):
     d = open(path, "rb").read()
@@ -191,15 +206,19 @@ def cmd_apinfo(path):
     print("  signature: %r" % sig)
     chk(f["magic0"] == AP_MAGIC0, "magic0 0x%08x (want 0x%08x 'CT90')" % (f["magic0"], AP_MAGIC0))
     chk(f["magic1"] == AP_MAGIC1, "magic1 0x%08x (want 0x%08x '9-AP')" % (f["magic1"], AP_MAGIC1))
-    chk(f["chip"] in (0x41, 0x01), "chip/auto-upgrade code 0x%x (want 0x41=952A or 0x01)" % f["chip"])
-    chk(0 < size <= AP_MAX_SIZE, "size 0x%x (want 1..0x%x)" % (size, AP_MAX_SIZE))
-    chk(size % 4 == 0, "size 4-byte aligned")
-    chk(f["pkver"] >= 5, "APPacker version %d (want >= 5)" % f["pkver"])
-    print("  force=%d checksum-enabled=%d" % (f["force"], f["cken"]))
-    if size and size <= len(d):
+    chk(f["chip"] in (0x41, 0x01), "dwChipVersion 0x%x (want 0x41=IC_VERSION_952A, or 0x01 reserved)" % f["chip"])
+    chk(0 < size <= AP_MAX_SIZE, "dwAP_Size 0x%x (want 1..0x%x)" % (size, AP_MAX_SIZE))
+    chk(size % 4 == 0, "dwAP_Size 4-byte aligned (HAL_CheckSum steps by DWORD)")
+    chk(f["pkver"] > 4, "dwVersionAP %d (want > 4)" % f["pkver"])
+    print("  dwAP_Type=%d (auto-upgrade=1) dwExternalFlag=%d dwAP_SP=0x%08x dwAP_UNZIP_BUF=0x%08x"
+          % (f["aptype"], f["extflag"], f["ap_sp"], f["unzip"]))
+    if f["extflag"] and size and size <= len(d):
         body = sum16(d[AP_HDR_LEN:size])
-        chk(body == f["cksum"], "body checksum 0x%04x @0x2e (computed 0x%04x over [0x200:0x%x))"
-            % (f["cksum"], body, size))
+        chk(body == f["cksum"] and f["cksum_hi"] == 0,
+            "dwCheckSum 0x%04x @0x2e (HAL_CheckSum computed 0x%04x over [0x200:0x%x); hi word 0x%04x)"
+            % (f["cksum"], body, size, f["cksum_hi"]))
+    elif not f["extflag"]:
+        print("  --   dwExternalFlag=0: body checksum not verified by the loader")
     else:
         print("  FAIL body checksum: size 0x%x exceeds file length %d" % (size, len(d))); ok = False
     print("=> %s" % ("VALID" if ok else "INVALID -- the device would reject this"))
@@ -208,49 +227,39 @@ def cmd_apinfo(path):
 def cmd_apfix(path):
     d = bytearray(open(path, "rb").read())
     size = len(d)
-    if size % 4:                                   # checksum reads whole words
+    if size % 4:                                   # HAL_CheckSum steps by DWORD
         d += b"\x00" * (4 - size % 4); size = len(d)
     struct.pack_into(">I", d, OFF_SIZE, size)
-    struct.pack_into(">I", d, OFF_CKEN, 1)
-    struct.pack_into(">H", d, OFF_CKSUM, sum16(d[AP_HDR_LEN:size]))
+    struct.pack_into(">I", d, OFF_EXTFLAG, 1)      # dwExternalFlag=TRUE => checksum verified
+    struct.pack_into(">I", d, 0x2c, sum16(d[AP_HDR_LEN:size]))  # dwCheckSum (hi word 0)
     open(path, "wb").write(d)
-    print("apfix: size=0x%x checksum=0x%04x written to %s" % (size, be16(d, OFF_CKSUM), path))
+    print("apfix: dwAP_Size=0x%x dwCheckSum=0x%04x written to %s" % (size, be16(d, OFF_CKSUM), path))
 
 def cmd_apwrap(body_path, out_path, code=0x41):
     body = open(body_path, "rb").read()
-    hdr = bytearray(AP_HDR_LEN)
-    struct.pack_into(">I", hdr, 0x00, AP_MAGIC0)
-    struct.pack_into(">I", hdr, 0x04, AP_MAGIC1)
-    struct.pack_into(">I", hdr, OFF_FORCE, 1)
-    struct.pack_into(">I", hdr, OFF_CKEN, 1)
-    struct.pack_into(">I", hdr, OFF_PKVER, 5)
-    struct.pack_into(">I", hdr, OFF_CHIP, code)
-    d = bytearray(hdr) + bytearray(body)
-    if len(d) % 4:
-        d += b"\x00" * (4 - len(d) % 4)
-    struct.pack_into(">I", d, OFF_SIZE, len(d))
-    struct.pack_into(">H", d, OFF_CKSUM, sum16(d[AP_HDR_LEN:len(d)]))
+    d = _ap_finalize(bytearray(AP_HDR_LEN) + bytearray(body), code, 0)
     if len(d) > AP_MAX_SIZE:
-        print("WARNING: size 0x%x exceeds reserved 0x%x (needs force flag / will be refused)"
+        print("WARNING: size 0x%x exceeds reserved 0x%x (dwAP_Size check will refuse it)"
               % (len(d), AP_MAX_SIZE))
     open(out_path, "wb").write(d)
-    print("apwrap: wrote %s (0x%x bytes, chip=0x%x, checksum=0x%04x)"
+    print("apwrap: wrote %s (0x%x bytes, dwChipVersion=0x%x, dwCheckSum=0x%04x)"
           % (out_path, len(d), code, be16(d, OFF_CKSUM)))
-    print("NOTE: the body must be a valid self-flashing AP; this only builds the container.")
+    print("NOTE: a loader-accepted body is a section-table image (see the format header);"
+          " this only builds the AP_INFO container + checksum.")
 
-def _ap_finalize(d, code, entry):
-    """Fill header (magic/flags/pkver/chip/entry), pad to 4, set size + checksum."""
+def _ap_finalize(d, code, ap_sp):
+    """Fill AP_INFO header (magic/type/flag/ver/chip/sp), pad to 4, set size + checksum."""
     struct.pack_into(">I", d, 0x00, AP_MAGIC0)
     struct.pack_into(">I", d, 0x04, AP_MAGIC1)
-    struct.pack_into(">I", d, OFF_FORCE, 1)
-    struct.pack_into(">I", d, OFF_CKEN, 1)
-    struct.pack_into(">I", d, OFF_PKVER, 5)
-    struct.pack_into(">I", d, OFF_CHIP, code)
-    struct.pack_into(">I", d, OFF_ENTRY, entry)
+    struct.pack_into(">I", d, OFF_APTYPE, 1)       # dwAP_Type = AP_AUTO_UPGRADE
+    struct.pack_into(">I", d, OFF_EXTFLAG, 1)      # dwExternalFlag = TRUE (checksum + section-load)
+    struct.pack_into(">I", d, OFF_PKVER, 5)        # dwVersionAP (> 4)
+    struct.pack_into(">I", d, OFF_CHIP, code)      # dwChipVersion (0x41 = IC_VERSION_952A)
+    struct.pack_into(">I", d, OFF_AP_SP, ap_sp)    # dwAP_SP (loaded-AP stack pointer)
     if len(d) % 4:
         d += b"\x00" * (4 - len(d) % 4)
     struct.pack_into(">I", d, OFF_SIZE, len(d))
-    struct.pack_into(">H", d, OFF_CKSUM, sum16(d[AP_HDR_LEN:len(d)]))
+    struct.pack_into(">I", d, 0x2c, sum16(d[AP_HDR_LEN:len(d)]))  # dwCheckSum (hi word 0)
     return d
 
 def cmd_mkflasher(out_path, writes, code=0x41, stub_path=None):

@@ -6049,3 +6049,45 @@ firmware code except the modeled controller. Note the caveat from 12.88 still ho
 the body targets a sector that does NOT hold the XIP WriteSPF trampoline; a hardware
 body that rewrites the low image must run a DRAM copy of the flash driver (as the OEM
 AP does), so it never executes flash it is erasing.
+
+### 12.91 Firmware SOURCE found in-repo; AP format + DRAM-driver reloc verified src↔binary
+
+The repo carries the firmware's own C source -- `aploader.c` (AP loader), `spflash.c`
+(SPI flash driver), `hsystem.c` (`HAL_CheckSum`), `Winav.h` (IC versions). No OEM
+`UPG952A.AP` file is downloadable, but the source + our binary together pin the whole
+format down. Everything below is cross-checked against `dp700wd.bin`.
+
+**Controller model confirmed exact.** `spflash.c` `HLCHANG(I) = (I<<24) | ((I&0xff00)<<8)
+| ((I&0xff0000)>>8)` is byte-identical to the gate-level model's address encode; opcodes
+PP=0x02, SE=0x20/0xD8, WREN=0x06, RDSR=0x05, WRSR=0x01 and the STATUS control values
+`Format_Page_Program`=0x0c / `Format_Sector_Erase`=0x0b all match what the model services.
+
+**Checksum confirmed.** `HAL_CheckSum` (`hsystem.c`) = additive byte-sum into a 16-bit
+WORD over `[start,end)` stepping by DWORD -- exactly `ctkap` `sum16` and the binary's
+`0x40320`. AP-body range = `body[0x200 : dwAP_Size]`.
+
+**AP_INFO header corrected to source** (`aploader.h`): `0x08`=`dwAP_Type` (auto-upgrade=1),
+`0x10`=`dwExternalFlag`, `0x18`=`dwChipVersion`, `0x2C`=`dwCheckSum`, `0x30`=`dwAP_SP`
+(a stack pointer, NOT an entry -- my earlier "entry@0x30" was wrong), `0x34`=`dwAP_UNZIP_BUF`.
+`ctkap.py apinfo` now names/validates these faithfully.
+
+**Key constants -- source has variants, binary is authoritative:**
+- `IC_VERSION_952A = 0x41` (`Winav.h`) == the binary's chip-check constant. VERIFIED.
+- `DS_AP_CODE_AREA` (AP body dest): the repo's `dvd_dram_16m.h` says `0x4008b000`, but a
+  scan of `dp700wd.bin` shows **`0x4009a000` used 13x and `0x4008b000` zero times** -- our
+  binary is a different DRAM-layout build. `0x4009a000` (my original reversal) is correct.
+- `AP_TABLE_ADDRESS = 0x40000800` (source) == 6 sethi hits in the binary. VERIFIED.
+
+**The DRAM-driver relocation -- answered by the format itself.** `AP_Loader` STEP6 runs
+`ROMLD_BOOT_LoadSectionAndRun((PSECTION_ENTRY)AP_TABLE_ADDRESS, dwAP_UNZIP_BUF, dwAP_SP)`:
+a loader-accepted AP body is a **section-table image** (AP_INFO + [image hdr 0x10][section
+table] + compressed sections), and the loader DECOMPRESSES the AP's sections into DRAM and
+runs it. So the AP's flash driver runs from DRAM by construction -- it never executes flash
+it is erasing. That is exactly the reloc; it's inherent to the AP format, not something a
+body has to hand-roll.
+
+**Consequence for our tooling.** `mkflasher`'s body is a RAW code stub (entry at body base)
+for the emulator's direct-jump harness (`--aprun`/`--apflash`) -- it proves the flash
+mechanism but the on-device loader, which *section-loads*, would not run it. A loader-
+compatible AP needs the section-table wrapper: a small flasher app linked to a DRAM LMA,
+UZIP-packed as a section-table image behind the AP_INFO header (a future `ctkap mksectionap`).

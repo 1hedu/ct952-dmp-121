@@ -1447,3 +1447,33 @@ new index is not triggered, so every advance re-parses photo 1's buffer. Closing
 iteration = wiring the advance's index change to an info.a bm_read_file for that index (the
 `0xcb328←…←0x190b4←info.a←0x6308←0x74cc` VFS path that loaded 01.JPG at 44.85M). That is the open
 thread; everything upstream of it is verified working.
+
+### 12.117 ★★ Multi-photo advance root cause: DSP mode-9 torn down by the transition orchestrator
+
+Traced the photo-2 stall to its root — the slide-transition orchestrator **FUN_00061170**
+(entry 0x61170), which runs on every advance. DSP-state trace (0x4003996c/0x40039948/0x4003991a +
+FUN_0005a50c) across a NEXT run:
+
+- **Photo 1 (working):** FUN_0005a50c(2) sets `DAT_4003996c = 0x20` (DSP mode-9 / MM decode, pc
+  0x5a6c8, 44.657M) and it **persists** through the file load (44.85M) and engine GO (44.858M).
+- **Photo 2 (after NEXT):** FUN_0005a50c(2) again sets `DAT_4003996c = 0x20` at 47.243M — but
+  **0.19M instructions later FUN_00061170 tears it right back down**: `DAT_40039948 = 0`,
+  `DAT_4003996c = 0` (pc 0x611b8 / FUN_00036ff0, 47.429M), and it is never restored.
+
+`FUN_00061170` then enters two bounded poll loops (`FUN_000375a0` — the decode-status reader —
+3000 then 30000 iterations) waiting for the parser to reach state 1/2. But with mode-9 torn down,
+the file load (info.a read of 02.JPG) and the engine driver `FUN_0009b9ac` never re-fire, so the
+decode never completes; the loops eventually let `DAT_4003263c` reach 2 (55.1M) on the **stale
+photo-1 buffer**. Net: 0 READ18 and 0 ENGGO for photo 2 — a chicken-and-egg in the DSP mode-9
+re-entry (the transition tears down the very mode the decode it waits on requires).
+
+**Full advance map (verified end to end):**
+key → dispatch (0xa720) → FUN_000260f4 → FUN_0001bec0 case '=' → FUN_0001d41c(0) [index++] →
+FUN_0001d57c/FUN_00061170 [transition] → **DSP mode-9 torn down, engine never re-driven** → parser
+re-completes on stale data → no new decode.
+
+**Assessment.** Every layer from the keypress to the parser re-completion is verified working; the
+sole faithful blocker is the DSP mode-9 re-entry for the transition path (FUN_00061170 teardown +
+the engine re-driver `FUN_0009b9ac` / info.a read not firing for the advanced index). This is the
+same DSP-mode/scheduling layer that has gated the boot throughout; resolving it faithfully is a deep
+change, not a localized fix. Single-photo render remains complete and faithful.

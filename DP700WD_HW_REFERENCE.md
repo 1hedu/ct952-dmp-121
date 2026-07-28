@@ -6125,10 +6125,14 @@ sentinel, sector tail 0xFF, and the boot region [0..0x3000), the XIP WriteSPF se
    Load|ProgEntry section to jump to (dwCheckSumFlag bit1); its checksum is the byte-sum
    of the UNPACKED bytes at the LMA (romld.c ROMLD_LoadSectionTo).
 
-**Known harness artifact:** after the reflash the flasher error-traps (trap 0x02) instead
-of its clean `ta 0`, because the driver's `wr %psr` (PIL mask/restore) desyncs CWP under
-the single-stepped machine_call (WIM=0). The reflash completes first (16+16 ops, bytes
-verified); on hardware the AP reboots rather than halting, so this path is emulator-only.
+**Clean-halt fix (was a trap, now resolved -- §12.94):** the flasher first ended on a
+stray `trap 0x02 @ 0x41400804`. A pc-ring trace showed the reflash always completed and
+the flasher reached its own `ta 0`, but the firmware driver/loader leaves traps enabled
+(ET=1), so `ta 0` took a REAL trap to the vector (tbr 0x40000000 | tt 0x80<<4 = 0x40000800)
+and executed the section-table bytes as code -> illegal instruction. Fix: the flasher
+clears ET (`rd %psr; andn 0x20; wr %psr`) before `ta 0`, so the halt is error-mode
+regardless of ET. It now stops cleanly at its own `ta 0` (trap 0x80 @ 0x405000e4). On
+hardware the AP reboots here instead; the `ta 0` halt is only the emulator's end marker.
 
 So the COMPLETE on-device update path -- AP_INFO validation, MoveSectionTable, the real
 ROMLD_BOOT_LoadSectionAndRun section loader, the flasher app running from its DRAM LMA,

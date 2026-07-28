@@ -330,6 +330,16 @@ static mp_obj_t ct952_call(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ct952_call_obj, 1, 5, ct952_call);
 
+// resume() -- for a PROC1-seize app: hand control back to the firmware, which
+// continues from exactly where it was seized (with whatever peek/poke/call
+// mutations Python made to the frozen state now in effect). The app does not
+// run past this point.
+static mp_obj_t ct952_resume(void) {
+    *(volatile uint32_t *)0x80007FE8u = 0x0C0FFEE0u;
+    for (;;) { }   // spin until the emulator restores the firmware context
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(ct952_resume_obj, ct952_resume);
+
 /* ---- SD host controller (SDHC spec, base 0xA0001100) ------------------------
  * A minimal bare-metal SD driver: the emulator presents a FAT card image
  * (CT952_SDCARD) as an inserted SDHC card and serves CMD18 block reads by DMA.
@@ -428,6 +438,7 @@ static const mp_rom_map_elem_t ct952_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_poke32), MP_ROM_PTR(&ct952_poke32_obj) },
     { MP_ROM_QSTR(MP_QSTR_poke_bytes), MP_ROM_PTR(&ct952_poke_bytes_obj) },
     { MP_ROM_QSTR(MP_QSTR_call), MP_ROM_PTR(&ct952_call_obj) },
+    { MP_ROM_QSTR(MP_QSTR_resume), MP_ROM_PTR(&ct952_resume_obj) },
     { MP_ROM_QSTR(MP_QSTR_sd_present), MP_ROM_PTR(&ct952_sd_present_obj) },
     { MP_ROM_QSTR(MP_QSTR_sd_init), MP_ROM_PTR(&ct952_sd_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_sd_read), MP_ROM_PTR(&ct952_sd_read_obj) },

@@ -5820,3 +5820,54 @@ primitive (seize PROC1, call the full announce path, restore PROC1's saved
 context, and let it run) -- the current seize freezes PROC1 with no resume, and
 concurrent PROC2 calls into eCos would race the non-SMP kernel. That primitive
 is the next tool; the diagnosis (blocked-wait, producer-gated) is now firm.
+
+### 12.84 Call-and-resume tool; park gate localized (but debugger is emulator-only)
+
+Built call-and-resume for the seize debugger: the seize saves PROC1's full
+context; `ct952.resume()` (writes 0x0C0FFEE0 to 0x80007FE8) restores it so the
+firmware continues from the seize point after Python mutates the frozen state.
+Verified: `[PYAPP] resumed PROC1 from saved context (pc=0x4001e6c0)`.
+
+Used it to chase the source-present announce:
+- `MediaPresentPost` (0x6130) sets `MediaInfo[i].present` (byte at
+  0x40039b08+i*52+48; present7 verified = 1) and records the source index at
+  0x40026e98, then calls the flag-setter 0x65dc.
+- **The setter 0x65dc is gated**: it reads flag 0x40038f80, tests bit 0x80000,
+  and if clear returns WITHOUT setting F_REQ (0x40026e9c). That is why the
+  announce never posts. Lifting that gate + announcing + resuming still didn't
+  reach POWERONMENU (0x40038f80 bit 0x80000 is itself gated upstream) -- the
+  no-media park is gates-behind-gates in the media-present subsystem.
+
+**Scope caveat (user's point, recorded):** this entire on-device debugger runs
+in the *emulator*, where a payload can be injected freely. On real silicon,
+running it would require the very flash/code-injection access we're trying to
+obtain -- it's circular. The debugger is an analysis tool for the emulated
+firmware; it does not help reflash a physical unit.
+
+### 12.85 Reflash without decapping -- the stock updater: UPG952A.AP on FAT USB/SD
+
+The non-circular reflash path (needs no pre-existing access; the stock boot/app
+does it): the firmware has a **field updater keyed on the filename `UPG952A.AP`**
+(string at flash 0x0e7658, referenced from the update routine at ~0x1bdc8 and
+the update UI at 0x23xxx-0x25xxx). Context strings pin the mechanism:
+`fatfs`, `usb`, `File Manager: Mount device %s OK`, `USB`, `SD`,
+`KH_COMMON_QueryIfExistPlayableFile`, plus the AP-loader log
+(`Find the desired AP, location:%lx`, `Switch to AP mode, ID:%lx`,
+`Err: Not desired chip version auto-upgrade code:%lx,now:%lx`,
+`Err: AP Size is %lx, larger than reserved space`, `AP_Loader() fail`).
+
+Recipe (no chip access, non-disruptive to a running unit):
+1. Obtain the new firmware as an **`UPG952A.AP`** file -- the CheerTek AP-image
+   container (the application section + its header). The header carries the
+   chip/version ("auto-upgrade code") the loader compares against the running
+   part; a wrong code is refused ("Not desired chip version").
+2. Put `UPG952A.AP` in the **root of a FAT-formatted USB stick or SD card**.
+3. Insert into the running player -- the File Manager mounts the volume and the
+   updater finds `UPG952A.AP`, validates it, erases + programs the serial flash
+   (driver ~0x3ce34..0x3d1cc, §12.81), and reboots.
+
+Only the **AP (application) section** is reprogrammed; the boot loader stays
+intact, so a bad AP flash is recoverable (boot loader + recovery survive) --
+lower brick risk than a full-chip write. Caveat: renaming a raw flash dump to
+`UPG952A.AP` will fail the header/chip-version check; a valid `.AP` container
+(from the OEM updater, or rebuilt with the correct header) is required.

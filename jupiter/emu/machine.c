@@ -2979,6 +2979,12 @@ uint64_t machine_run(machine_t *m, uint64_t n)
      * firmware's hardware initialised and its state live -- reachable via
      * ct952.peek32/poke32 and callable via ct952.call. §12.79. */
     static long pyapp_at = -2; static uint32_t pyapp_hook = 0; static int pyapp_done = 0;
+    /* Call-and-resume (§12.84): a PROC1-seize saves the full firmware context
+     * here; ct952.resume() (writes 0x0C0FFEE0 to 0x80007FE8) restores it so the
+     * firmware continues from exactly where it was seized -- after Python has
+     * poked/called on the frozen snapshot. Lets us e.g. announce a source then
+     * let the firmware process it. */
+    static sparc_t pyapp_saved_ctx; static int pyapp_ctx_valid = 0;
     if (pyapp_at == -2) {
         const char *e = getenv("CT952_PYAPP_AT");
         const char *h = getenv("CT952_PYAPP_HOOK");
@@ -3023,6 +3029,10 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                         "running on PROC1) at icount=%llu\n",
                         (unsigned long long)m->cpu.icount);
             } else {
+                /* Save the full firmware context so ct952.resume() can restore
+                 * PROC1 exactly where it was seized (call-and-resume). */
+                pyapp_saved_ctx = m->cpu;
+                pyapp_ctx_valid = 1;
                 m->cpu.pc  = 0x40500000u;               /* payload entry stub */
                 m->cpu.npc = 0x40500004u;
                 sparc_set_reg(&m->cpu, 14, 0x407F0000u);/* %sp: top of the payload window */
@@ -3036,6 +3046,16 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                         (unsigned long long)m->cpu.icount, pyapp_hook ? 1 : 0);
             }
             pyapp_done = 1;
+        }
+        /* Resume trigger: ct952.resume() wrote the magic to 0x80007FE8. Restore
+         * the saved firmware context so PROC1 continues from the seize point,
+         * now that Python has mutated the frozen state (§12.84). */
+        if (pyapp_ctx_valid && io_get(m, 0x7FE8u) == 0x0C0FFEE0u) {
+            m->cpu = pyapp_saved_ctx;
+            pyapp_ctx_valid = 0;
+            io_set(m, 0x7FE8u, 0);
+            fprintf(stderr, "[PYAPP] resumed PROC1 from saved context at icount=%llu "
+                    "(pc=0x%08x)\n", (unsigned long long)m->cpu.icount, m->cpu.pc);
         }
         if (cardshow_at >= 0 && m->cpu.icount > (uint64_t)cardshow_at) {
             static int cardshow_done = 0;

@@ -5609,3 +5609,71 @@ keyboard: display/OSD, palette, GPU 2-D blitter, GPU font engine, JPU JPEG
 decoder, SD host controller, IR remote, panel key ladder, USB, UART, and
 arbitrary registers/memory. Every peripheral ct952emu models has a Python
 binding.
+
+### 12.79 Python AS a firmware app — an on-device live debugger
+
+The payoff of the MicroPython work: package the interpreter as an app and run it
+**inside the booted firmware**, in place of a firmware app, so Python becomes an
+interactive on-device console over the *live* firmware state.
+
+**How it works.**
+- **Free DRAM window.** After a firmware boot the region `0x40500000..0x40800000`
+  (3 MB) is 100% zero -- only transient decompress scratch used it during boot.
+  A DRAM-resident MicroPython payload lives there without touching eCos or the
+  firmware working set.
+- **Embedded build** (`make APP=1 BUILD=build-app`, `ct952_app.ld` +
+  `start_app.S`): everything (code/rodata/data/bss/heap/stack) links into that
+  window. `--build-id=none -N` pins `.text` to the window base so the raw `.bin`
+  loads 1:1. The app installs its OWN trap table (`%tbr`) with the register-
+  window overflow/underflow + `ST_FLUSH_WINDOWS` handlers -- riding eCos's
+  handlers faulted (`trap 0x05 with ET=0`), because they are coupled to eCos
+  thread context. Safe to own the traps: the app runs with interrupts masked
+  (PIL=15) and never returns, so eCos's traps are dormant while Python holds
+  PROC1.
+- **Injection + seize** (`CT952_PYAPP=<payload>` [`CT952_PYAPP_AT=<icount>` |
+  `CT952_PYAPP_HOOK=<pc>`]): the emulator DMA-loads the payload at `0x40500000`,
+  then at the chosen point seizes PROC1 -- sets PC to the window base, a fresh
+  `%sp`, and PIL=15 -- exactly the mechanism by which the firmware would hand off
+  to an app's entry (`CT952_PYAPP_HOOK` = the replaced app's entry PC).
+- **Live-firmware bindings.** `ct952.peek32/poke32/poke_bytes` read/write any
+  live address; `ct952.call(addr, *args)` calls a firmware function directly
+  (args in `%o0..%o3`, result from `%o0`), since Python shares the firmware's
+  address space and ABI.
+
+**Verified (REPL over the USB keyboard, real `dp700wd.bin` booted then seized):**
+
+```
+[PYAPP] launched Python app (seized PROC1 -> 0x40500000) at icount=40000xxx
+[pyapp] MicroPython launched inside the firmware
+[pyapp] the firmware is live: ct952.peek32/poke32/call
+>>> print(hex(ct952.peek32(0x40000000)))
+0xa7580000                         # live: the firmware's loaded ROMV code
+>>> ct952.call(0xd3900, 0x40780000, 0x40000000, 8)   # the firmware's own memcpy
+1081606144                         # returns dst (0x40780000)
+>>> print(hex(ct952.peek32(0x40780000)), hex(ct952.peek32(0x40000000)))
+0xa7580000 0xa7580000              # memcpy ran: scratch now equals the source
+```
+
+Two gotchas fixed: `gc_collect` now issues `ta 3` to flush register windows
+before the stack scan (else a collection deep in the VM frees in-register roots
+-> `VERIFY_PTR` heap corruption); and `pyapp_main` imports `ct952` up front so
+the REPL name is bound.
+
+**Does this help knock out the remaining unknowns? Yes -- decisively.** The open
+questions (why the boot parks before `POWERONMENU`, why the source-detect never
+runs, which gate the CC-mbox event waits on) have been chased with static
+analysis + env-gated emulator probes. On-device Python replaces that with
+*interactive* experiments against the running firmware:
+- `peek32` any suspect variable live (`__bISRKey` 0x40039074, `__bPOWERONMENU
+  Initial` 0x40023a10, DISPSTATE, the CC event flag 0x40026ea4, thread/mbox
+  state) instead of inferring it.
+- `poke32` a gate and watch the firmware's own threads react (the probes we
+  hard-coded in C become one-liners typed at a prompt).
+- `ct952.call` the firmware's OWN functions -- call the source-detect
+  (`0x12b30`), `POWERONMENU_Initial` (`0x4b808`), an event post, etc. -- and read
+  the resulting state, turning "why doesn't X run / what would X do" from a
+  disassembly question into a direct call. `call`-ing `memcpy` already proves
+  arbitrary firmware routines execute and return correctly from the prompt.
+
+The emulator becomes an interactive firmware lab: seize -> poke/peek/call ->
+observe, with no rebuild between experiments.

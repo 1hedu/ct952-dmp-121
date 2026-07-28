@@ -2680,6 +2680,32 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
         }
     }
 
+    /* Embedded Python "app" (CT952_PYAPP=<file>): load a DRAM-resident
+     * MicroPython payload into the runtime-free high-DRAM window at 0x40500000,
+     * so it can be launched in place of a firmware app -- an on-device Python
+     * REPL that sees the live firmware state (§12.79). The seize into it happens
+     * in machine_run at CT952_PYAPP_AT / CT952_PYAPP_HOOK. */
+    {
+        const char *e = getenv("CT952_PYAPP");
+        if (e && *e) {
+            FILE *pf = fopen(e, "rb");
+            if (pf) {
+                uint8_t *dst = machine_dram_ptr(m, 0x40500000u);
+                long n = 0;
+                if (dst) {
+                    fseek(pf, 0, SEEK_END); n = ftell(pf); fseek(pf, 0, SEEK_SET);
+                    if (n > 0 && n <= 0x300000) {
+                        if (fread(dst, 1, (size_t)n, pf) != (size_t)n) n = -1;
+                    } else n = -2;
+                }
+                fclose(pf);
+                fprintf(stderr, "[PYAPP] loaded %s (%ld bytes) at 0x40500000\n", e, n);
+            } else {
+                fprintf(stderr, "[PYAPP] cannot open %s\n", e);
+            }
+        }
+    }
+
     /* display field-rate divider for the VSYNC IRQ (see machine_cycle) */
     {
         const char *e = getenv("CT952_VSYNC_DIV");
@@ -2937,7 +2963,38 @@ uint64_t machine_run(machine_t *m, uint64_t n)
     static long cardshow_at = -2;
     if (cardshow_at == -2) { const char *e = getenv("CT952_CARDSHOW");
                              cardshow_at = e ? (long)strtoull(e, NULL, 0) : -1; }
+    /* Embedded Python "app" launch (CT952_PYAPP loaded at 0x40500000): seize the
+     * PROC1 CPU and jump into the DRAM-resident MicroPython payload, either when
+     * the firmware first calls a specific app entry (CT952_PYAPP_HOOK=<pc>, the
+     * "replaced app") or at a fixed icount (CT952_PYAPP_AT=<icount>, default
+     * 120M once the firmware has booted). Python then runs on-device with the
+     * firmware's hardware initialised and its state live -- reachable via
+     * ct952.peek32/poke32 and callable via ct952.call. §12.79. */
+    static long pyapp_at = -2; static uint32_t pyapp_hook = 0; static int pyapp_done = 0;
+    if (pyapp_at == -2) {
+        const char *e = getenv("CT952_PYAPP_AT");
+        const char *h = getenv("CT952_PYAPP_HOOK");
+        pyapp_hook = h ? (uint32_t)strtoul(h, NULL, 0) : 0;
+        pyapp_at = e ? (long)strtoull(e, NULL, 0)
+                     : (getenv("CT952_PYAPP") && !h ? 120000000L : -1);
+    }
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
+        if (!pyapp_done && getenv("CT952_PYAPP") &&
+            ((pyapp_hook && m->cpu.pc == pyapp_hook) ||
+             (pyapp_at >= 0 && m->cpu.icount > (uint64_t)pyapp_at))) {
+            m->cpu.pc  = 0x40500000u;               /* payload entry stub */
+            m->cpu.npc = 0x40500004u;
+            sparc_set_reg(&m->cpu, 14, 0x407F0000u);/* %sp: top of the payload window */
+            sparc_set_reg(&m->cpu, 30, 0);          /* %fp = 0 */
+            /* Mask device interrupts (PIL=15) so eCos's timer tick can't
+             * context-switch PROC1 away from the Python app; window/flush traps
+             * are not maskable by PIL, so the NLR longjmp still works. */
+            m->cpu.psr |= 0x00000F00u;
+            fprintf(stderr, "[PYAPP] launched Python app (seized PROC1 -> 0x40500000) "
+                    "at icount=%llu pc-was-hook=%d\n",
+                    (unsigned long long)m->cpu.icount, pyapp_hook ? 1 : 0);
+            pyapp_done = 1;
+        }
         if (cardshow_at >= 0 && m->cpu.icount > (uint64_t)cardshow_at) {
             static int cardshow_done = 0;
             if (!cardshow_done) {

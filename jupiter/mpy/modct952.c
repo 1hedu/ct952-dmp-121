@@ -312,6 +312,21 @@ static mp_obj_t ct952_poke_bytes(mp_obj_t addr_in, mp_obj_t data_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(ct952_poke_bytes_obj, ct952_poke_bytes);
 
+// call(addr, a0=0, a1=0, a2=0, a3=0) -- call a firmware function at `addr` with
+// up to four integer arguments (SPARC %o0..%o3) and return its result (%o0).
+// Only meaningful in the embedded "app" build, where Python runs inside the
+// live firmware and shares its address space + calling convention.
+static mp_obj_t ct952_call(size_t n_args, const mp_obj_t *args) {
+    uint32_t addr = (uint32_t)mp_obj_get_int(args[0]);
+    mp_int_t a[4] = {0, 0, 0, 0};
+    for (size_t i = 1; i < n_args && i <= 4; i++) a[i - 1] = mp_obj_get_int(args[i]);
+    typedef mp_int_t (*fw_fn_t)(mp_int_t, mp_int_t, mp_int_t, mp_int_t);
+    fw_fn_t f = (fw_fn_t)(uintptr_t)addr;
+    mp_int_t r = f(a[0], a[1], a[2], a[3]);
+    return mp_obj_new_int(r);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ct952_call_obj, 1, 5, ct952_call);
+
 /* ---- SD host controller (SDHC spec, base 0xA0001100) ------------------------
  * A minimal bare-metal SD driver: the emulator presents a FAT card image
  * (CT952_SDCARD) as an inserted SDHC card and serves CMD18 block reads by DMA.
@@ -409,6 +424,7 @@ static const mp_rom_map_elem_t ct952_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_peek32), MP_ROM_PTR(&ct952_peek32_obj) },
     { MP_ROM_QSTR(MP_QSTR_poke32), MP_ROM_PTR(&ct952_poke32_obj) },
     { MP_ROM_QSTR(MP_QSTR_poke_bytes), MP_ROM_PTR(&ct952_poke_bytes_obj) },
+    { MP_ROM_QSTR(MP_QSTR_call), MP_ROM_PTR(&ct952_call_obj) },
     { MP_ROM_QSTR(MP_QSTR_sd_present), MP_ROM_PTR(&ct952_sd_present_obj) },
     { MP_ROM_QSTR(MP_QSTR_sd_init), MP_ROM_PTR(&ct952_sd_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_sd_read), MP_ROM_PTR(&ct952_sd_read_obj) },

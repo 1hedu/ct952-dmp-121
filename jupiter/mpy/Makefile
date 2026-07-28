@@ -22,7 +22,10 @@ CFLAGS_ARCH = -m32 -mcpu=v8 -msoft-float -mno-app-regs
 # -U_FORTIFY_SOURCE: the sparc64 headers otherwise inline snprintf() ->
 # __snprintf_chk (a glibc fortify helper we don't link freestanding); readline
 # uses snprintf, and shared/libc/printf.c supplies the plain version.
-CFLAGS += $(INC) -Wall -std=c99 -nostdlib -ffreestanding -fno-common -U_FORTIFY_SOURCE $(CFLAGS_ARCH) $(COPT)
+# -fno-delete-null-pointer-checks: ct952.peek32/poke32 legitimately dereference
+# low/zero addresses (they're real MMIO/memory here), so the compiler must not
+# treat a NULL deref as unreachable.
+CFLAGS += $(INC) -Wall -std=c99 -nostdlib -ffreestanding -fno-common -U_FORTIFY_SOURCE -fno-delete-null-pointer-checks $(CFLAGS_ARCH) $(COPT)
 
 CSUPEROPT = -Os
 
@@ -34,8 +37,26 @@ CFLAGS += -Os
 CFLAGS += -fdata-sections -ffunction-sections
 endif
 
+# APP=1 builds the embedded "app" variant: a DRAM-resident payload (linked into
+# the runtime-free 0x40500000 window, no trap table) that is injected into a
+# booted firmware and launched in place of a firmware app. Use a separate BUILD
+# dir so it doesn't clobber the standalone objects:
+#   make APP=1 BUILD=build-app
+ifdef APP
+LDSCRIPT  = ct952_app.ld
+STARTFILE = start_app.S
+# --build-id=none: drop the .note.gnu.build-id that would otherwise sit at the
+# segment start and push .text off the window base. -N (OMAGIC): don't
+# page-align. Together, .text starts exactly at 0x40500000, so the raw .bin
+# loads 1:1 there and all absolute references resolve correctly.
+LDFLAGS  += -Wl,-N -Wl,--build-id=none
+else
+LDSCRIPT  = ct952.ld
+STARTFILE = start.S
+endif
+
 LD = $(CC)
-LDFLAGS += -nostdlib -T ct952.ld -Wl,-Map=$@.map,--cref -Wl,--gc-sections $(CFLAGS_ARCH)
+LDFLAGS += -nostdlib -T $(LDSCRIPT) -Wl,-Map=$@.map,--cref -Wl,--gc-sections $(CFLAGS_ARCH)
 LIBS =
 
 SRC_C = \
@@ -54,7 +75,7 @@ SRC_QSTR += modusb_kbd.c
 SRC_QSTR += shared/readline/readline.c
 
 SRC_S = \
-	start.S \
+	$(STARTFILE) \
 
 OBJ += $(PY_CORE_O)
 OBJ += $(addprefix $(BUILD)/, $(SRC_C:.c=.o))

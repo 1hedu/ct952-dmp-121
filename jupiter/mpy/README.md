@@ -45,8 +45,13 @@ host Python for MicroPython's qstr generation.
 ```sh
 git submodule update --init jupiter/mpy/micropython   # first time
 cd jupiter/mpy
-make -j4                       # -> build/firmware.bin
+make -j4                              # standalone -> build/firmware.bin
+make APP=1 BUILD=build-app -j4        # embedded "app" -> build-app/firmware.bin
 ```
+
+The **standalone** build boots from reset and replaces the whole firmware. The
+**app** build is a DRAM-resident payload injected into a *booted* firmware and
+launched in place of a firmware app -- see "Python as a firmware app" below.
 
 ## Running
 
@@ -118,6 +123,35 @@ plane. `decode_jpeg` points the MCU-BIU bitstream source at a DRAM address and
 runs a JPU op, so the functional picojpeg decoder reconstructs the frame onto
 the video plane the display composites under the OSD. (Set `CT952_OSD_FULL=1` to
 composite the whole 240-row OSD in `--fb-out`; the default clamps to ~51 rows.)
+
+## Python as a firmware app (on-device live debugger)
+
+The `app` build runs MicroPython **inside a booted CT952 firmware**, in place of
+a firmware app, so Python is an interactive console over the *live* firmware
+state. The payload links into the runtime-free DRAM window `0x40500000` (all-zero
+after boot), installs its own trap table, and runs with interrupts masked so it
+owns PROC1 without disturbing eCos's dormant handlers.
+
+```sh
+# boot the real firmware, inject the app, seize PROC1 at 40M instructions:
+CT952_PYAPP=../mpy/build-app/firmware.bin CT952_PYAPP_AT=40000000 \
+CT952_USB_KEYS=$'print(hex(ct952.peek32(0x40000000)))\n' \
+  ./ct952emu dp700wd.bin --instr 200000000
+```
+
+`CT952_PYAPP_HOOK=<pc>` instead seizes when the firmware first reaches a specific
+app-entry PC (the "replaced app"). Inside the REPL the firmware is live:
+
+```python
+ct952.peek32(0x40039074)              # read a firmware variable (__bISRKey)
+ct952.poke32(0x40023a10, 1)           # flip a firmware gate
+ct952.call(0xd3900, dst, src, n)      # call a firmware function (here memcpy)
+```
+
+`ct952.call(addr, a0..a3)` invokes firmware code directly (args in `%o0..%o3`,
+result from `%o0`) -- verified by driving the firmware's own `memcpy`. This turns
+the emulator into an interactive firmware lab: seize, then peek/poke/call and
+observe, with no rebuild between experiments.
 
 ## SPARC bring-up notes
 

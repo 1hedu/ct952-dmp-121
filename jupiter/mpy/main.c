@@ -88,11 +88,53 @@ int mpy_main(void) {
     return 0;
 }
 
+/* Entry for the embedded "app" build (start_app.S): MicroPython launched INSIDE
+ * a booted CT952 firmware, in place of a firmware app. Unlike mpy_main() it does
+ * not run the emulator completion protocol -- it just brings up the interpreter
+ * (and a USB keyboard) and drops into the REPL, from which the live firmware is
+ * reachable via ct952.peek32/poke32/call. */
+int pyapp_main(void) {
+    int stack_dummy;
+    stack_top = (char *)&stack_dummy;
+
+    mp_hal_stdout_tx_strn("\n[pyapp] MicroPython launched inside the firmware\n", 49);
+
+    #if MICROPY_ENABLE_GC
+    gc_init(heap, heap + sizeof(heap));
+    #endif
+    mp_init();
+
+    if (usb_kbd_bringup()) {
+        mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
+    } else {
+        mp_hal_stdout_tx_strn("[pyapp] REPL on UART1 RX\n", 25);
+    }
+
+    #if MICROPY_ENABLE_COMPILER
+    // Bind the hardware module into the REPL's global namespace up front, so
+    // the operator can use ct952.peek32/poke32/call without an import.
+    do_str("import ct952", MP_PARSE_FILE_INPUT);
+    mp_hal_stdout_tx_strn("[pyapp] the firmware is live: ct952.peek32/poke32/call\n", 55);
+    for (;;) {
+        if (pyexec_friendly_repl() != 0) {
+            break;
+        }
+    }
+    #endif
+
+    mp_deinit();
+    for (;;) {
+    }
+    return 0;
+}
+
 #if MICROPY_ENABLE_GC
 void gc_collect(void) {
-    // Scan the C stack for GC roots. (SPARC register-window roots are
-    // handled by flushing windows in start.S's helper before entry to
-    // collection-heavy paths; simple scripts keep roots on the C stack.)
+    // Flush the SPARC register windows to the stack (ST_FLUSH_WINDOWS, handled
+    // by start*.S) so GC roots living only in unspilled register windows become
+    // visible to the C-stack scan below. Without this, a collection triggered
+    // deep in the VM (e.g. from a C module) can free a still-live object.
+    __asm__ __volatile__("ta 3" ::: "memory");
     gc_collect_start();
     void *dummy;
     gc_collect_root(&dummy, ((mp_uint_t)stack_top - (mp_uint_t)&dummy) / sizeof(mp_uint_t));

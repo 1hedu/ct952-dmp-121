@@ -5778,3 +5778,45 @@ and watch PROC1's PC in real time -- if it leaves the `0x4001dxxx` poll region
 for the POWERONMENU path, that gate is the producer. (Caveat: calling firmware
 *functions* from PROC2 while PROC1 also runs them races on unlocked state; peek/
 poke of data is the safe concurrent primitive.)
+
+### 12.83 Park-crack via live experiments: it's a blocked kernel-wait, not a poll
+
+Drove the park investigation with the on-device debugger (concurrent sweep on
+PROC2 + a seize-mode function call). Two decisive results.
+
+**1. Poke sweep is a clean negative.** On PROC2, while PROC1 ran, poked the three
+"polled-guard" candidates and sampled PROC1's live PC (0x98080020) after each:
+- page-8 advance guard `byte[0x40022f81]=1`
+- CC event flag `0x40026ea4 |= 0x1000`
+- F_REQ source-present bits `0x40026e9c |= 0x86`
+
+In every case PROC1 stayed in the eCos idle/scheduler + blocked-thread region
+(`0x40000054..0x400010b0` and `0x4001d000..0x4001e6d0`); `__bPOWERONMENUInitial`
+and both CC mailbox counts stayed 0. **No memory poke wakes the parked threads**
+-- so the park is a *blocked eCos kernel wait* (mbox_get / flag_wait), not a
+spin-poll of a data flag. The transition cannot be forced by poking a value; the
+source-present PRODUCER has to actually run and reschedule the waiter.
+
+**2. MediaPresentPost is the producer; it accepts source 7 but doesn't announce
+at power-on.** In seize mode, `ct952.call(0x6130, 7, 1)`:
+```
+before  F_REQlo(0x40026e98)=0x0
+ret     0x7
+after   F_REQlo(0x40026e98)=0x7          # recorded "last source index = 7"
+        F_REQ(0x40026e9c)=0, mboxes=0, POM=0
+```
+So `0x6130` is `MediaPresentPost(sourceIdx, present)` and source 7 is a valid
+index -- calling it executed and recorded the source, but the flag-set / mailbox
+post did not land (consistent with §12.64: the built-in/SPI source is never
+actually announced at power-on -- the announce is gated, or the recorded index
+never gets the follow-through `OS_SetFlag` under these no-media conditions).
+
+**Conclusion.** The boot parks because, with no media, nothing completes a
+source-present announcement, and the CC threads are *blocked* on the resulting
+kernel objects -- a state a data-poke provably cannot escape (result 1). The
+producer function exists and takes the built-in source index (result 2) but its
+announce doesn't complete at power-on. Closing this needs a **call-and-resume**
+primitive (seize PROC1, call the full announce path, restore PROC1's saved
+context, and let it run) -- the current seize freezes PROC1 with no resume, and
+concurrent PROC2 calls into eCos would race the non-SMP kernel. That primitive
+is the next tool; the diagnosis (blocked-wait, producer-gated) is now firm.

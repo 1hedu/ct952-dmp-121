@@ -1048,20 +1048,20 @@ static uint32_t sd_find_nth_jpeg(machine_t *m, uint32_t nth, uint32_t *out_len)
  * DAT_40032748) into the card decode buffer and decode it. Returns 1 on decode. */
 static int machine_dsp_predecode(machine_t *m)
 {
+    static uint32_t last_foff = 0;   /* card offset of the file last staged here */
     uint32_t idx, foff, flen;
     uint8_t *dst;
     if (!m->sd_img) return 0;
     { uint8_t *ip = machine_dram_ptr(m, 0x40032748u); if (!ip) return 0; idx = *ip; }
     foff = sd_find_nth_jpeg(m, idx, &flen);
     if (!foff || !flen) return 0;
+    /* One decode per distinct file: the card offset uniquely identifies the photo
+     * (JPEG header bytes are identical across files, so a header compare wrongly
+     * matches). Skip if this file is already staged. */
+    if (foff == last_foff) return 0;
+    last_foff = foff;
     dst = machine_dram_ptr(m, 0x401ec000u);
     if (!dst) return 0;
-    /* Only (re)load when the buffer isn't already this file -- so the initial
-     * photo (loaded by the firmware's own info.a) is left to the real engine
-     * path, and we act only when the advance leaves a stale buffer. */
-    if (dst[0] == m->sd_img[foff] && dst[1] == m->sd_img[foff+1] &&
-        dst[6] == m->sd_img[foff+6] && dst[0x20] == m->sd_img[foff+0x20])
-        return 0;
     if (foff + flen > m->sd_size) flen = m->sd_size - foff;
     memcpy(dst, m->sd_img + foff, flen);
     m->jpeg_src = 0x401ec000u;

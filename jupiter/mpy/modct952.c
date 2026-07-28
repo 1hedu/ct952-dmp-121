@@ -312,6 +312,87 @@ static mp_obj_t ct952_poke_bytes(mp_obj_t addr_in, mp_obj_t data_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(ct952_poke_bytes_obj, ct952_poke_bytes);
 
+/* ---- SD host controller (SDHC spec, base 0xA0001100) ------------------------
+ * A minimal bare-metal SD driver: the emulator presents a FAT card image
+ * (CT952_SDCARD) as an inserted SDHC card and serves CMD18 block reads by DMA.
+ * We run the standard init handshake (CMD0/8/ACMD41/CMD2/3/7) then read blocks
+ * into a DRAM buffer the controller DMAs into. */
+#define REG32(a)      (*(volatile uint32_t *)(uintptr_t)(uint32_t)(a))
+#define SDC_BASE      0xA0001100u
+#define SDC_DMA       (SDC_BASE + 0x00)   /* DMA target address              */
+#define SDC_BLK       (SDC_BASE + 0x04)   /* [31:16]=block size, [15:0]=count */
+#define SDC_ARG       (SDC_BASE + 0x08)   /* command argument                */
+#define SDC_CMD       (SDC_BASE + 0x0C)   /* [31:16]=tran mode, [15:8]=index  */
+#define SDC_RESP0     (SDC_BASE + 0x10)
+#define SDC_STAT      (SDC_BASE + 0x24)   /* bit16=card inserted             */
+#define SDC_INT       (SDC_BASE + 0x30)   /* W1C; bit16=cmd, bit17=tran done  */
+#define SDC_CARD_INS  (1u << 16)
+#define SDC_TRAN_DONE (1u << 17)
+#define SD_MAXBLK     64                  /* per sd_read() call (32 KB)       */
+
+static uint8_t g_sdbuf[SD_MAXBLK * 512] __attribute__((aligned(4)));  /* DRAM DMA */
+static uint8_t g_sd_ready;
+
+/* Issue one SD command; returns R1/R6 (RESP0). The model completes commands
+ * synchronously, but we clear the completion latch for a faithful handshake. */
+static uint32_t sd_cmd(uint32_t idx, uint32_t arg, uint32_t tranmode) {
+    REG32(SDC_INT) = 0xFFFFFFFFu;                 /* clear stale status */
+    REG32(SDC_ARG) = arg;
+    REG32(SDC_CMD) = (tranmode << 16) | (idx << 8);   /* word write issues it */
+    return REG32(SDC_RESP0);
+}
+
+// sd_present() -- True if a card is inserted.
+static mp_obj_t ct952_sd_present(void) {
+    return (REG32(SDC_STAT) & SDC_CARD_INS) ? mp_const_true : mp_const_false;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(ct952_sd_present_obj, ct952_sd_present);
+
+// sd_init() -- run the SDHC init handshake; returns True on success.
+static mp_obj_t ct952_sd_init(void) {
+    g_sd_ready = 0;
+    if (!(REG32(SDC_STAT) & SDC_CARD_INS)) return mp_const_false;
+    sd_cmd(0, 0, 0);                     /* GO_IDLE_STATE            */
+    sd_cmd(8, 0x1AA, 0);                 /* SEND_IF_COND             */
+    for (int i = 0; i < 100; i++) {      /* ACMD41: wait card ready  */
+        sd_cmd(55, 0, 0);
+        if (sd_cmd(41, 0x40FF8000u, 0) & 0x80000000u) break;  /* busy bit -> ready */
+    }
+    sd_cmd(2, 0, 0);                     /* ALL_SEND_CID             */
+    uint32_t rca = sd_cmd(3, 0, 0) >> 16;/* SEND_RELATIVE_ADDR       */
+    sd_cmd(7, rca << 16, 0);             /* SELECT_CARD              */
+    g_sd_ready = 1;
+    return mp_const_true;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(ct952_sd_init_obj, ct952_sd_init);
+
+// sd_read(lba, count) -- read `count` 512-byte blocks from block `lba` via the
+// controller's DMA engine; returns the data as bytes.
+static mp_obj_t ct952_sd_read(mp_obj_t lba_in, mp_obj_t count_in) {
+    if (!g_sd_ready) mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sd not initialised"));
+    uint32_t lba = (uint32_t)mp_obj_get_int(lba_in);
+    mp_int_t count = mp_obj_get_int(count_in);
+    if (count < 1) count = 1;
+    if (count > SD_MAXBLK) count = SD_MAXBLK;
+    REG32(SDC_DMA) = (uint32_t)(uintptr_t)g_sdbuf;
+    REG32(SDC_BLK) = (512u << 16) | (uint32_t)count;
+    sd_cmd(18, lba, 0x0032);             /* READ_MULTIPLE_BLOCK (DMA read) */
+    for (volatile int i = 0; i < 100000 && !(REG32(SDC_INT) & SDC_TRAN_DONE); i++) { }
+    REG32(SDC_INT) = SDC_TRAN_DONE | (1u << 16);
+    return mp_obj_new_bytes(g_sdbuf, (size_t)count * 512u);
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(ct952_sd_read_obj, ct952_sd_read);
+
+// panel_adc(channel=0x84) -- select an analog key-ladder line and read the ADC
+// voltage (0..255). Feed keypresses with ct952emu CT952_PANELKEY / CT952_ADC.
+static mp_obj_t ct952_panel_adc(size_t n_args, const mp_obj_t *args) {
+    uint32_t chan = n_args >= 1 ? (uint32_t)mp_obj_get_int(args[0]) : 0x84u;
+    volatile uint32_t *adc = (volatile uint32_t *)0x8000407Cu;
+    *adc = (*adc & ~0x00FF0000u) | ((chan & 0xFF) << 16);   /* select ladder line */
+    return MP_OBJ_NEW_SMALL_INT((*adc >> 24) & 0xFF);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ct952_panel_adc_obj, 0, 1, ct952_panel_adc);
+
 static const mp_rom_map_elem_t ct952_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_ct952) },
     { MP_ROM_QSTR(MP_QSTR_WIDTH), MP_ROM_INT(OSD_W) },
@@ -328,6 +409,10 @@ static const mp_rom_map_elem_t ct952_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_peek32), MP_ROM_PTR(&ct952_peek32_obj) },
     { MP_ROM_QSTR(MP_QSTR_poke32), MP_ROM_PTR(&ct952_poke32_obj) },
     { MP_ROM_QSTR(MP_QSTR_poke_bytes), MP_ROM_PTR(&ct952_poke_bytes_obj) },
+    { MP_ROM_QSTR(MP_QSTR_sd_present), MP_ROM_PTR(&ct952_sd_present_obj) },
+    { MP_ROM_QSTR(MP_QSTR_sd_init), MP_ROM_PTR(&ct952_sd_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_sd_read), MP_ROM_PTR(&ct952_sd_read_obj) },
+    { MP_ROM_QSTR(MP_QSTR_panel_adc), MP_ROM_PTR(&ct952_panel_adc_obj) },
 };
 static MP_DEFINE_CONST_DICT(ct952_module_globals, ct952_module_globals_table);
 

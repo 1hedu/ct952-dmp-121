@@ -5572,3 +5572,40 @@ rows and the text until the flag was set.
 The player is now scriptable end to end from a `>>>` prompt: display plane,
 palette, 2-D blitter, font engine, JPEG decoder, IR remote, and arbitrary
 registers — all from Python typed on a USB keyboard.
+
+### 12.78 The last peripherals — SD host controller + panel keys in `ct952`
+
+Completing the "all hardware" pass: the two remaining modeled peripherals are
+now bound, so every block ct952emu models is reachable from Python.
+
+- **SD host controller** (`sd_present`, `sd_init`, `sd_read`). A minimal but real
+  bare-metal SD driver against the SDHC model (base `0xA0001100`): it runs the
+  standard init handshake (CMD0 / CMD8 / ACMD41 until ready / CMD2 / CMD3 /
+  CMD7) then issues CMD18 multi-block reads, with the controller DMAing 512-byte
+  blocks from the inserted FAT card image into a DRAM buffer. `sd_read(lba,n)`
+  returns the blocks as `bytes`.
+- **Panel keys** (`panel_adc`). Reads the analog key-ladder ADC at `0x8000407C`:
+  it selects a ladder line (writes bits [23:16]) then returns the voltage byte
+  [31:24] -- the input the emulator's CT952_PANELKEY / CT952_ADC drives.
+
+Also enabled `MICROPY_PY_BUILTINS_SLICE` so byte buffers slice at the REPL
+(`b[0:11]`); indexing worked at the minimum ROM level but slice syntax was
+compiled out, which had shown up as a `SyntaxError` on the `:`.
+
+**Verified (REPL over the USB keyboard, `CT952_SDCARD=<fat.img>`):**
+
+```
+>>> ct952.sd_init()
+True
+>>> b = ct952.sd_read(0, 1)
+>>> print(b[0:11])
+b'\xeb<\x90MSDOS5.0'          # the card's real FAT boot sector, read by DMA
+>>> print(999, ct952.panel_adc(0x84))
+999 119                       # key-ladder ADC voltage (0x77)
+```
+
+The whole modeled machine is now scriptable from a `>>>` prompt over a USB
+keyboard: display/OSD, palette, GPU 2-D blitter, GPU font engine, JPU JPEG
+decoder, SD host controller, IR remote, panel key ladder, USB, UART, and
+arbitrary registers/memory. Every peripheral ct952emu models has a Python
+binding.

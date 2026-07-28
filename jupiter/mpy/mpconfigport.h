@@ -8,6 +8,9 @@
 #define MICROPY_COMP_DOUBLE_TUPLE_ASSIGN (1)
 #define MICROPY_COMP_TRIPLE_TUPLE_ASSIGN (1)
 
+// Slice syntax (b[0:4]) -- handy for the SD/USB byte buffers at the REPL.
+#define MICROPY_PY_BUILTINS_SLICE         (1)
+
 #define MICROPY_ENABLE_COMPILER     (1)
 
 // SPARC has no dedicated NLR implementation; use the setjmp/longjmp path

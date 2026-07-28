@@ -2598,6 +2598,30 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                     (unsigned long long)m->cpu.icount);
             irkey_done = 1;
         }
+        /* Multi-key faithful IR injector (CT952_IRKEYS="code@icount,code@icount,..."):
+         * fire a sequence of timed keypresses through the same modeled IR path as
+         * CT952_IRKEY, so one run can e.g. step NEXT (scancode 0x10) through a
+         * multi-photo card slideshow (§12.115). Up to 16 entries, fired in order. */
+        { static int mk_init = -1; static uint32_t mk_code[16]; static uint64_t mk_at[16];
+          static int mk_n = 0, mk_i = 0;
+          if (mk_init < 0) { mk_init = 0; const char *e = getenv("CT952_IRKEYS");
+              if (e) { char b[256]; strncpy(b, e, 255); b[255] = 0;
+                  char *t = strtok(b, ","); while (t && mk_n < 16) {
+                      char *at = strchr(t, '@');
+                      mk_code[mk_n] = (uint32_t)strtoul(t, NULL, 0);
+                      mk_at[mk_n] = at ? strtoull(at + 1, NULL, 0) : 40000000ull;
+                      mk_n++; t = strtok(NULL, ","); } } }
+          if (mk_i < mk_n && m->cpu.icount > mk_at[mk_i]) {
+              uint32_t code = mk_code[mk_i];
+              io_set(m, R_IR_DATA, code & 0xFFu);
+              io_set(m, R_IR_RAWCODE, 0x00FF0000u | ((code & 0xFFu) << 8));
+              io_set(m, R_P1_2ND_MASK, io_get(m, R_P1_2ND_MASK) | INT_P1_2ND_IR);
+              io_set(m, R_P1_2ND_PEND, io_get(m, R_P1_2ND_PEND) | INT_P1_2ND_IR);
+              fprintf(stderr, "[IRKEYS] #%d injected scancode 0x%02x at icount=%llu\n",
+                      mk_i, code & 0xFF, (unsigned long long)m->cpu.icount);
+              mk_i++;
+          }
+        }
         uint64_t chunk = n - done;
         uint64_t ran, i;
         /* Logo/status-state event injection (CT952_LOGOEVENT): the power-on

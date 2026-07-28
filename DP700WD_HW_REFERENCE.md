@@ -5918,3 +5918,62 @@ round-trips). `jupiter/tools/ctkap.py` now:
 
 So a modified section can be re-packed to firmware-format UZIP (or shipped raw).
 CT952A_FLASH_FORMAT.md updated with the UZIP container + LZMA params.
+
+### 12.88 Self-flashing AP body: emulator flash-write model + verified update loop
+
+Reversed the serial-flash write path and built a testable self-flashing AP.
+
+**Flash driver (all verified by disassembly):**
+- `WriteSPF` @ `0x3d0fc` (XIP, always callable): `WriteSPF(i0=flashAddr,
+  i1=srcBuf, i2=size)` — asserts `flashAddr` 64 KB-aligned + `size<=0x10000`,
+  erases the 64 KB sector (one 64 KB erase, or 16×4 KB via `0x4001fea8` when
+  `ldub[0x40033723]==4`), then programs via `0x4002003c(src, src+size, flashAddr)`.
+- erase `0x4001fea8` / program `0x4002003c` live in decompressed TEXT (lma
+  `0x4001d000`): mask interrupts (PSR PIL=15), cache-flush `0x40020578`, gate on
+  the halfword `[0x40033720]==0x6655`.
+- program → SPI loop `0x400200a0` → **SPI/PROM controller @ `0x80002800`**
+  (base ptr read from `0x8000006c`; per-channel data `+0x22c`, status/trigger
+  `+0x224`, cmd `+0x220`, result `+0x230`; channel index byte `[0x400238d3]`;
+  opcode/config bytes at `0x40033720..0x40033728`), command issue+wait
+  `0x4001fe20`, trigger/poll `0x40020324` (status bit 0x4 ready, timeout 0x32).
+
+**Emulator model (`CT952_FLASHWRITE`, machine.c):** a *contract-level* model of
+`WriteSPF` — intercept at its entry (`brk_pc=0x3d0fc` so `sparc_run` stops there),
+apply the reversed contract to `m->flash` (64 KB erase to 0xFF + program `size`
+bytes from the DRAM source), return `%o0=0` to `%o7+8`. Chosen over a gate-level
+`0x80002800` model: the boundary is reversed byte-exact and simple, and gate-level
+fidelity would only exercise driver internals we already trust while the real
+brick-risk unknowns (start offset, entry convention) are unaffected by it.
+
+**Self-flashing AP body (`jupiter/tools/apstub.S`, embedded in ctkap.py):** a tiny
+SPARC V8 stub linked at the loader's body-copy target `0x4009a000`. It reads a
+descriptor at `body+0x100` (`u32 nchunks; {u32 dstFlash,u32 srcBodyOff,u32 size}*`)
+and loops `WriteSPF(0x3d0fc)` over a carried image 64 KB per call, then signals
+`0xC0DED00D` and `ta 0`. `ctkap.py mkflasher <out.AP> --write DST:img` builds
+body+descriptor+image and wraps a valid CT909-AP (magic, chip 0x41, pkver 5,
+entry 0x30 = 0x4009a000, size + body checksum).
+
+**Emulated update loop (`--aprun <AP> --flash-out <bin>`):** copies the AP body
+`[0x200:size]` to DRAM `0x4009a000` and jumps to the header entry — as the loader
+`0x3e48` does after header validation — then runs the body under the flash-write
+model. Verified end-to-end:
+- *Targeted sector:* a 1×64 KB sentinel write to `0x1a0000` changed **only** that
+  sector; boot region `[0..0x3000)` and all other flash byte-identical.
+- *Multi-sector + boot:* a 4×64 KB reflash of sectors 0–3 (with a boot-safe marker
+  in the no-checksum SETD sector) programmed all four, kept the image header +
+  section table intact, and the reflashed dump **boots to the exact same state as
+  the original** (pc/npc/psr/tbr/cwp/wim identical at 20M instrs).
+
+**Two honest caveats (documented, not worked around):**
+1. *Raw-image size.* A full `0..0x166000` image can't be carried **raw** inside an
+   AP that must itself be `<=0x166000` — this is precisely why the OEM body is
+   UZIP-compressed and decompresses sections on the fly. The raw stub is right for
+   targeted/sector updates; a full reflash needs the compressed-section approach
+   (which `ctkap.py repack` supports for the payload).
+2. *Real-hardware driver location.* On hardware, calling the XIP `WriteSPF` to
+   rewrite the sector that *holds* `WriteSPF` would erase the running code. The
+   OEM body avoids this by running a **DRAM-resident** copy of the flash driver
+   (the AP's own TEXT/DATA). The emulator's entry-intercept hides this (the XIP
+   sector is never actually executed during erase), so the stub verifies flashing
+   *logic*, not hardware-safe driver placement. A hardware-ready body must embed
+   the DRAM driver + the correct AP start offset — safest lifted from an OEM AP.

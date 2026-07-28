@@ -134,9 +134,65 @@ python3 jupiter/tools/ctkap.py sections dp700wd.bin      # dump + verify a full-
 ```
 
 The **body must be a valid self-flashing AP** (the application that knows how to
-reprogram itself) — the container tool only builds/validates the wrapper and
-checksums. The safest source of a body is the OEM `UPG952A.AP` (validate it first),
-or an AP rebuilt from this firmware's own sections; then edit + `apfix`.
+reprogram itself) — `apwrap` only builds/validates the wrapper and checksums. The
+safest source of a body is the OEM `UPG952A.AP` (validate it first), or an AP
+rebuilt from this firmware's own sections; then edit + `apfix`.
+
+---
+
+## 4. Building a self-flashing body (`mkflasher`) + serial-flash write path
+
+### The flash-write driver (reversed from the firmware)
+`WriteSPF` @ `0x3d0fc` (XIP, always callable): `WriteSPF(flashAddr, srcBuf, size)`
+asserts `flashAddr` is 64 KB-aligned and `size <= 0x10000`, **erases** the 64 KB
+sector (one 64 KB erase, or 16×4 KB via `0x4001fea8` when `[0x40033723]==4`), then
+**programs** it via `0x4002003c(src, src+size, flashAddr)`. The erase/program
+routines live in the decompressed `TEXT` (lma `0x4001d000`): they mask interrupts
+(PSR PIL=15), cache-flush (`0x40020578`), gate on `[0x40033720]==0x6655`, and drive
+the **SPI/PROM controller @ `0x80002800`** (base ptr `[0x8000006c]`; per-channel
+data `+0x22c`, status/trigger `+0x224`, cmd `+0x220`, result `+0x230`; channel byte
+`[0x400238d3]`; opcodes at `0x40033720..0x40033728`) via issue+wait `0x4001fe20`
+and trigger/poll `0x40020324`.
+
+### `ctkap.py mkflasher` — a self-flashing AP
+```sh
+python3 jupiter/tools/ctkap.py mkflasher out.AP --write 0x0:newimage.bin
+python3 jupiter/tools/ctkap.py mkflasher out.AP --write 0x1a0000:sector.bin --code 0x41
+```
+Builds a body = a small SPARC stub (`apstub.S`, embedded) at the loader's copy
+target `0x4009a000` + a descriptor at `body+0x100`
+(`u32 nchunks; {u32 dstFlash, u32 srcBodyOff, u32 size}*`) + the carried image, then
+wraps a valid CT909-AP (entry `0x30` = `0x4009a000`, size + body checksum). The stub
+loops `WriteSPF` over each 64 KB chunk, then signals + halts.
+
+### Verifying in the emulator (no hardware)
+```sh
+ct952emu dp700wd.bin --aprun out.AP --flash-out after.bin --instr 5000000   # CT952_FLASHWRITE auto-on
+```
+`--aprun` copies the AP body to DRAM `0x4009a000` and jumps to the header entry —
+as the loader (`0x3e48`) does — under a **`WriteSPF`-contract flash-write model**
+(`CT952_FLASHWRITE`): it intercepts `WriteSPF` at its entry and applies the reversed
+erase+program to the emulated flash. `--flash-out` dumps the result to diff. This
+is a *contract-level* model (the reversed boundary), not a gate-level model of the
+`0x80002800` controller. Verified: a targeted sector write touches only that sector
+(boot region intact); a 4-sector reflash keeps the header + section table intact and
+the reflashed image **boots identically to the original**.
+
+### Two constraints on a *hardware-ready* body (do not skip)
+1. **Size / compression.** A full `0..0x166000` image cannot be carried **raw**
+   inside an AP that must itself be `<= 0x166000` — the OEM body is UZIP-compressed
+   and decompresses on the fly. The raw stub suits **targeted/sector** updates; a
+   full reflash needs the compressed-section payload (`repack`).
+2. **DRAM-resident driver.** On hardware, calling the XIP `WriteSPF` to rewrite the
+   sector that *holds* `WriteSPF` erases the running code. The OEM body runs a
+   **DRAM copy** of the flash driver (its own `TEXT`/`DATA`). The emulator's
+   entry-intercept hides this, so the stub verifies flashing **logic**, not
+   hardware-safe driver placement + the exact AP start offset — safest lifted from
+   an OEM `UPG952A.AP`.
+
+---
+
+## 5. Deploying
 
 Place the finished file, named exactly `UPG952A.AP`, in the **root of a FAT USB
 stick or SD card**, and trigger the update from the player's update mode.

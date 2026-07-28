@@ -3202,6 +3202,53 @@ uint64_t machine_run(machine_t *m, uint64_t n)
         }
         uint64_t chunk = n - done;
         uint64_t ran, i;
+        /* Serial-flash write model (CT952_FLASHWRITE): intercept the firmware's
+         * XIP WriteSPF primitive (flash 0x3d0fc) at its entry and apply its
+         * reversed, byte-exact contract directly to the emulated flash --
+         * WriteSPF(i0=flashAddr, i1=srcBuf, i2=size): assert flashAddr is
+         * 64 KB-aligned and size <= 0x10000, erase the 64 KB sector to 0xFF,
+         * then program `size` bytes from the DRAM source buffer. This is a
+         * *contract-level* model of WriteSPF (the boundary is reversed exactly),
+         * not a gate-level model of the 0x80002800 SPI/PROM controller: it makes
+         * any self-flashing AP body observable end-to-end (the body loops
+         * WriteSPF over a carried image, then reboots) so its logic -- write
+         * offsets, chunking, and preservation of the low boot region -- can be
+         * verified in the emulator before any hardware. §12.88. Args are the
+         * caller's %o0..%o2 (WriteSPF's first insn is `save`, not yet executed);
+         * we skip the body and return to %o7+8 with %o0 = 0 (success). */
+        {
+            static int fw_hook = -1;
+            if (fw_hook < 0) fw_hook = getenv("CT952_FLASHWRITE") ? 1 : 0;
+            /* Make sparc_run return AT WriteSPF's entry so we can intercept it
+             * (sparc_run executes a whole chunk internally; a loop-top pc check
+             * alone would let the real XIP routine run and fault). */
+            if (fw_hook) m->cpu.brk_pc = 0x3d0fcu;
+            if (fw_hook && m->cpu.pc == 0x3d0fcu) {
+                uint32_t fa  = sparc_get_reg(&m->cpu, 8);   /* %o0 flashAddr  */
+                uint32_t src = sparc_get_reg(&m->cpu, 9);   /* %o1 srcBuf(DRAM)*/
+                uint32_t sz  = sparc_get_reg(&m->cpu, 10);  /* %o2 size       */
+                uint32_t o7  = sparc_get_reg(&m->cpu, 15);
+                uint8_t *sp  = machine_dram_ptr(m, src);
+                int ok = ((fa & 0xFFFFu) == 0) && sz <= 0x10000u &&
+                         (uint64_t)fa + 0x10000u <= m->flash_size && sp != NULL;
+                if (ok) {
+                    memset(m->flash + fa, 0xFF, 0x10000u);   /* 64 KB sector erase */
+                    memcpy(m->flash + fa, sp, sz);           /* program            */
+                    if (!getenv("CT952_FWQUIET"))
+                        fprintf(stderr, "[FLASHWRITE] flash[0x%06x..0x%06x) <- "
+                                "DRAM 0x%08x (%u B)\n", fa, fa + 0x10000u, src, sz);
+                    sparc_set_reg(&m->cpu, 8, 0);            /* return 0 = OK */
+                } else {
+                    fprintf(stderr, "[FLASHWRITE] REJECT fa=0x%08x src=0x%08x "
+                            "sz=0x%x (align/size/range/src)\n", fa, src, sz);
+                    sparc_set_reg(&m->cpu, 8, 6);            /* WriteSPF err code */
+                }
+                m->cpu.pc  = o7 + 8u;                        /* return to caller */
+                m->cpu.npc = m->cpu.pc + 4u;
+                done++;
+                continue;
+            }
+        }
         /* Logo/status-state event injection (CT952_LOGOEVENT): the power-on
          * state-8 handler advances only when its post-wait check (flash 0x254a4)
          * returns 0 -- which happens when the key/event queue (0x400329FC) has a

@@ -36,6 +36,8 @@ int main(int argc, char **argv)
     int gdb_port = 0;
     uint64_t run_to = 0;
     const char *snap_out = NULL, *snap_in = NULL;
+    const char *aprun_path = NULL;    /* --aprun: run a UPG952A.AP body as a self-flasher */
+    const char *flashout_path = NULL; /* --flash-out: dump the (possibly reflashed) flash */
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -95,6 +97,10 @@ int main(int argc, char **argv)
             snap_out = argv[++i];
         else if (!strcmp(argv[i], "--restore") && i + 1 < argc)
             snap_in = argv[++i];
+        else if (!strcmp(argv[i], "--aprun") && i + 1 < argc)
+            aprun_path = argv[++i];
+        else if (!strcmp(argv[i], "--flash-out") && i + 1 < argc)
+            flashout_path = argv[++i];
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -256,6 +262,49 @@ int main(int argc, char **argv)
         if (!gdb_port) { machine_free(m); free(m); return 0; }
     }
 
+    /* --aprun FILE: run a UPG952A.AP body as a self-flasher, exactly as the
+     * firmware's AP loader (0x3e48) does after header validation -- copy the AP
+     * body (file bytes [0x200 .. size]) to DRAM 0x4009a000 and jump into it at
+     * the header's entry field (0x30). The body then loops the modeled WriteSPF
+     * (enable with CT952_FLASHWRITE) over its carried image and reboots. This
+     * isolates the *body* under test: it needs no firmware services, so we start
+     * from a fresh machine and jump straight in. (Header validation itself is
+     * checked independently by `ctkap.py apinfo`; this proves the body's flashing
+     * logic + that the low boot region is preserved.) §12.88. */
+    if (aprun_path) {
+        FILE *af = fopen(aprun_path, "rb");
+        long asz;
+        uint8_t *ap;
+        if (!af) { perror(aprun_path); return 1; }
+        fseek(af, 0, SEEK_END); asz = ftell(af); fseek(af, 0, SEEK_SET);
+        ap = (uint8_t *)malloc((size_t)asz);
+        if (!ap || fread(ap, 1, (size_t)asz, af) != (size_t)asz) {
+            fprintf(stderr, "[aprun] read failed\n"); return 1; }
+        fclose(af);
+        {
+            uint32_t apsize = (uint32_t)ap[0x0c]<<24 | (uint32_t)ap[0x0d]<<16 |
+                              (uint32_t)ap[0x0e]<<8  | ap[0x0f];
+            uint32_t entry  = (uint32_t)ap[0x30]<<24 | (uint32_t)ap[0x31]<<16 |
+                              (uint32_t)ap[0x32]<<8  | ap[0x33];
+            uint32_t bodylen = (apsize > 0x200 && apsize <= (uint32_t)asz)
+                                 ? apsize - 0x200u : (uint32_t)asz - 0x200u;
+            uint8_t *d = machine_dram_ptr(m, 0x4009a000u);
+            if (!entry) entry = 0x4009a000u;
+            if (!d) { fprintf(stderr, "[aprun] DRAM 0x4009a000 unmapped\n"); return 1; }
+            memcpy(d, ap + 0x200, bodylen);
+            m->cpu.pc  = entry;
+            m->cpu.npc = entry + 4;
+            sparc_set_reg(&m->cpu, 14, 0x40780000u);     /* %sp */
+            sparc_set_reg(&m->cpu, 30, 0);               /* %fp */
+            m->cpu.psr = 0xA0000000u | PSR_S | 0x00000F00u; /* S=1, PIL=15 */
+            m->cpu.halted = 0;
+            setenv("CT952_FLASHWRITE", "1", 0);          /* enable the write model */
+            fprintf(stderr, "[aprun] loaded AP body (%u B) -> DRAM 0x4009a000, "
+                    "entry=0x%08x, flash-write model ON\n", bodylen, entry);
+        }
+        free(ap);
+    }
+
     if (gdb_port) {
         fprintf(stderr, "[ct952emu] flash %ld bytes, gdb stub mode\n", sz);
         gdb_serve(m, gdb_port);
@@ -316,6 +365,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "[ct952emu] dumped DRAM (%u bytes) to %s\n",
                     MACH_DRAM_SIZE, dram_path);
         }
+    }
+
+    if (flashout_path) {
+        FILE *ff = fopen(flashout_path, "wb");
+        if (ff) {
+            fwrite(m->flash, 1, m->flash_size, ff);
+            fclose(ff);
+            fprintf(stderr, "[ct952emu] dumped flash (%u bytes) to %s\n",
+                    m->flash_size, flashout_path);
+        } else perror(flashout_path);
     }
 
     if (fb_path) {

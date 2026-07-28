@@ -14,6 +14,9 @@ Every field and checksum below is verified against the firmware's own loader
   ctkap.py apinfo    <UPG952A.AP>           # parse + validate a CT909-AP update file
   ctkap.py apfix     <UPG952A.AP>           # recompute size(0x0c)+checksum(0x2e) in place
   ctkap.py apwrap    <body.bin> <out.AP> [--code 0x41]   # wrap a raw AP body into a .AP
+  ctkap.py mkflasher <out.AP> --write DST:img [--write ...] [--code 0x41] [--stub f]
+                                            # build a self-flashing AP: a SPARC stub
+                                            # that loops WriteSPF over carried images
 
 WARNING: reflashing is irreversible-ish and can brick hardware. This tool builds
 and *validates* images; it does not talk to a device. Always `apinfo` a file and
@@ -78,6 +81,26 @@ OFF_CKEN     = 0x10       # u32: 1 => body checksum is verified
 OFF_PKVER    = 0x14       # u32: APPacker version, must be >= 5
 OFF_CHIP     = 0x18       # u32: chip/auto-upgrade code, 0x41 (952A) or 0x01 (universal)
 OFF_CKSUM    = 0x2e       # u16: sum16(body[0x200:size])
+OFF_ENTRY    = 0x30       # u32: AP entry address; loader jumps here after copying the
+                          #      body to DRAM. Body is copied to AP_BODY_DRAM, entry ==
+                          #      the stub's _start there.
+
+# ---- self-flashing AP body --------------------------------------------------
+# The firmware AP loader (0x3e48) copies the body (file[0x200:size]) to this DRAM
+# address and jumps to OFF_ENTRY. APSTUB_BIN is a tiny SPARC V8 (big-endian) stub
+# (source: apstub.S) whose _start sits at the body base. It reads a descriptor the
+# packer places at body+0x100 and loops the firmware's XIP WriteSPF (flash 0x3d0fc)
+# over a carried image, 64 KB per call, then signals + halts. Descriptor (BE):
+#   +0x100  u32 nchunks
+#   +0x104  nchunks * { u32 dstFlashAddr; u32 srcBodyOff; u32 size }
+#   +....   image bytes (srcBodyOff is a byte offset within the body)
+AP_BODY_DRAM = 0x4009a000
+STUB_MAX     = 0x100      # descriptor starts here; stub code must fit below it
+APSTUB_BIN = bytes.fromhex(
+    "21100268e2042100a404210480a460000280000e01000000d004a000d204a004"
+    "d404a00892024010030000f4821060fc9fc0400001000000a404a00ca2a46001"
+    "12bffff6010000000320001f821063f4053037b48410a00dc420400091d020000"
+    "1000000")
 
 def cmd_sections(path):
     d = open(path, "rb").read()
@@ -215,6 +238,71 @@ def cmd_apwrap(body_path, out_path, code=0x41):
           % (out_path, len(d), code, be16(d, OFF_CKSUM)))
     print("NOTE: the body must be a valid self-flashing AP; this only builds the container.")
 
+def _ap_finalize(d, code, entry):
+    """Fill header (magic/flags/pkver/chip/entry), pad to 4, set size + checksum."""
+    struct.pack_into(">I", d, 0x00, AP_MAGIC0)
+    struct.pack_into(">I", d, 0x04, AP_MAGIC1)
+    struct.pack_into(">I", d, OFF_FORCE, 1)
+    struct.pack_into(">I", d, OFF_CKEN, 1)
+    struct.pack_into(">I", d, OFF_PKVER, 5)
+    struct.pack_into(">I", d, OFF_CHIP, code)
+    struct.pack_into(">I", d, OFF_ENTRY, entry)
+    if len(d) % 4:
+        d += b"\x00" * (4 - len(d) % 4)
+    struct.pack_into(">I", d, OFF_SIZE, len(d))
+    struct.pack_into(">H", d, OFF_CKSUM, sum16(d[AP_HDR_LEN:len(d)]))
+    return d
+
+def cmd_mkflasher(out_path, writes, code=0x41, stub_path=None):
+    """Build a self-flashing UPG952A.AP: stub + descriptor + carried image(s).
+
+    `writes` is a list of (dstFlashAddr, image_path). Each image is written to
+    flash starting at dstFlashAddr (64 KB-aligned), split into <=64 KB chunks at
+    consecutive 64 KB sectors -- exactly what the stub feeds to WriteSPF.
+    """
+    stub = open(stub_path, "rb").read() if stub_path else APSTUB_BIN
+    if len(stub) > STUB_MAX:
+        print("stub too big (0x%x > 0x%x)" % (len(stub), STUB_MAX)); return 1
+
+    # Flatten every --write into 64 KB WriteSPF chunks.
+    chunks = []                      # (dstFlashAddr, data)
+    for dst, ipath in writes:
+        if dst & 0xFFFF:
+            print("--write dst 0x%x not 64 KB-aligned" % dst); return 1
+        data = open(ipath, "rb").read()
+        for off in range(0, len(data), 0x10000):
+            chunks.append((dst + off, data[off:off + 0x10000]))
+
+    n = len(chunks)
+    img_off = STUB_MAX + 4 + n * 12               # image bytes follow the table
+    table, image = bytearray(), bytearray()
+    touches_boot = False
+    for dst, data in chunks:
+        table += struct.pack(">III", dst, img_off + len(image), len(data))
+        image += data
+        if dst < 0x10000:
+            touches_boot = True
+
+    body = bytearray(STUB_MAX)
+    body[:len(stub)] = stub
+    body += struct.pack(">I", n) + table + image
+
+    d = _ap_finalize(bytearray(AP_HDR_LEN) + body, code, AP_BODY_DRAM)
+    if len(d) > AP_MAX_SIZE:
+        print("WARNING: size 0x%x exceeds reserved AP area 0x%x (force flag set; a real "
+              "loader may still refuse)" % (len(d), AP_MAX_SIZE))
+    open(out_path, "wb").write(d)
+    print("mkflasher: wrote %s (0x%x bytes, chip=0x%x, entry=0x%08x, checksum=0x%04x)"
+          % (out_path, len(d), code, AP_BODY_DRAM, be16(d, OFF_CKSUM)))
+    print("  %d WriteSPF chunk(s):" % n)
+    for dst, data in chunks:
+        print("    flash[0x%06x .. 0x%06x)  %u B" % (dst, dst + 0x10000, len(data)))
+    if touches_boot:
+        print("  NOTE: sector 0 (0x0..0x10000) is rewritten -- it holds the reset vector"
+              " + section table; this is expected for a full-image reflash.")
+    print("  verify with:  ctkap.py apinfo %s" % out_path)
+    return 0
+
 def main(argv):
     if len(argv) < 3:
         print(__doc__); return 2
@@ -229,6 +317,22 @@ def main(argv):
         if "--code" in rest:
             code = int(rest[rest.index("--code")+1], 0); rest = rest[:rest.index("--code")]
         return cmd_apwrap(rest[0], rest[1], code)
+    if cmd == "mkflasher":
+        code, stub, writes, out = 0x41, None, [], None
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--code":   code = int(rest[i+1], 0); i += 2
+            elif a == "--stub": stub = rest[i+1]; i += 2
+            elif a == "--write":
+                dst, ip = rest[i+1].split(":", 1)
+                writes.append((int(dst, 0), ip)); i += 2
+            elif out is None:   out = a; i += 1
+            else:               print("unexpected arg %r" % a); return 2
+        if not out or not writes:
+            print("usage: mkflasher <out.AP> --write DST:img [--write ...] [--code C] [--stub f]")
+            return 2
+        return cmd_mkflasher(out, writes, code, stub)
     print("unknown command %r" % cmd); return 2
 
 if __name__ == "__main__":

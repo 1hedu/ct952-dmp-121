@@ -6134,3 +6134,22 @@ So the COMPLETE on-device update path -- AP_INFO validation, MoveSectionTable, t
 ROMLD_BOOT_LoadSectionAndRun section loader, the flasher app running from its DRAM LMA,
 the firmware's own flash driver, and the SPI controller -- executes end-to-end for a
 self-built, loader-compatible AP, with only the controller modeled.
+
+### 12.93 Full compressed-image reflash: --image / mksectionap section-load path
+
+Extended `mksectionap` for whole-image reflash. `--image DST:img` ships the payload as
+its own UZIP-compressed section (`IMGn`, Load|ZIP) instead of raw bytes in FLSH, so a
+large image fits under the AP cap: the loader (0x528 -> UZIP codec 0x2c50) decompresses
+it to a DRAM LMA (0x40600000), and the flasher writes the decompressed bytes. dwAP_UNZIP_BUF
+(header 0x34) supplies the decoder work buffer (0x40780000); descriptor chunk src offsets
+into IMGn are `(IMGn_LMA - FLSH_LMA) + off`.
+
+Verified through the real loader (`--apload`): a 256 KB image (UZIP 0x40000->0x17d1d)
+decompressed and reflashed byte-exact -- **64 erase + 1024 program** SPI ops (4 sectors x
+16 erase; 4 x 256 pages), flash[0:0x40000] == the new image incl. a boot-safe SETD marker,
+flash above untouched. The full [0:0x160000] firmware image UZIPs to 0x7f33c (well under the
+0x166000 cap), packs into a 0x7fa58 AP (22 sectors, photo+COPY above 0x160000 preserved).
+
+So the update pipeline is complete for a self-built AP: `mksectionap --image` builds a
+loader-compatible, compressed, section-table AP, and `--apload` runs it through the real
+ROMLD loader (decompress -> flasher -> resident driver -> gate-level controller -> flash).

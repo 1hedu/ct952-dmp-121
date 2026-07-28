@@ -125,7 +125,9 @@ SEC_ENTRY    = 24               # sizeof(SECTION_ENTRY)
 SEC_TBL_OFF  = AP_HDR_LEN + AP_IMG_HDR              # 0x210 (file offset of the table)
 CONTENT_OFF  = SEC_TBL_OFF + NSEC * SEC_ENTRY       # 0x510 (sections start after 32 entries)
 FLSH_LMA     = 0x40500000       # runtime-free high DRAM; flasher app runs here
-FLSH_AP_SP   = 0x405f0000       # dwAP_SP for the loaded AP
+FLSH_AP_SP   = 0x405f0000       # dwAP_SP for the loaded AP (below IMAG_LMA_BASE)
+IMAG_LMA_BASE= 0x40600000       # decompressed --image section(s) land here
+FLSH_UNZIP_BUF = 0x40780000     # dwAP_UNZIP_BUF: UZIP work buffer for section decompression
 SEC_FLAG_LOAD, SEC_FLAG_PROGENTRY, SEC_FLAG_ZIP = 1, 2, 4
 # the section flasher app (source: apstub_sec.S), linked/loaded at FLSH_LMA
 APSTUB_SEC_BIN = bytes.fromhex(
@@ -338,64 +340,93 @@ def cmd_mkflasher(out_path, writes, code=0x41, stub_path=None):
     print("  verify with:  ctkap.py apinfo %s" % out_path)
     return 0
 
-def cmd_mksectionap(out_path, writes, code=0x41, stub_path=None):
+def cmd_mksectionap(out_path, writes, images, code=0x41, stub_path=None):
     """Build a LOADER-COMPATIBLE self-flashing AP (a section-table image).
 
-    The flasher app (apstub_sec.S) is one section (Load|ProgEntry) at FLSH_LMA; it
-    carries a descriptor + image and reflashes via the resident DRAM driver. The
-    on-device loader section-loads it and jumps in -- so it runs from DRAM.
+    The flasher app (apstub_sec.S) is section FLSH (Load|ProgEntry) at FLSH_LMA; it
+    carries a chunk descriptor and reflashes via the resident DRAM driver. Each
+    --write DST:img is a small raw payload embedded in FLSH; each --image DST:img is
+    a LARGE payload shipped as its own UZIP-compressed section (IMGn, Load|ZIP) that
+    the loader decompresses to a DRAM LMA -- so a full image fits under the AP cap
+    and the flasher writes the decompressed bytes. Chunk src offsets are relative to
+    FLSH_LMA (the flasher adds FLSH_LMA), so a chunk pointing into IMGn uses
+    (IMGn_LMA - FLSH_LMA) + offset.
     """
     stub = open(stub_path, "rb").read() if stub_path else APSTUB_SEC_BIN
     if len(stub) > STUB_MAX:
         print("flasher app too big (0x%x > 0x%x)" % (len(stub), STUB_MAX)); return 1
 
-    # section content = [app padded to 0x100][u32 nchunks][chunk table][image]
-    chunks = []
+    # flatten --write into raw 64 KB chunks (bytes embedded in FLSH content)
+    raw_chunks = []
     for dst, ip in writes:
         if dst & 0xFFFF:
             print("--write dst 0x%x not 64 KB-aligned" % dst); return 1
         data = open(ip, "rb").read()
         for off in range(0, len(data), 0x10000):
-            chunks.append((dst + off, data[off:off + 0x10000]))
-    n = len(chunks)
-    img_off = STUB_MAX + 4 + n * 12
-    table, image = bytearray(), bytearray()
-    for dst, data in chunks:
-        table += struct.pack(">III", dst, img_off + len(image), len(data))
-        image += data
+            raw_chunks.append((dst + off, data[off:off + 0x10000]))
+
+    # each --image becomes its own IMGn section (compressed), decompressed to imag_lma
+    img_specs, imag_lma = [], IMAG_LMA_BASE
+    for dst, ip in images:
+        if dst & 0xFFFF:
+            print("--image dst 0x%x not 64 KB-aligned" % dst); return 1
+        data = open(ip, "rb").read()
+        img_specs.append((dst, imag_lma, data))
+        imag_lma = (imag_lma + len(data) + 0xFFFF) & ~0xFFFF   # next IMGn LMA (64 KB-aligned)
+
+    nchunks = len(raw_chunks) + sum((len(d) + 0xFFFF) // 0x10000 for _, _, d in img_specs)
+    raw_base = STUB_MAX + 4 + nchunks * 12            # raw --write bytes follow the table
+    table, raw = bytearray(), bytearray()
+    for dst, data in raw_chunks:                       # raw chunks: src within FLSH content
+        table += struct.pack(">III", dst, raw_base + len(raw), len(data))
+        raw += data
+    for dst, ilma, data in img_specs:                  # image chunks: src within IMGn (@ its LMA)
+        for off in range(0, len(data), 0x10000):
+            n = min(0x10000, len(data) - off)
+            table += struct.pack(">III", dst + off, (ilma - FLSH_LMA) + off, n)
     content = bytearray(STUB_MAX); content[:len(stub)] = stub
-    content += struct.pack(">I", n) + table + image
+    content += struct.pack(">I", nchunks) + table + raw
     if len(content) % 4:
         content += b"\x00" * (4 - len(content) % 4)
 
-    # section table (32 entries); entry 0 = FLSH, entry 1.. = 0 (terminator).
-    # dwRMA is stored IMAGE-RELATIVE (offset from the AP image base = file 0x200):
-    # the loader resolves the source as dwRMA + pSecTbl - 0x10 (binary 0x5cc), and
-    # ROMLD_MoveSectionTable first rebases dwRMA by (src_tbl - dest_tbl) -- the two
-    # cancel so an image-relative dwRMA lands on the real DRAM content. (Same
-    # convention as the main image, where the table is at 0x10 and dwRMA == flash
-    # offset.) So dwRMA = content offset within the AP image.
-    rma_file  = CONTENT_OFF - AP_HDR_LEN
-    rma_final = AP_BODY_DRAM + CONTENT_OFF                        # where content lands in DRAM
-    csum = sum16(content)
+    # section table (32 entries): entry 0 = FLSH, then one IMGn per --image, then 0.
+    # dwRMA is IMAGE-RELATIVE (loader resolves dwRMA + pSecTbl - 0x10 after
+    # MoveSectionTable rebases it; same convention as the main image at table 0x10).
     sectbl = bytearray(NSEC * SEC_ENTRY)
-    struct.pack_into(">IIIIII", sectbl, 0,
-                     0x464C5348,                                  # 'FLSH'
-                     FLSH_LMA, rma_file, len(content), len(content),
-                     (csum << 16) | SEC_FLAG_LOAD | SEC_FLAG_PROGENTRY)
+    body = bytearray()          # section contents, placed at file offset CONTENT_OFF
+    secs = []                   # for the report
 
-    d = bytearray(AP_HDR_LEN + AP_IMG_HDR) + sectbl + content
+    def put_section(idx, name, lma, blob, lsz, cks, flags):
+        rma = (CONTENT_OFF + len(body)) - AP_HDR_LEN
+        struct.pack_into(">IIIIII", sectbl, idx * SEC_ENTRY, name, lma, rma, lsz, len(blob),
+                         (cks << 16) | flags)
+        secs.append((idx, name, lma, rma, lsz, len(blob), flags))
+        body.extend(blob)
+        if len(body) % 4:
+            body.extend(b"\x00" * (4 - len(body) % 4))
+
+    put_section(0, 0x464C5348, FLSH_LMA, content, len(content), sum16(content),
+                SEC_FLAG_LOAD | SEC_FLAG_PROGENTRY)                          # FLSH (raw)
+    for i, (dst, ilma, data) in enumerate(img_specs):
+        comp = uzip_compress(data)
+        name = int.from_bytes(("IMG%d" % i).encode(), "big")
+        put_section(1 + i, name, ilma, comp, len(data), sum16(data),
+                    SEC_FLAG_LOAD | SEC_FLAG_ZIP)                            # IMGn (UZIP)
+
+    d = bytearray(AP_HDR_LEN + AP_IMG_HDR + NSEC * SEC_ENTRY) + body
+    d[SEC_TBL_OFF:SEC_TBL_OFF + len(sectbl)] = sectbl
     d = _ap_finalize(d, code, FLSH_AP_SP)
+    struct.pack_into(">I", d, OFF_UNZIP, FLSH_UNZIP_BUF)   # dwAP_UNZIP_BUF (header; not in checksum)
     if len(d) > AP_MAX_SIZE:
-        print("WARNING: size 0x%x exceeds reserved 0x%x" % (len(d), AP_MAX_SIZE))
+        print("WARNING: size 0x%x exceeds reserved AP area 0x%x" % (len(d), AP_MAX_SIZE))
     open(out_path, "wb").write(d)
-    print("mksectionap: wrote %s (0x%x bytes, chip=0x%x, dwAP_SP=0x%08x, dwCheckSum=0x%04x)"
-          % (out_path, len(d), code, FLSH_AP_SP, be16(d, OFF_CKSUM)))
-    print("  section FLSH: lma=0x%08x rma=0x%08x(file) -> 0x%08x(after move) size=0x%x cks=0x%04x flags=Load|ProgEntry"
-          % (FLSH_LMA, rma_file, rma_final, len(content), csum))
-    print("  %d WriteSPF chunk(s):" % n)
-    for dst, data in chunks:
-        print("    flash[0x%06x .. 0x%06x)  %u B" % (dst, dst + 0x10000, len(data)))
+    print("mksectionap: wrote %s (0x%x bytes, chip=0x%x, dwAP_SP=0x%08x, dwAP_UNZIP_BUF=0x%08x, dwCheckSum=0x%04x)"
+          % (out_path, len(d), code, FLSH_AP_SP, FLSH_UNZIP_BUF, be16(d, OFF_CKSUM)))
+    for idx, name, lma, rma, lsz, rsz, flags in secs:
+        fl = "|".join(f for b, f in ((1, "Load"), (2, "ProgEntry"), (4, "ZIP")) if flags & b)
+        print("  sec[%d] %-4s lma=0x%08x rma=0x%06x lsz=0x%x rsz=0x%x flags=%s"
+              % (idx, name.to_bytes(4, "big").decode("latin1"), lma, rma, lsz, rsz, fl))
+    print("  %d WriteSPF chunk(s):" % nchunks)
     print("  run through the real loader:  ct952emu dp700wd.bin --rom-load --apload %s" % out_path)
     return 0
 
@@ -430,7 +461,7 @@ def main(argv):
             return 2
         return cmd_mkflasher(out, writes, code, stub)
     if cmd in ("mksectionap", "mksecap"):
-        code, stub, writes, out = 0x41, None, [], None
+        code, stub, writes, images, out = 0x41, None, [], [], None
         i = 0
         while i < len(rest):
             a = rest[i]
@@ -439,12 +470,15 @@ def main(argv):
             elif a == "--write":
                 dst, ip = rest[i+1].split(":", 1)
                 writes.append((int(dst, 0), ip)); i += 2
+            elif a == "--image":
+                dst, ip = rest[i+1].split(":", 1)
+                images.append((int(dst, 0), ip)); i += 2
             elif out is None:   out = a; i += 1
             else:               print("unexpected arg %r" % a); return 2
-        if not out or not writes:
-            print("usage: mksectionap <out.AP> --write DST:img [--write ...] [--code C] [--stub f]")
+        if not out or not (writes or images):
+            print("usage: mksectionap <out.AP> [--write DST:img] [--image DST:img] [--code C] [--stub f]")
             return 2
-        return cmd_mksectionap(out, writes, code, stub)
+        return cmd_mksectionap(out, writes, images, code, stub)
     print("unknown command %r" % cmd); return 2
 
 if __name__ == "__main__":

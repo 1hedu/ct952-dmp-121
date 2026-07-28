@@ -479,7 +479,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "[apload] calling REAL ROMLD_BOOT_LoadSectionAndRun(0x4bc)"
                     "(tbl=0x40000800, unzip=0x%08x, sp=0x%08x)\n", unzip, ap_sp);
             ran = (uint64_t)machine_call(m, 0x4bcu, 0x40000800u, unzip, ap_sp,
-                                         ap_sp, 10000000ull);
+                                         ap_sp, 200000000ull);
             fprintf(stderr, "[apload] returned (rc as icount unused); stopped: %s (pc=0x%08x); "
                     "SPI ops: %llu erase, %llu program\n",
                     m->cpu.halted ? m->cpu.halt_reason : "budget/return", m->cpu.pc,

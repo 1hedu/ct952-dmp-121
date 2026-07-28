@@ -858,6 +858,23 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
                             sparc_get_reg(c, 15), (unsigned long long)c->icount);
                 }
         }
+        /* Gate-value dump (CT952_GATEDUMP): at the confirm handler FUN_000237dc
+         * (0x237dc) dump the play-gate DAT vars so we see which gate blocks the
+         * SD auto-select -> play (§12.113). f99=0x40022f99 325f9=0x400325f9
+         * 329e0=0x400329e0 329e4=0x400329e4. */
+        { static int gd = -1; static int gn = 0;
+          if (gd < 0) gd = getenv("CT952_GATEDUMP") ? 1 : 0;
+          if (gd && c->pc == 0x237dcu && gn < 8) { int f;
+            gn++;
+            uint32_t f99 = c->bus->read(c->bus, 0x40022f99u, 1, &f);
+            uint32_t s9  = c->bus->read(c->bus, 0x400325f9u, 1, &f);
+            uint32_t e0  = c->bus->read(c->bus, 0x400329e0u, 4, &f);
+            uint32_t e4  = c->bus->read(c->bus, 0x400329e4u, 4, &f);
+            uint32_t f97 = c->bus->read(c->bus, 0x40022f97u, 1, &f);
+            fprintf(stderr, "[GATE] @237dc param=%02x f99=%02x 325f9=%02x 329e0=%08x 329e4=%08x f97=%02x icount=%llu\n",
+                    sparc_get_reg(c,8)&0xff, f99, s9, e0, e4, f97, (unsigned long long)c->icount);
+          }
+        }
         if (ftr >= 0 && c->pc == 0x4001dffcu && c->icount >= (uint64_t)ftr && ftn < 400) {
             ftn++;
             fprintf(stderr, "[FLAG] wait obj=%08x mask=%08x i7=%08x icount=%llu\n",

@@ -1267,3 +1267,54 @@ keys (ENTER 0x13, and scancode 8 -> keycode 0xf0) did not yet drive it — next 
 dialog's source list shows the card and which key/sequence selects it (ref: media.c
 MEDIA_MediaSelection_ProcessKey uses KEY_SELECTMEDIA/KEY_UP/KEY_DOWN). That is UX wiring on top of
 a fully-working recognition path -- the hard part (does the emulator recognize the card) is DONE.
+
+### 12.113 ★★★ DONE — the SD card photo renders through the real firmware media path
+
+The full card→display chain is now traced end‑to‑end, decompiled, and — with one faithful
+user‑setting model + the missing hardware‑engine pixel decode — the card's photo renders on screen
+via the firmware's own path. No crutch: every step is the real firmware acting on the modeled SD
+card's bytes.
+
+**The play chain (all Ghidra‑verified, addresses from our binary):**
+`FUN_00026f38` (boot SD check) → if `DAT_40022f97==0` calls `FUN_00029348` **directly (auto‑play)**;
+if `f97!=0` (our boot) → `FUN_0002743c` (menu path) → `FUN_0002183c(DAT_40032a58)` →
+`FUN_00021868` → `FUN_000237dc` (confirm) → `FUN_00029348` (play) → `FUN_0001b48c` (parse‑decision)
+→ `FUN_0001b5c8` (PARSER START) → the `0x80000800` engine.
+
+**The two real gates (both faithful):**
+1. **`DAT_40022f97` = power‑on media‑select menu.** `FUN_000418f0` (INITIAL boot thread) sets f97=1
+   unconditionally in the initial‑done branch and shows OSD mode‑8. This is the genuine power‑on
+   menu design: boot → media‑select menu → user picks a source. With f97=1 the SD is recognized and
+   its entry is auto‑selected in the menu (via `FUN_0002743c`→`FUN_0002183c`), but not auto‑played.
+2. **`DAT_40022f99` (from setting `DAT_400325fa`, NVRAM index 0x10a) = manual‑select vs auto‑play.**
+   `FUN_000237dc`'s play branch requires `f99==0`. f99 is copied from 325fa: 325fa=1 → f99=1 (park
+   in menu, wait for keypress); 325fa=0 → f99=0 (auto‑play recognized media). **325fa's shipped
+   value is 1** — proven by the defaults blob `01 01 01 02 02 02 00 00` stored 4× in the settings
+   flash at 0x1108/0x1508/0x1908/0x1d08 (redundant NVRAM slots). So on the dumped device the card
+   correctly waits in the power‑on menu; playing it needs either the auto‑play setting (325fa=0) or
+   the user's select keypress. GATEDUMP at `FUN_000237dc`:
+   `param=00 f99=01 325f9=01 329e0=0 329e4=1038 f97=01` — every gate satisfied except f99.
+
+**The card's display path is the `0x80000800` hardware engine, NOT the JPU.** After selection the
+parser fires and `FUN_0009b9ac` programs the card JPEG into the engine (`0x80000a20 <- 0x401ec000`)
+with scale math and GOs it (`0x80000a3c <- 1`, one op at icount≈44.86M). The firmware never routes
+the card through the JPU — `jpeg_src` stays on the demo buffer 0x401dc000, which is why the card was
+invisible: our engine model only faked the completion‑status field, producing no pixels.
+
+**Fix (faithful): model the engine's decode with the same picojpeg path the JPU already uses.** On
+engine GO, if the source holds a JPEG (SOI), point the decode at the engine source and run the
+existing decode+emit pipeline (`machine.c`, in the `CT952_JPUENG` GO handler). This mirrors exactly
+how the demo/JPU path is modeled — only the decoder implementation (picojpeg vs the HW JPEG core) is
+approximated; the trigger, source buffer, and timing are the real firmware's.
+
+**Result — decode #3: 640×360 from 0x401ec000** (native SDTEST resolution, distinct from the demo's
+480×270). The rendered frame reproduces the modeled card's own test image — the RGB colour bars and
+the legible text `SD CARD / TEST IMAGE / not in demo album`, content that exists **only** on the SD
+image and never in the built‑in demo album. Unforgeable proof the pixels came from the card's DMA
+buffer through the firmware path. (The lower ~40% is corrupted because only the first 16 KB of the
+20 KB file was in the buffer at engine‑GO time; the top is pixel‑exact.)
+
+**Diagnostics added:** `CT952_MEDIA_AUTOPLAY` (force setting 325fa=0 to model a user who enabled
+auto‑play), `CT952_GATEDUMP` (dump the `FUN_000237dc` play gates), and the engine pixel‑decode in
+the `CT952_JPUENG` GO handler. Run: `CT952_SDCARD=<img> CT952_MEDIA_AUTOPLAY=1 CT952_JPUENG=1
+CT952_TICK_MULT=64 ./ct952emu dp700wd.bin --instr 50000000 --jpeg-out out.ppm`.

@@ -1608,7 +1608,7 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
          || addr == 0x40039f60u || (addr & ~3u) == 0x40039cd0u || addr == 0x40022f06u
          || addr == 0x4003263cu || addr == 0x4003277cu
          || addr == 0x40039949u || addr == 0x4003274au
-         || addr == 0x40022f81u || addr == 0x40032780u || addr == 0x4002fb2au || addr == 0x40022f5eu || addr == 0x40022f00u || (addr &~3u) == 0x4002fb50u || addr == 0x4003996cu || (addr &~3u) == 0x40032aa0u || (addr &~3u) == 0x400322c8u || addr == 0x40020d8au)) {
+         || addr == 0x40022f81u || addr == 0x40032780u || addr == 0x4002fb2au || addr == 0x40022f5eu || addr == 0x40022f00u || (addr &~3u) == 0x4002fb50u || addr == 0x4003996cu || (addr &~3u) == 0x40032aa0u || (addr &~3u) == 0x400322c8u || addr == 0x40020d8au || addr == 0x400235acu || addr == 0x40039b08u || (addr &~7u) == 0x400325f8u || addr == 0x40022f99u || addr == 0x40022f97u)) {
         static int smw; if (smw < 300) {
             fprintf(stderr, "[SMW] %08x <- %08x (sz%d) pc=%08x icount=%llu\n",
                     addr, val, size, m->cpu.pc, (unsigned long long)m->cpu.icount); smw++; }
@@ -1636,6 +1636,24 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
                 fprintf(stderr, "[ENGGO] src=%08x pc=%08x winframes:", m->eng_src, m->cpu.pc);
                 for (bi = 0; bi < nb; bi++) fprintf(stderr, " %08x", bt[bi]);
                 fprintf(stderr, " icount=%llu\n", (unsigned long long)m->cpu.icount);
+            }
+            /* Engine pixel-decode (§12.113): the 0x80000800 hardware engine is the
+             * card photo's real display path -- FUN_0009b9ac programs the card JPEG
+             * (0x80000a20 <- 0x401ec000) and GOs it. The firmware never routes the
+             * card through the JPU (jpeg_src stays on the demo buffer 0x401dc000),
+             * so without decoding the engine source the card is invisible. Model
+             * the engine's decode with the SAME picojpeg path the JPU uses: point
+             * jpeg_src at the engine source and run the decode+emit pipeline. This
+             * is a faithful model -- the real hardware engine really does decode
+             * that buffer; only the decoder implementation (picojpeg vs HW) is
+             * modeled, exactly as the demo/JPU path already is. Gated on a JPEG SOI
+             * so non-image engine ops (2D blits) are untouched. */
+            {
+                uint8_t *es = machine_dram_ptr(m, m->eng_src);
+                if (es && es[0] == 0xFF && es[1] == 0xD8) {
+                    m->jpeg_src = m->eng_src;
+                    machine_maybe_jpeg_decode(m);
+                }
             }
         }
     }
@@ -1839,6 +1857,16 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
     if (addr < MACH_FLASH_MAX)
         return;                          /* XIP flash: ignore writes */
     if (addr >= 0x40000000u && addr + (uint32_t)size <= 0x40000000u + MACH_DRAM_SIZE) {
+        /* Media auto-play preference (CT952_MEDIA_AUTOPLAY): the shipped flash
+         * setting 0x10a (DAT_400325fa, at 0x400325fa) = 1 means "require manual
+         * media selection" -- so a recognized SD card is placed in the power-on
+         * media-select menu (f97=1 path) instead of auto-playing. It is a
+         * user-configurable persisted setting; value 0 = "auto-play recognized
+         * media". Force it to 0 to model a user who enabled auto-play, so the
+         * already-proven recognition->confirm chain (FUN_0002743c -> FUN_0002183c
+         * -> FUN_000237dc -> FUN_00029348 -> parser) drives the card decode
+         * without a keypress. Faithful downstream: nothing else is altered. */
+        if (addr == 0x400325fau && getenv("CT952_MEDIA_AUTOPLAY")) val = 0;
         mem_write_raw(m->dram + (addr - 0x40000000u), val, size);
         /* Media-state scan (CT952_MSCAN=<start_icount>): log byte writes of the
          * MediaInfo bitflag values (INSERT=1/RECOGNIZE=2/PARSING=4/READY=8/

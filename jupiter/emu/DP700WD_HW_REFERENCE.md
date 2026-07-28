@@ -1407,3 +1407,20 @@ is now blocked solely on posting/delivering that mailbox event.
 
 **Diagnostics added:** `CT952_IRKEYS` (multi-key timed IR injection) and event-slot watch on
 0x40026eb0.
+
+### 12.116-CORRECTION ★ The 0x40026eb0==0x168/5 gate is NOT the blocker (data contradicts §12.116)
+
+Watching writes to CC mailbox slot 0 (0x40026eb0) across a NEXT run: the slot holds **2** during the
+*working* photo-1 parse (written 0x2 at icount 44.864M, pc=0x6354) and is not rewritten after NEXT.
+Since `FUN_00007658(0)` returns 2 for photo 1 too — and photo 1 decoded fine — the THUMB-trigger
+branch (`==0x168/5`) is NOT the path photo 1 takes, so it is NOT the advance blocker. §12.116's
+"CC event 0x168/5 never posted" conclusion is retracted.
+
+**What still holds (PCWATCH-verified, unchanged):** the input dispatch is fully wired — NEXT →
+FUN_000260f4 → FUN_0001bec0 case '=' → FUN_0001d41c(0) advance → parser re-arm (DAT_4003274a=1),
+and PARSERHEADER (FUN_0001b800) re-runs afterward. **What actually stalls:** PARSERHEADER re-enters
+its `else` branch (the same path photo 1 used: state `DAT_4003263c`, stepping via `FUN_000375a0`)
+but spins there without driving a new file-read/engine-GO for photo 2 (0 READ18, 0 ENGGO after NEXT).
+The precise sub-cause inside the parser re-entry (why `FUN_000375a0` / the `DAT_4003263c` state
+machine advances for the initial photo but not for the post-advance photo) is not yet pinned — that
+is the open thread, not the mailbox event.

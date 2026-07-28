@@ -218,11 +218,10 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
     }
 }
 
-/* ============================ Python surface ================================= */
-
-/* usb_kbd.init() -- reset the controller + port, enumerate and configure the
- * keyboard. Returns True on success. */
-static mp_obj_t usb_kbd_init(void) {
+/* Reset the controller + root-hub port, enumerate and configure the keyboard.
+ * Returns 1 on success, 0 if no device / enumeration failed. Plain C so both
+ * the Python module and the C REPL stdin path can call it. */
+int usb_kbd_bringup(void) {
     g_ready = 0; g_dev_addr = 0; g_int_toggle = 0;
 
     /* Controller reset, then take ownership of all ports and run. */
@@ -232,7 +231,7 @@ static mp_obj_t usb_kbd_init(void) {
     EHCI_USBCMD = USBCMD_RS;
 
     if (!(EHCI_PORTSC0 & PORTSC_CCS)) {
-        return mp_const_false;           /* nothing plugged in */
+        return 0;                        /* nothing plugged in */
     }
     /* Clear the connect-change latch, then reset the port. */
     EHCI_PORTSC0 = (EHCI_PORTSC0 & ~PORTSC_PED) | PORTSC_CSC;
@@ -241,12 +240,12 @@ static mp_obj_t usb_kbd_init(void) {
     EHCI_PORTSC0 = EHCI_PORTSC0 & ~PORTSC_PR;   /* de-assert -> HS enable */
     for (volatile int i = 0; i < 20000; i++) { }
     if (!(EHCI_PORTSC0 & PORTSC_PED)) {
-        return mp_const_false;           /* port did not enable */
+        return 0;                        /* port did not enable */
     }
 
     /* Enumerate at address 0: read the 18-byte device descriptor. */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 18) < 18) {
-        return mp_const_false;
+        return 0;
     }
     mp_printf(&mp_plat_print,
         "usb_kbd: device VID=%04x PID=%04x class=%d MPS0=%d\n",
@@ -255,17 +254,17 @@ static mp_obj_t usb_kbd_init(void) {
 
     /* Assign address 1 and adopt it. */
     if (ctrl_xfer(0x00, REQ_SET_ADDRESS, 1, 0, 0) < 0) {
-        return mp_const_false;
+        return 0;
     }
     g_dev_addr = 1;
 
     /* Read the configuration descriptor set (config+iface+HID+endpoint). */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_CONFIG << 8), 0, 34) < 9) {
-        return mp_const_false;
+        return 0;
     }
     /* Select the (only) configuration. */
     if (ctrl_xfer(0x00, REQ_SET_CONFIGURATION, g_data[5], 0, 0) < 0) {
-        return mp_const_false;
+        return 0;
     }
     /* HID: boot protocol + infinite idle (report only on change). */
     ctrl_xfer(0x21, HID_SET_PROTOCOL, 0 /* boot */, 0, 0);
@@ -273,7 +272,31 @@ static mp_obj_t usb_kbd_init(void) {
 
     g_ready = 1;
     mp_printf(&mp_plat_print, "usb_kbd: configured, polling ep 0x81\n");
-    return mp_const_true;
+    return 1;
+}
+
+/* Non-blocking single-key read for the REPL's stdin. One short interrupt-IN
+ * poll: returns the ASCII code of a key-down with a printable usage, or -1 for
+ * NAK / key-up / non-printable / no keyboard. */
+int usb_kbd_c_getchar(void) {
+    if (!g_ready) {
+        return -1;
+    }
+    uint8_t rep[8];
+    if (int_in_poll(rep, 4000) && rep[2] != 0) {
+        char c = usage_to_ascii(rep[0], rep[2]);
+        if (c) {
+            return (unsigned char)c;
+        }
+    }
+    return -1;
+}
+
+/* ============================ Python surface ================================= */
+
+/* usb_kbd.init() -- enumerate and configure the keyboard; returns True/False. */
+static mp_obj_t usb_kbd_init(void) {
+    return usb_kbd_bringup() ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(usb_kbd_init_obj, usb_kbd_init);
 

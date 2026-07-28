@@ -10,11 +10,23 @@
 #define UART1_STAT (*(volatile uint32_t *)0x80000074u)
 #define UART_RX_READY 0x1u
 
-// Receive single character (blocking).
+/* USB HID keyboard driver (modusb_kbd.c): non-blocking single-key read, -1 if
+ * no key / no keyboard. Lets the REPL take input from a USB keyboard as well as
+ * UART1. */
+extern int usb_kbd_c_getchar(void);
+
+// Receive single character (blocking): poll the USB keyboard and UART1 RX,
+// returning whichever produces a character first.
 int mp_hal_stdin_rx_chr(void) {
-    while ((UART1_STAT & UART_RX_READY) == 0) {
+    for (;;) {
+        int c = usb_kbd_c_getchar();
+        if (c >= 0) {
+            return c;
+        }
+        if (UART1_STAT & UART_RX_READY) {
+            return (int)(UART1_DATA & 0xFF);
+        }
     }
-    return (int)(UART1_DATA & 0xFF);
 }
 
 // Send string of given length.

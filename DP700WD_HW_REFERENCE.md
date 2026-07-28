@@ -5486,3 +5486,43 @@ correctly; with no `CT952_USB_KEYS`, `init()` returns False and the demo prints
 `usb_kbd: no keyboard on port 0` — the retail boot path is untouched. A full USB stack —
 controller reset, port reset, control-transfer enumeration, and HID interrupt polling —
 now runs on the emulated CT952, written in Python on the device.
+
+### 12.76 Boot-to-REPL — a live Python prompt driven by the USB keyboard
+
+The branch's goal reached: the MicroPython port now **boots to an interactive
+REPL** whose stdin is the USB HID keyboard (and UART1).
+
+- `mp_hal_stdin_rx_chr` (`uart_core.c`) now polls both sources: a non-blocking
+  `usb_kbd_c_getchar()` (one short interrupt-IN poll on the HID endpoint,
+  returning the decoded ASCII of a key-down or -1) and UART1 RX, returning
+  whichever produces a character first.
+- `mpy_main` (`main.c`) brings up the keyboard (`usb_kbd_bringup()`, the C entry
+  the Python `usb_kbd.init()` also uses), runs a one-line startup
+  (`import ct952; ct952.init()`), then loops on MicroPython's
+  `pyexec_friendly_repl()` — the real friendly REPL (readline line editing,
+  multi-line continuation, expression auto-print).
+- Build: added `shared/runtime/pyexec.c` + `shared/readline/readline.c`;
+  `readline.c` goes in `SRC_QSTR` so its `MP_REGISTER_ROOT_POINTER(readline_hist)`
+  is collected into `genhdr/root_pointers.h`. readline pulls `snprintf`
+  (`shared/libc/printf.c`), and `-U_FORTIFY_SOURCE` stops the sparc64 headers
+  redirecting it to the unavailable `__snprintf_chk`.
+
+**Result (verified), feeding `CT952_USB_KEYS="print(2+2)\nimport ct952\nct952.fill(11)\n2**16\n"`:**
+
+```
+usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64
+usb_kbd: configured, polling ep 0x81
+[ct952] USB keyboard ready -- type Python below
+MicroPython v1.29.0-preview on 2026-07-28; ct952 with sparc-v8-be
+>>> print(2+2)
+4
+>>> import ct952
+>>> ct952.fill(11)
+>>> 2**16
+65536
+```
+
+Every keystroke traversed the full stack — HID boot report → EHCI async schedule
+→ bare-metal driver → REPL stdin — and `ct952.fill(11)` repainted the OSD plane
+live. A DVD-player SoC, emulated from its own firmware, now takes typed Python at
+a `>>>` prompt over a USB keyboard.

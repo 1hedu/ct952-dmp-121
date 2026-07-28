@@ -50,34 +50,50 @@ make -j4                       # -> build/firmware.bin
 
 ## Running
 
-`ct952emu` loads the `.bin` as the flash image and resets to address 0:
+`ct952emu` loads the `.bin` as the flash image and resets to address 0. The
+firmware boots to an **interactive MicroPython REPL** reading from a USB
+keyboard and UART1:
 
 ```sh
 cd ../emu && make ct952emu
-./ct952emu ../mpy/build/firmware.bin --instr 20000000
+./ct952emu ../mpy/build/firmware.bin --instr 200000000
 ```
 
 UART1 output is echoed to stdout.
 
-### USB keyboard
+### Interactive REPL over a USB keyboard
 
-The demo also enumerates and polls a USB HID keyboard through the `usb_kbd`
-module — a bare-metal EHCI driver written in C, driven from Python. Attach a
-keyboard and feed keystrokes with `CT952_USB_KEYS`:
+After a one-time startup (`import ct952; ct952.init()`) the port drops into
+MicroPython's friendly REPL. Input comes from a USB HID keyboard — enumerated
+and polled by the bare-metal EHCI driver (`modusb_kbd.c`) — and/or UART1 RX.
+Feed a keyboard "session" with `CT952_USB_KEYS` (`\n` = Enter, shift handled):
 
 ```sh
-CT952_USB_KEYS="hello world" ./ct952emu ../mpy/build/firmware.bin --instr 150000000
-# ...
-# usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64
-# usb_kbd: configured, polling ep 0x81
-# usb_kbd typed: hello world
+printf -v KEYS 'print(2+2)\nimport ct952\nct952.fill(11)\n2**16\n'
+CT952_USB_KEYS="$KEYS" ./ct952emu ../mpy/build/firmware.bin --instr 200000000
 ```
 
-`usb_kbd.init()` resets the controller, resets the root-hub port, enumerates
-the device over the async schedule (GET_DESCRIPTOR / SET_ADDRESS /
-SET_CONFIGURATION / HID SET_PROTOCOL), then `usb_kbd.getchar()` polls the
-interrupt-IN endpoint for 8-byte HID boot reports and maps them to characters.
-With no `CT952_USB_KEYS`, the root hub is empty and `init()` returns `False`.
+```
+usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64
+usb_kbd: configured, polling ep 0x81
+[ct952] USB keyboard ready -- type Python below
+MicroPython v1.29.0-preview on ...; ct952 with sparc-v8-be
+>>> print(2+2)
+4
+>>> import ct952
+>>> ct952.fill(11)
+>>> 2**16
+65536
+```
+
+Every character arrives as an 8-byte USB HID boot report through the modeled
+EHCI controller: `usb_kbd_bringup()` resets the controller, resets the root-hub
+port, and enumerates the device over the async schedule (GET_DESCRIPTOR /
+SET_ADDRESS / SET_CONFIGURATION / HID SET_PROTOCOL); the REPL's stdin
+(`mp_hal_stdin_rx_chr`) then polls the interrupt-IN endpoint and UART1 RX. With
+no `CT952_USB_KEYS`, the root hub is empty and the REPL reads UART1 only
+(`--uart-in`). The `usb_kbd` module (`init`, `poll`, `getchar`) exposes the same
+driver to Python.
 
 ## SPARC bring-up notes
 
@@ -94,12 +110,13 @@ With no `CT952_USB_KEYS`, the root hub is empty and `init()` returns `False`.
 - **Big-endian.** Verified live: `(0x01020304).to_bytes(4, 'big')` yields
   `b'\x01\x02\x03\x04'`, and MPZ long ints (`2**32 - 1`) are exact.
 - **No 32-bit libgcc / libc.** The link is `-nostdlib`; `shared/libc/string0.c`
-  supplies `mem*`/`str*`, and no libgcc runtime helpers turned out to be
-  needed at `-Os`.
+  supplies `mem*`/`str*` and `shared/libc/printf.c` supplies `snprintf` (for
+  readline), and no libgcc runtime helpers turned out to be needed at `-Os`.
+  `-U_FORTIFY_SOURCE` stops the toolchain headers redirecting `snprintf` to the
+  glibc `__snprintf_chk` fortify helper.
 
 ## Next
 
-- Interactive REPL over UART RX (`uart_core.c` already implements
-  `mp_hal_stdin_rx_chr`; feed input with `ct952emu --uart-in`).
-- A `ct952` HAL module binding the modeled display/GPU/input so Python can
-  drive the panel (see `jupiter/` for the C-side hardware bring-up).
+- A frozen `boot.py`/`main.py` in flash so scripts run without a keyboard.
+- Bind more of the modeled hardware to `ct952` (GPU 2-D engine, IR/panel keys,
+  the SD card) so Python can drive the whole player.

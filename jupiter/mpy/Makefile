@@ -19,7 +19,10 @@ INC += -I$(BUILD)
 # SPARC V8, ILP32, big-endian, soft-float, no OS/libc. -I. makes our
 # setjmp.h shim win over the toolchain's <setjmp.h>.
 CFLAGS_ARCH = -m32 -mcpu=v8 -msoft-float -mno-app-regs
-CFLAGS += $(INC) -Wall -std=c99 -nostdlib -ffreestanding -fno-common $(CFLAGS_ARCH) $(COPT)
+# -U_FORTIFY_SOURCE: the sparc64 headers otherwise inline snprintf() ->
+# __snprintf_chk (a glibc fortify helper we don't link freestanding); readline
+# uses snprintf, and shared/libc/printf.c supplies the plain version.
+CFLAGS += $(INC) -Wall -std=c99 -nostdlib -ffreestanding -fno-common -U_FORTIFY_SOURCE $(CFLAGS_ARCH) $(COPT)
 
 CSUPEROPT = -Os
 
@@ -41,10 +44,14 @@ SRC_C = \
 	modct952.c \
 	modusb_kbd.c \
 	shared/libc/string0.c \
+	shared/libc/printf.c \
 	shared/runtime/stdout_helpers.c \
+	shared/runtime/pyexec.c \
+	shared/readline/readline.c \
 
 SRC_QSTR += modct952.c
 SRC_QSTR += modusb_kbd.c
+SRC_QSTR += shared/readline/readline.c
 
 SRC_S = \
 	start.S \

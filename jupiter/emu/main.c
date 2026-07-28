@@ -41,6 +41,7 @@ int main(int argc, char **argv)
     int spitest = 0;                  /* --spitest: drive the REAL flash driver via the SPI ctrl model */
     uint32_t spi_addr = 0x1a0000u, spi_size = 0x1000u;
     uint64_t spi_boot = 20000000ull;   /* enough to run flash-init (PROM_Config...Ok) */
+    const char *apflash_path = NULL;  /* --apflash: full self-flashing AP via the gate-level ctrl */
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -111,6 +112,8 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--spitest-boot") && i + 1 < argc)
             spi_boot = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--apflash") && i + 1 < argc)
+            apflash_path = argv[++i];
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -356,6 +359,68 @@ int main(int argc, char **argv)
             FILE *ff = fopen(flashout_path, "wb");
             if (ff) { fwrite(m->flash, 1, m->flash_size, ff); fclose(ff);
                 fprintf(stderr, "[spitest] dumped flash to %s\n", flashout_path); }
+        }
+        machine_free(m); free(m);
+        return 0;
+    }
+
+    /* --apflash FILE: the FULL self-flashing update path on firmware code. Boot
+     * normally (driver resident + config populated), arm the gate-level SPI
+     * controller model, load the AP body to DRAM 0x4009a000 and jump into it as
+     * the loader (0x3e48) does -- then the body calls the REAL WriteSPF (XIP
+     * 0x3d0fc), whose real erase/program helpers issue real SPI commands the
+     * controller model services against m->flash. Every layer is firmware code
+     * except the modeled controller. §12.90. (The body must target a sector that
+     * does NOT hold the XIP WriteSPF trampoline; a hardware body runs a DRAM copy
+     * of the driver to rewrite even that -- see CT952A_FLASH_FORMAT.md.) */
+    if (apflash_path) {
+        FILE *af = fopen(apflash_path, "rb");
+        long asz; uint8_t *ap;
+        if (!af) { perror(apflash_path); return 1; }
+        fseek(af, 0, SEEK_END); asz = ftell(af); fseek(af, 0, SEEK_SET);
+        ap = (uint8_t *)malloc((size_t)asz);
+        if (!ap || fread(ap, 1, (size_t)asz, af) != (size_t)asz) {
+            fprintf(stderr, "[apflash] read failed\n"); return 1; }
+        fclose(af);
+        fprintf(stderr, "[apflash] booting %llu instrs to populate the flash driver...\n",
+                (unsigned long long)spi_boot);
+        machine_run(m, spi_boot);
+        m->spi_ctrl_on = 1;
+        m->spi_erases = m->spi_programs = 0;
+        {
+            uint32_t apsize = (uint32_t)ap[0x0c]<<24 | (uint32_t)ap[0x0d]<<16 |
+                              (uint32_t)ap[0x0e]<<8  | ap[0x0f];
+            uint32_t entry  = (uint32_t)ap[0x30]<<24 | (uint32_t)ap[0x31]<<16 |
+                              (uint32_t)ap[0x32]<<8  | ap[0x33];
+            uint32_t bodylen = (apsize > 0x200 && apsize <= (uint32_t)asz)
+                                 ? apsize - 0x200u : (uint32_t)asz - 0x200u;
+            uint8_t *d = machine_dram_ptr(m, 0x4009a000u);
+            uint64_t ran;
+            if (!entry) entry = 0x4009a000u;
+            if (!d) { fprintf(stderr, "[apflash] DRAM 0x4009a000 unmapped\n"); return 1; }
+            memcpy(d, ap + 0x200, bodylen);
+            fprintf(stderr, "[apflash] boot pc=0x%08x; controller armed; AP body (%u B) "
+                    "-> DRAM 0x4009a000, jumping to entry 0x%08x\n", m->cpu.pc, bodylen, entry);
+            m->cpu.pc = entry; m->cpu.npc = entry + 4;
+            sparc_set_reg(&m->cpu, 14, 0x40760000u);
+            sparc_set_reg(&m->cpu, 30, 0);
+            /* Trap-free window environment (as machine_call uses to run WriteSPF):
+             * S=1, PIL=15, ET=0, WIM=0 so nested save/restore just rotate and the
+             * body's terminating `ta 0` cleanly halts (error mode). */
+            m->cpu.psr = 0xA0000000u | PSR_S | 0x00000F00u;
+            m->cpu.wim = 0;
+            m->cpu.halted = 0; m->watchdog_fired = 0;
+            ran = machine_run(m, 100000000ull);
+            fprintf(stderr, "[apflash] body ran %llu instrs, stopped: %s (pc=0x%08x); "
+                    "SPI ops: %llu erase, %llu program\n", (unsigned long long)ran,
+                    m->cpu.halted ? m->cpu.halt_reason : "budget", m->cpu.pc,
+                    (unsigned long long)m->spi_erases, (unsigned long long)m->spi_programs);
+        }
+        free(ap);
+        if (flashout_path) {
+            FILE *ff = fopen(flashout_path, "wb");
+            if (ff) { fwrite(m->flash, 1, m->flash_size, ff); fclose(ff);
+                fprintf(stderr, "[apflash] dumped flash to %s\n", flashout_path); }
         }
         machine_free(m); free(m);
         return 0;

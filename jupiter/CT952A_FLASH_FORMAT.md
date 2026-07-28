@@ -190,6 +190,18 @@ model services against `m->flash`. Verified byte-exact against a staged sentinel
 (16 erase + 16 program ops, surrounding flash untouched). See §12.89 in
 `DP700WD_HW_REFERENCE.md`.
 
+And the FULL update path — a self-flashing AP body driving that real driver through
+the gate-level controller (loader-style body load → real `WriteSPF` → real
+erase/program → controller → flash), every layer firmware code except the modeled
+controller:
+```sh
+ct952emu dp700wd.bin --rom-load --apflash out.AP --flash-out after.bin
+```
+Boots, arms the controller, copies the AP body to DRAM `0x4009a000`, jumps to the
+header entry (as loader `0x3e48` does), and lets the body reflash. Verified: 16 erase
++ 16 program ops, target sector matches the payload, and the boot region + the XIP
+`WriteSPF` sector are untouched. See §12.90.
+
 ### Two constraints on a *hardware-ready* body (do not skip)
 1. **Size / compression.** A full `0..0x166000` image cannot be carried **raw**
    inside an AP that must itself be `<= 0x166000` — the OEM body is UZIP-compressed

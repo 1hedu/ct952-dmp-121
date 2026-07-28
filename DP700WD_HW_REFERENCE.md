@@ -6021,3 +6021,31 @@ services against m->flash: SIZE bytes at ADDR match the staged sentinel exactly,
 16 erase + 16 program ops (the 64 KB sector + 0x1000-byte payload), and the surrounding flash is untouched. This is the
 faithful counterpart to the WriteSPF-contract model (12.88) -- same net effect,
 but driven end-to-end by the firmware's own driver code.
+
+### 12.90 Full self-flashing AP through the gate-level controller (--apflash)
+
+Ran the ENTIRE update path on firmware code, with only the SPI controller modeled:
+boot -> AP body in DRAM -> real WriteSPF (XIP) -> real erase/program (DRAM) ->
+gate-level 0x80002800 controller (12.89) -> m->flash.
+
+`--apflash <AP>`: boot normally (driver resident + config populated), arm the
+controller model, copy the AP body [0x200:size] to DRAM 0x4009a000 and jump to the
+header entry (0x30) -- as the loader (0x3e48) does after validation -- then let the
+body run. The body (apstub.S) calls the real `WriteSPF(0x3d0fc)`, whose real SE/PP
+helpers issue real SPI commands the controller services against m->flash. The body's
+window environment is set trap-free (S=1, PIL=15, ET=0, WIM=0, as machine_call uses)
+so nested save/restore just rotate and the terminating `ta 0` halts cleanly.
+
+**Verified** (`--apflash apflash.AP`, body writes a 4 KB sentinel to sector 0x1a0000):
+- boot -> body jump -> body ran 217859 instrs, halted at its `ta 0` (pc 0x4009a060);
+- **16 erase + 16 program** SPI ops (the real driver, not a hook);
+- target sector == the sentinel, full 64 KB sector erased (tail 0xFF);
+- boot region [0..0x3000), the XIP WriteSPF sector [0x30000:0x40000), and all
+  surrounding flash byte-identical.
+
+So the complete chain -- loader-style body load, the firmware's own flash driver,
+and the SPI controller -- executes end-to-end in the emulator, every layer real
+firmware code except the modeled controller. Note the caveat from 12.88 still holds:
+the body targets a sector that does NOT hold the XIP WriteSPF trampoline; a hardware
+body that rewrites the low image must run a DRAM copy of the flash driver (as the OEM
+AP does), so it never executes flash it is erasing.

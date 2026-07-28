@@ -5871,3 +5871,28 @@ intact, so a bad AP flash is recoverable (boot loader + recovery survive) --
 lower brick risk than a full-chip write. Caveat: renaming a raw flash dump to
 `UPG952A.AP` will fail the header/chip-version check; a valid `.AP` container
 (from the OEM updater, or rebuilt with the correct header) is required.
+
+### 12.86 UPG952A.AP + flash-image format fully reversed (byte-exact, verified)
+
+Reversed the complete CT952A flash-image and `UPG952A.AP` update-container format
+for a safe software reflash. Full spec: `jupiter/CT952A_FLASH_FORMAT.md`; tool:
+`jupiter/tools/ctkap.py` (sections/apinfo/apfix/apwrap).
+
+- **Section table** (24-byte entries @ flash 0x10): name/lma/rma/lsz/rsz then
+  `(cksum16<<16)|flags16`. **cksum16 = sum of the UNPACKED section bytes & 0xFFFF**
+  -- verified exact on every raw section and on the decompressed TEXT/ENGL.
+- **UPG952A.AP** = a `CT909-AP` header (0x200 bytes) + a RAM-boot AP body. The
+  loader (validator @0x4170, checksum @0x40320) enforces: magic0=0x43543930
+  "CT90", magic1=0x392d4150 "9-AP", chip/auto-upgrade code @0x18 = 0x41(952A) or
+  0x01, size @0x0c <= 0x166000 (4-aligned), APPacker ver @0x14 >= 5, and a
+  **16-bit additive byte-sum of body[0x200:size] stored BE @0x2e** (NOT a CRC).
+  Two independent disassembly passes agreed; magic/checksum/chip-code re-verified
+  by hand instruction-for-instruction.
+- Only the AP area (<=0x166000) is erased+programmed (64K-aligned sectors,
+  driver 0x3d0fc/0x3d1cc); the boot loader is preserved => a bad AP is
+  recoverable. The `.AP` body must be a valid self-flashing AP (the container
+  tool builds/validates the wrapper + both checksum kinds).
+
+`ctkap.py sections dp700wd.bin` verifies all content-section checksums; a
+wrap->validate->corrupt roundtrip confirms the AP body-checksum detects a
+single flipped byte.

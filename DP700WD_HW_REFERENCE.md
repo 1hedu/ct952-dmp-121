@@ -5414,3 +5414,75 @@ but no source-present is ever declared, so the CC-mbox event that would carry
 the internal source (and/or the "no source found" path a card-less frame takes to the
 menu), and why it never executes. New: RAM-dump analysis method; indirect-dispatch
 ruled out for the source-detect.
+
+### 12.75 USB HID keyboard — bare-metal EHCI driver, enumerated + polled from Python
+
+Having faithfully modeled the hardware, the branch's next milestone is a **USB HID
+keyboard driver** written against the modeled EHCI host controller and driven entirely
+from MicroPython on the device.
+
+**Emulator side (`jupiter/emu/machine.c`, `machine.h`).** The EHCI model (base
+`0xA0000100`) previously exposed only its register file (capability + operational regs,
+an empty root hub) so the retail boot's USB enumeration completes with zero devices.
+This adds the missing execution engine and a device:
+
+- **Async-schedule executor** (`ehci_run_async`): walks Queue Heads from
+  `ASYNCLISTADDR`, and for each QH advances its qTD overlay chain (`QH+0x10` Next-qTD
+  pointer), running each active qTD by PID — SETUP (parse the 8-byte USB control
+  request), IN (return staged descriptor / control data, or an interrupt-IN HID
+  report), OUT (accept the status/data stage). Status is written back to the qTD token
+  (Active cleared, residual byte-count in bits[30:16]); IOC raises `USBSTS.USBINT`. A
+  NAK (interrupt IN with no queued report) leaves the qTD Active so the driver's next
+  poll retries — exactly the real device behaviour. The executor is invoked on a coarse
+  cadence from `machine_cycle` (every 1024 cycles) while `USBCMD.RS` and `USBCMD.ASE`
+  are set, modelling the controller running the ring in the background.
+- **HID boot keyboard device**: standard descriptors (device VID `0xCEEB` / PID
+  `0x0952`, one configuration, one HID boot-protocol interface, one interrupt-IN
+  endpoint `0x81`), the 63-byte boot-keyboard HID report descriptor, and string
+  descriptors. Control requests handled: `GET_DESCRIPTOR` (device/config/HID-report/
+  string), `SET_ADDRESS` (adopted at the status-stage IN, per spec), `SET_CONFIGURATION`,
+  `GET_CONFIGURATION`, `GET_STATUS`, and the HID class `SET_IDLE` / `SET_PROTOCOL` /
+  `GET_REPORT`. The interrupt endpoint streams 8-byte boot reports
+  (`[modifiers, 0, key1..key6]`) from a queue.
+- **PORTSC handshake**: when a device is attached (opt-in), port 0 reports connect
+  (CCS+CSC), and the port-reset→high-speed-enable sequence sets PED when the driver
+  clears Port Reset.
+- **Host key feed** (`machine_usb_kbd_feed` / `CT952_USB_KEYS="..."`): converts an
+  ASCII string to HID usage codes (with the shift modifier for uppercase/symbols) and
+  queues a key-down + key-up report per character. **Opt-in only** — with no key source
+  the root hub stays empty, so the retail boot's enumeration is unchanged.
+
+Modeling choices, documented in-source: the schedule structures (QH/qTD) are read/written
+**CPU-native big-endian** on this SoC (so the driver needs no byte-swaps), while USB
+*descriptors* keep their spec little-endian byte order. The interrupt endpoint is serviced
+via the async schedule rather than a separate periodic-schedule frame list; since both the
+controller and the device are modeled here, this is internally consistent and keeps the
+driver small. Buffer pointers are followed linearly (no 4 KB page-split), which is
+transparent for the small control/interrupt transfers used here.
+
+**Device side (`jupiter/mpy/modusb_kbd.c`).** A real, if minimal, bare-metal EHCI driver
+exposed as the MicroPython `usb_kbd` module:
+
+- `usb_kbd.init()` — HCRESET, `CONFIGFLAG=1`, run; reset the root-hub port and confirm
+  PED; then enumerate over the async schedule with standard control transfers
+  (GET device descriptor → SET_ADDRESS 1 → GET config descriptor → SET_CONFIGURATION →
+  HID SET_PROTOCOL boot / SET_IDLE). Builds the QH + SETUP/DATA/STATUS qTDs in DRAM
+  (`.bss`) with ordinary 32-bit stores and polls the qTD Active bit for completion.
+- `usb_kbd.poll()` — one interrupt-IN transaction; returns the 8-byte report as `bytes`,
+  or `None` on NAK.
+- `usb_kbd.getchar()` — polls until a key-down report with a printable usage, mapping the
+  HID usage + shift modifier to an ASCII `str` (US layout).
+
+**Result (verified).** `CT952_USB_KEYS="hello world"` →
+
+```
+usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64
+usb_kbd: configured, polling ep 0x81
+usb_kbd typed: hello world
+```
+
+`CT952_USB_KEYS="CT952-DVD!"` round-trips uppercase (shift modifier) and `!` (shift+1)
+correctly; with no `CT952_USB_KEYS`, `init()` returns False and the demo prints
+`usb_kbd: no keyboard on port 0` — the retail boot path is untouched. A full USB stack —
+controller reset, port reset, control-transfer enumeration, and HID interrupt polling —
+now runs on the emulated CT952, written in Python on the device.

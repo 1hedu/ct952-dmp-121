@@ -182,6 +182,31 @@ typedef struct machine {
     uint32_t ehci_ctrldss, ehci_periodic, ehci_async, ehci_configflag;
     uint32_t ehci_portsc[4];
 
+    /* USB HID boot keyboard on EHCI root-hub port 0 (§12.119). The async-
+     * schedule executor (ehci_run_async) walks Queue Heads from ASYNCLISTADDR
+     * and runs their qTDs against this device: SETUP/IN/OUT for the standard
+     * control-transfer enumeration (device/config/HID/string descriptors,
+     * SET_ADDRESS, SET_CONFIGURATION, HID SET_IDLE/SET_PROTOCOL), and 8-byte
+     * HID boot reports on the interrupt-IN endpoint (0x81). Opt-in: the device
+     * is only attached when a host key source is supplied (CT952_USB_KEYS /
+     * machine_usb_kbd_feed), so the retail boot's empty-root-hub enumeration is
+     * unaffected. Schedule structures are read/written CPU-native (big-endian)
+     * on this SoC; USB descriptors keep their spec little-endian byte order. */
+    int      usb_kbd_present;      /* device attached to port 0                 */
+    uint8_t  usb_kbd_address;      /* USB device address (0 until SET_ADDRESS)  */
+    uint8_t  usb_kbd_config;       /* selected bConfigurationValue              */
+    uint8_t  usb_kbd_protocol;     /* HID protocol (0=boot, 1=report)           */
+    uint8_t  usb_kbd_idle;         /* HID idle rate (SET_IDLE)                   */
+    uint8_t  usb_ep0_buf[256];     /* staged EP0 (control) IN response          */
+    uint16_t usb_ep0_len;          /* bytes available in usb_ep0_buf            */
+    uint16_t usb_ep0_off;          /* bytes of usb_ep0_buf already returned     */
+    uint8_t  usb_setaddr_armed;    /* adopt usb_setaddr at next EP0 status IN   */
+    uint8_t  usb_setaddr;          /* address pending from SET_ADDRESS          */
+    uint8_t  usb_kbd_reports[256][8]; /* pending 8-byte HID boot reports (ring) */
+    int      usb_kbd_rq_head, usb_kbd_rq_tail;
+    uint64_t usb_kbd_polls;        /* interrupt-IN transactions serviced        */
+    uint64_t usb_kbd_reports_sent; /* non-NAK interrupt-IN reports delivered    */
+
     /* SD Host Controller (standard SDHC spec, base 0xa0001100) + a FAT image as
      * the inserted card. Lets the firmware's SDC driver (card.a/sdc.o) init the
      * card and CMD18-DMA-read blocks, so the media manager enumerates the card
@@ -214,6 +239,13 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size);
  * Appends to any pending data; each byte is delivered once, in order,
  * and the UART1 status DATA_READY bit reflects whether any remain. */
 void machine_uart_feed(machine_t *m, const uint8_t *data, uint32_t len);
+
+/* Attach the USB HID boot keyboard on EHCI port 0 (if not already) and queue
+ * the ASCII string `keys` as HID keypresses: each character becomes a
+ * key-down report (usage + shift modifier) followed by a key-up report, so the
+ * firmware's interrupt-IN polling reads them as discrete presses. Newlines map
+ * to Enter, tab to Tab. Call after machine_init. */
+void machine_usb_kbd_feed(machine_t *m, const char *keys);
 
 /* Seed the boot-trampoline registers the earlier dsu_boot stage would
  * have written: GR22 (0x800007d8) = firmware entry, GR21 (0x800007d4)

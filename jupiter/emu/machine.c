@@ -928,7 +928,9 @@ static uint32_t ehci_read(machine_t *m, uint32_t off)
     case 0x24: return m->ehci_periodic;         /* PERIODICLISTBASE                   */
     case 0x28: return m->ehci_async;            /* ASYNCLISTADDR                      */
     case 0x50: return m->ehci_configflag;       /* CONFIGFLAG                         */
-    case 0x54: return m->ehci_portsc[0];        /* PORTSC[0]: no connect -> 0         */
+    case 0x54:                                  /* PORTSC[0]                          */
+        return m->usb_kbd_present ? (m->ehci_portsc[0] | 0x1u)  /* CCS: device present */
+                                  : m->ehci_portsc[0];          /* no connect -> 0     */
     default:   return 0;
     }
 }
@@ -944,8 +946,329 @@ static void ehci_write(machine_t *m, uint32_t off, uint32_t val)
     case 0x24: m->ehci_periodic = val; break;
     case 0x28: m->ehci_async = val; break;
     case 0x50: m->ehci_configflag = val; break;
-    case 0x54: m->ehci_portsc[0] = val & ~0x2Au; break;  /* drop W1C change bits; no dev */
+    case 0x54: {                                         /* PORTSC[0] */
+        if (!m->usb_kbd_present) { m->ehci_portsc[0] = val & ~0x2Au; break; }
+        /* Device present: keep CCS(bit0) set, honour W1C change bits (CSC bit1,
+         * PEDC bit3, OCC bit5), and model the port-reset -> high-speed-enable
+         * handshake: while Port Reset(bit8) is written 1, PED(bit2) is forced
+         * off; when the driver clears Port Reset, a high-speed device enables
+         * the port (PED=1). */
+        uint32_t p = (m->ehci_portsc[0] | 0x1u) & ~(val & 0x2Au);
+        if (val & 0x100u)        p = (p | 0x100u) & ~0x4u;   /* reset asserted   */
+        else if (p & 0x100u)     p = (p & ~0x100u) | 0x4u;   /* reset released   */
+        m->ehci_portsc[0] = p;
+        break;
+    }
     default: break;
+    }
+}
+
+/* ---- USB HID boot keyboard device (behind the EHCI async schedule) ----------
+ * A standard low-cost USB keyboard: one configuration, one HID boot-protocol
+ * interface, one interrupt-IN endpoint (0x81) carrying 8-byte boot reports
+ * ([modifiers, 0, key1..key6]). Descriptors are spec little-endian; the device
+ * answers the enumeration control requests the firmware/driver issues on EP0
+ * and streams queued keypress reports on the interrupt endpoint. §12.119. */
+
+static const uint8_t kbd_dev_desc[18] = {
+    18, 0x01, 0x00,0x02, 0x00,0x00,0x00, 64,   /* USB 2.00, class-per-iface, MPS0=64 */
+    0xeb,0xce, 0x52,0x09, 0x00,0x01,           /* idVendor 0xCEEB, idProduct 0x0952 */
+    0x01,0x02,0x03, 0x01                       /* iMfr/iProd/iSerial, 1 configuration */
+};
+
+static const uint8_t kbd_cfg_desc[34] = {
+    /* configuration */
+    9, 0x02, 34,0, 1, 1, 0, 0xA0, 50,          /* wTotalLength=34, 1 iface, bus-powered */
+    /* interface: HID(3) boot(1) keyboard(1) */
+    9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0,
+    /* HID descriptor: bcdHID 1.11, one report descriptor of 63 bytes */
+    9, 0x21, 0x11,0x01, 0, 1, 0x22, 63,0,
+    /* endpoint 0x81, interrupt IN, 8-byte max, bInterval=10 */
+    7, 0x05, 0x81, 0x03, 8,0, 10
+};
+
+/* Standard HID boot-keyboard report descriptor (USB HID 1.11, Appendix E.6). */
+static const uint8_t kbd_report_desc[63] = {
+    0x05,0x01, 0x09,0x06, 0xA1,0x01,               /* Usage Page Generic Desktop, Keyboard */
+    0x05,0x07, 0x19,0xE0, 0x29,0xE7, 0x15,0x00, 0x25,0x01,
+    0x75,0x01, 0x95,0x08, 0x81,0x02,               /* 8 modifier bits (input) */
+    0x95,0x01, 0x75,0x08, 0x81,0x03,               /* 1 reserved byte */
+    0x95,0x05, 0x75,0x01, 0x05,0x08, 0x19,0x01, 0x29,0x05, 0x91,0x02,  /* 5 LED bits (output) */
+    0x95,0x01, 0x75,0x03, 0x91,0x03,               /* LED padding */
+    0x95,0x06, 0x75,0x08, 0x15,0x00, 0x25,0x65, 0x05,0x07, 0x19,0x00, 0x29,0x65, 0x81,0x00,
+    0xC0                                           /* 6 key bytes (input array), End Collection */
+};
+
+/* Build a USB string descriptor (UTF-16LE) from ASCII into m->usb_ep0_buf. */
+static void usb_str_desc(machine_t *m, const char *s)
+{
+    int n = 0;
+    while (s[n]) n++;
+    m->usb_ep0_buf[0] = (uint8_t)(2 + 2 * n);
+    m->usb_ep0_buf[1] = 0x03;
+    for (int i = 0; i < n; i++) {
+        m->usb_ep0_buf[2 + 2 * i]     = (uint8_t)s[i];
+        m->usb_ep0_buf[2 + 2 * i + 1] = 0;
+    }
+    m->usb_ep0_len = (uint16_t)(2 + 2 * n);
+}
+
+static void usb_ep0_stage(machine_t *m, const uint8_t *data, int len)
+{
+    if (len > (int)sizeof m->usb_ep0_buf) len = sizeof m->usb_ep0_buf;
+    memcpy(m->usb_ep0_buf, data, len);
+    m->usb_ep0_len = (uint16_t)len;
+    m->usb_ep0_off = 0;
+}
+
+/* Handle an 8-byte SETUP packet, staging any EP0 IN response. */
+static void usb_dev_setup(machine_t *m, const uint8_t *sp)
+{
+    uint8_t  bmReqType = sp[0];
+    uint8_t  bRequest  = sp[1];
+    uint16_t wValue    = (uint16_t)(sp[2] | (sp[3] << 8));
+    uint16_t wLength   = (uint16_t)(sp[6] | (sp[7] << 8));
+    m->usb_ep0_len = 0;
+    m->usb_ep0_off = 0;
+
+    switch (bmReqType & 0x60) {
+    case 0x00:  /* standard request */
+        switch (bRequest) {
+        case 0x06: {  /* GET_DESCRIPTOR */
+            uint8_t type = (uint8_t)(wValue >> 8), idx = (uint8_t)wValue;
+            if (type == 0x01)      usb_ep0_stage(m, kbd_dev_desc, sizeof kbd_dev_desc);
+            else if (type == 0x02) usb_ep0_stage(m, kbd_cfg_desc, sizeof kbd_cfg_desc);
+            else if (type == 0x22) usb_ep0_stage(m, kbd_report_desc, sizeof kbd_report_desc);
+            else if (type == 0x03) {  /* string */
+                if (idx == 0) { static const uint8_t l[4] = {4,0x03,0x09,0x04};
+                                usb_ep0_stage(m, l, 4); }
+                else if (idx == 1) usb_str_desc(m, "CheerTek");
+                else if (idx == 2) usb_str_desc(m, "CT952 Keyboard");
+                else               usb_str_desc(m, "0001");
+            }
+            break; }
+        case 0x05:  /* SET_ADDRESS: adopt after the status stage */
+            m->usb_setaddr = (uint8_t)(wValue & 0x7F);
+            m->usb_setaddr_armed = 1;
+            break;
+        case 0x09:  /* SET_CONFIGURATION */
+            m->usb_kbd_config = (uint8_t)wValue;
+            break;
+        case 0x08:  /* GET_CONFIGURATION */
+            m->usb_ep0_buf[0] = m->usb_kbd_config; m->usb_ep0_len = 1;
+            break;
+        case 0x00:  /* GET_STATUS */
+            m->usb_ep0_buf[0] = 0; m->usb_ep0_buf[1] = 0; m->usb_ep0_len = 2;
+            break;
+        default: break;
+        }
+        break;
+    case 0x20:  /* class (HID) request */
+        switch (bRequest) {
+        case 0x0A: m->usb_kbd_idle = (uint8_t)(wValue >> 8); break;   /* SET_IDLE     */
+        case 0x0B: m->usb_kbd_protocol = (uint8_t)wValue;   break;   /* SET_PROTOCOL */
+        case 0x03: m->usb_ep0_buf[0] = m->usb_kbd_protocol;          /* GET_PROTOCOL */
+                   m->usb_ep0_len = 1; break;
+        case 0x01: memset(m->usb_ep0_buf, 0, 8);                     /* GET_REPORT   */
+                   m->usb_ep0_len = 8; break;
+        case 0x09: break;   /* SET_REPORT (LED state) -- accept and ignore */
+        default: break;
+        }
+        break;
+    default: break;
+    }
+    if (m->usb_ep0_len > wLength) m->usb_ep0_len = wLength;  /* never exceed request */
+}
+
+/* IN transfer: fill up to maxlen bytes for endpoint `ep`; return byte count, or
+ * -1 for NAK (interrupt endpoint with no report queued). */
+static int usb_dev_in(machine_t *m, uint8_t ep, uint8_t *dst, int maxlen)
+{
+    if (ep == 0) {  /* control data / status stage */
+        if (m->usb_ep0_off >= m->usb_ep0_len) {
+            /* zero-length status IN: SET_ADDRESS takes effect here */
+            if (m->usb_setaddr_armed) {
+                m->usb_kbd_address = m->usb_setaddr;
+                m->usb_setaddr_armed = 0;
+            }
+            return 0;
+        }
+        int n = m->usb_ep0_len - m->usb_ep0_off;
+        if (n > maxlen) n = maxlen;
+        memcpy(dst, m->usb_ep0_buf + m->usb_ep0_off, n);
+        m->usb_ep0_off = (uint16_t)(m->usb_ep0_off + n);
+        return n;
+    }
+    /* interrupt IN (endpoint 1): deliver the next queued HID report, else NAK */
+    m->usb_kbd_polls++;
+    if (m->usb_kbd_rq_head == m->usb_kbd_rq_tail)
+        return -1;  /* no key change -> NAK (report stays Active in the qTD) */
+    int n = maxlen < 8 ? maxlen : 8;
+    memcpy(dst, m->usb_kbd_reports[m->usb_kbd_rq_head], n);
+    m->usb_kbd_rq_head = (m->usb_kbd_rq_head + 1) & 0xFF;
+    m->usb_kbd_reports_sent++;
+    return n;
+}
+
+/* qTD token bits (EHCI 1.0 Table 3-16). */
+#define QTD_ACTIVE   0x00000080u
+#define QTD_HALTED   0x00000040u
+#define QTD_IOC      0x00008000u
+#define QTD_PID_MASK 0x00000300u   /* bits[9:8]: 0=OUT 1=IN 2=SETUP */
+#define QTD_DT       0x80000000u   /* data toggle */
+
+static uint32_t usb_rd32(machine_t *m, uint32_t a)
+{
+    uint8_t *p = machine_dram_ptr(m, a);
+    if (!p) return 0;
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+static void usb_wr32(machine_t *m, uint32_t a, uint32_t v)
+{
+    uint8_t *p = machine_dram_ptr(m, a);
+    if (!p) return;
+    p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16); p[2]=(uint8_t)(v>>8); p[3]=(uint8_t)v;
+}
+
+/* Execute one qTD at `addr` against device endpoint `ep`. Returns 1 if the qTD
+ * retired (status written back, Active cleared), 0 if it NAKed (left Active). */
+static int ehci_exec_qtd(machine_t *m, uint32_t addr, uint8_t ep)
+{
+    uint32_t token = usb_rd32(m, addr + 0x08);
+    if (!(token & QTD_ACTIVE)) return 1;   /* already retired */
+    int pid   = (int)((token & QTD_PID_MASK) >> 8);
+    int total = (int)((token >> 16) & 0x7FFF);
+    uint32_t buf0 = usb_rd32(m, addr + 0x0C);   /* buffer pointer 0 (single page) */
+    int remaining = total;
+
+    if (pid == 2) {                 /* SETUP */
+        uint8_t sp[8]; uint8_t *b = machine_dram_ptr(m, buf0);
+        if (b) memcpy(sp, b, 8); else memset(sp, 0, 8);
+        usb_dev_setup(m, sp);
+        remaining = 0;
+    } else if (pid == 1) {          /* IN */
+        uint8_t tmp[64];
+        int cap = total < (int)sizeof tmp ? total : (int)sizeof tmp;
+        int n = usb_dev_in(m, ep, tmp, cap);
+        if (n < 0) return 0;        /* NAK: leave the qTD Active for the next poll */
+        uint8_t *b = machine_dram_ptr(m, buf0);
+        if (b && n > 0) memcpy(b, tmp, n);
+        remaining = total - n;
+    } else {                        /* OUT (data/status) -- accept and drop */
+        remaining = 0;
+    }
+
+    /* Write back: clear Active/Halted + error bits, keep data toggle, set the
+     * residual byte count (bits[30:16]). The driver polls Active to detect
+     * completion and reads the residual to size the transfer. */
+    uint32_t nt = (token & QTD_DT) | (((uint32_t)remaining & 0x7FFF) << 16);
+    usb_wr32(m, addr + 0x08, nt);
+    if (token & QTD_IOC) m->ehci_usbsts |= 0x1u;   /* USBINT */
+    return 1;
+}
+
+/* Walk the async schedule from ASYNCLISTADDR and run each Queue Head's qTD
+ * chain. Bounded so a malformed (circular) list cannot spin forever. Called on
+ * a cadence from machine_cycle while USBCMD.RS and USBCMD.ASE are set. */
+static void ehci_run_async(machine_t *m)
+{
+    uint32_t qh = m->ehci_async & ~0x1Fu;
+    for (int guard = 0; guard < 32 && qh; guard++) {
+        uint32_t hlink   = usb_rd32(m, qh + 0x00);   /* horizontal link + Typ/T */
+        uint32_t epchar  = usb_rd32(m, qh + 0x04);   /* endpoint characteristics */
+        uint8_t  ep      = (uint8_t)((epchar >> 8) & 0xF);
+        /* Advance the overlay's qTD chain (QH+0x10 = Next qTD Pointer). */
+        for (int q = 0; q < 8; q++) {
+            uint32_t nextp = usb_rd32(m, qh + 0x10);
+            if (nextp & 0x1u) break;                 /* T bit: chain terminates */
+            uint32_t qtd = nextp & ~0x1Fu;
+            uint32_t tok = usb_rd32(m, qtd + 0x08);
+            if (!(tok & QTD_ACTIVE)) break;          /* nothing to do */
+            if (!ehci_exec_qtd(m, qtd, ep))          /* NAKed: stop this QH */
+                break;
+            uint32_t follow = usb_rd32(m, qtd + 0x00);
+            usb_wr32(m, qh + 0x0C, qtd);             /* Current qTD Pointer */
+            usb_wr32(m, qh + 0x10, follow);          /* overlay Next qTD Pointer */
+        }
+        if (hlink & 0x1u) break;                     /* T bit: end of ring       */
+        uint32_t next = hlink & ~0x1Fu;
+        if (next == (m->ehci_async & ~0x1Fu)) break; /* wrapped to the head      */
+        qh = next;
+    }
+}
+
+/* ---- host-side key feed ------------------------------------------------------
+ * Convert an ASCII string to HID boot-keyboard reports and queue them. Each
+ * character produces a key-down report (usage code + shift modifier if needed)
+ * and a key-up (all-zero) report, so the firmware sees discrete keypresses. */
+static uint8_t hid_usage_of(char c, uint8_t *mod)
+{
+    *mod = 0;
+    if (c >= 'a' && c <= 'z') return (uint8_t)(0x04 + (c - 'a'));
+    if (c >= 'A' && c <= 'Z') { *mod = 0x02; return (uint8_t)(0x04 + (c - 'A')); }
+    if (c >= '1' && c <= '9') return (uint8_t)(0x1E + (c - '1'));
+    switch (c) {
+    case '0': return 0x27;
+    case '\n': case '\r': return 0x28;   /* Enter  */
+    case 0x1b: return 0x29;              /* Escape */
+    case '\b': return 0x2A;              /* Backspace */
+    case '\t': return 0x2B;              /* Tab */
+    case ' ':  return 0x2C;             /* Space */
+    case '-':  return 0x2D;
+    case '=':  return 0x2E;
+    case '[':  return 0x2F;
+    case ']':  return 0x30;
+    case '\\': return 0x31;
+    case ';':  return 0x33;
+    case '\'': return 0x34;
+    case '`':  return 0x35;
+    case ',':  return 0x36;
+    case '.':  return 0x37;
+    case '/':  return 0x38;
+    /* shifted symbols */
+    case '!': *mod=0x02; return 0x1E;
+    case '@': *mod=0x02; return 0x1F;
+    case '#': *mod=0x02; return 0x20;
+    case '$': *mod=0x02; return 0x21;
+    case '%': *mod=0x02; return 0x22;
+    case '^': *mod=0x02; return 0x23;
+    case '&': *mod=0x02; return 0x24;
+    case '*': *mod=0x02; return 0x25;
+    case '(': *mod=0x02; return 0x26;
+    case ')': *mod=0x02; return 0x27;
+    case '_': *mod=0x02; return 0x2D;
+    case '+': *mod=0x02; return 0x2E;
+    case ':': *mod=0x02; return 0x33;
+    case '?': *mod=0x02; return 0x38;
+    default:  return 0;
+    }
+}
+
+static void usb_kbd_push(machine_t *m, uint8_t mod, uint8_t usage)
+{
+    int next = (m->usb_kbd_rq_tail + 1) & 0xFF;
+    if (next == m->usb_kbd_rq_head) return;   /* queue full: drop */
+    uint8_t *r = m->usb_kbd_reports[m->usb_kbd_rq_tail];
+    memset(r, 0, 8);
+    r[0] = mod;
+    r[2] = usage;
+    m->usb_kbd_rq_tail = next;
+}
+
+void machine_usb_kbd_feed(machine_t *m, const char *keys)
+{
+    if (!keys) return;
+    if (!m->usb_kbd_present) {
+        m->usb_kbd_present = 1;
+        m->usb_kbd_address = 0;
+        /* signal a new high-speed connection on port 0 (CCS + CSC) */
+        m->ehci_portsc[0] = 0x00000003u;
+    }
+    for (const char *p = keys; *p; p++) {
+        uint8_t mod, usage = hid_usage_of(*p, &mod);
+        if (!usage) continue;
+        usb_kbd_push(m, mod, usage);      /* key down */
+        usb_kbd_push(m, 0, 0);            /* key up   */
     }
 }
 
@@ -2207,6 +2530,14 @@ static void timer_tick_one(machine_t *m, uint32_t cnt_off, uint32_t rld_off,
 static void machine_cycle(machine_t *m)
 {
     m->cycles++;
+    /* EHCI async-schedule tick: the host controller runs the async ring in the
+     * background whenever USBCMD.RS(bit0) and USBCMD.ASE(bit5) are set. We
+     * service it on a coarse cadence (every 1024 cycles) so descriptor
+     * transfers and interrupt-IN keyboard polls make progress without a
+     * per-instruction cost. Gated on an attached device (§12.119). */
+    if (m->usb_kbd_present && (m->ehci_usbcmd & 0x21u) == 0x21u &&
+        (m->cycles & 0x3FFu) == 0)
+        ehci_run_async(m);
     /* Display VSYNC tick: raise the secondary VSYNC-pending bit at the
      * panel field rate so the firmware's display state machine advances.
      * Real timing is ~MCLK/50Hz (~2.66M cycles); we use a shorter, env-
@@ -2320,6 +2651,19 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
             } else {
                 fprintf(stderr, "[SDCARD] could not open %s\n", e);
             }
+        }
+    }
+
+    /* Optional USB HID keyboard (CT952_USB_KEYS=<string>): attach a boot
+     * keyboard on EHCI port 0 and queue the string as keypresses, so a driver
+     * that enumerates + polls the interrupt endpoint reads them (§12.119).
+     * Opt-in only, so the retail empty-root-hub enumeration is unchanged. */
+    {
+        const char *e = getenv("CT952_USB_KEYS");
+        if (e && *e) {
+            machine_usb_kbd_feed(m, e);
+            fprintf(stderr, "[USBKBD] attached HID keyboard on port 0; queued %u chars\n",
+                    (unsigned)strlen(e));
         }
     }
 

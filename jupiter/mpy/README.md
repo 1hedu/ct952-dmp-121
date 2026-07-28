@@ -30,6 +30,7 @@ into DRAM, and runs a Python script, printing over UART1.
 | `main.c` | `mpy_main()`: GC heap in DRAM, `mp_init`, run the demo script |
 | `uart_core.c` | `mp_hal_stdout_tx_strn` / `mp_hal_stdin_rx_chr` on UART1 (`0x80000070`) |
 | `modct952.c` | `ct952` display module: draw to the OSD plane from Python (`init`, `palette`, `pixel`, `fill`, `rect`, `WIDTH`, `HEIGHT`) |
+| `modusb_kbd.c` | `usb_kbd` module: a bare-metal EHCI + USB HID boot-keyboard driver (`init`, `poll`, `getchar`) — enumerate and read a USB keyboard from Python |
 | `mpconfigport.h` | Feature config (minimal + compiler + GC + MPZ long ints; `MICROPY_NLR_SETJMP`) |
 | `setjmp.h` | `setjmp`/`longjmp` → gcc builtins (handle SPARC register windows, no libc) |
 | `start.S` | Reset trap table, window overflow/underflow handlers, `.data` copy, `.bss` zero, stack, `mpy_main` |
@@ -57,6 +58,26 @@ cd ../emu && make ct952emu
 ```
 
 UART1 output is echoed to stdout.
+
+### USB keyboard
+
+The demo also enumerates and polls a USB HID keyboard through the `usb_kbd`
+module — a bare-metal EHCI driver written in C, driven from Python. Attach a
+keyboard and feed keystrokes with `CT952_USB_KEYS`:
+
+```sh
+CT952_USB_KEYS="hello world" ./ct952emu ../mpy/build/firmware.bin --instr 150000000
+# ...
+# usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64
+# usb_kbd: configured, polling ep 0x81
+# usb_kbd typed: hello world
+```
+
+`usb_kbd.init()` resets the controller, resets the root-hub port, enumerates
+the device over the async schedule (GET_DESCRIPTOR / SET_ADDRESS /
+SET_CONFIGURATION / HID SET_PROTOCOL), then `usb_kbd.getchar()` polls the
+interrupt-IN endpoint for 8-byte HID boot reports and maps them to characters.
+With no `CT952_USB_KEYS`, the root hub is empty and `init()` returns `False`.
 
 ## SPARC bring-up notes
 

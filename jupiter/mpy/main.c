@@ -78,6 +78,23 @@ static const char *demo_script =
     "    bh = fib[i] * 80 // top\n"
     "    ct952.rect(60 + i * 32, base - bh, 24, bh, 1 + (i % 8))\n"
     "print('drawn: colour bars + grey ramp + dialog + Fibonacci bar chart')\n"
+    // A USB HID keyboard, enumerated and polled entirely from Python through
+    // the bare-metal EHCI driver (usb_kbd). Feed keys with ct952emu's
+    // CT952_USB_KEYS. Gracefully no-ops if no keyboard is attached.
+    "try:\n"
+    "    import usb_kbd\n"
+    "    if usb_kbd.init():\n"
+    "        typed = ''\n"
+    "        for _ in range(64):\n"
+    "            c = usb_kbd.getchar()\n"
+    "            if c is None:\n"
+    "                break\n"
+    "            typed = typed + c\n"
+    "        print('usb_kbd typed:', typed)\n"
+    "    else:\n"
+    "        print('usb_kbd: no keyboard on port 0')\n"
+    "except Exception as e:\n"
+    "    print('usb_kbd error:', e)\n"
     ;
 
 // Entry from start.S (after .data copy / .bss zero / stack set up).

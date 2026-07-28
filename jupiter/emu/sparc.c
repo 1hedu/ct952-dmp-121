@@ -881,6 +881,22 @@ uint64_t sparc_run(sparc_t *c, uint64_t n)
                     sparc_get_reg(c, 8), sparc_get_reg(c, 9), sparc_get_reg(c, 31),
                     (unsigned long long)c->icount);
         }
+        /* Gated DSP-command logger (CT952_DSPCMD=<from_icount>): log every call to
+         * the VDEC command issuer FUN_0006f2b0 (0x6f2b0) past <from>, with param1
+         * (%o0), the command (%o1), and the current photo index DAT_40032748
+         * (0x40032748). Pins what the slideshow advance commands the decoder DSP
+         * to do for the next photo (§12.118). */
+        { static long dc = -2; static int dcn = 0;
+          if (dc == -2) { const char *e = getenv("CT952_DSPCMD");
+              dc = e ? (long)strtoull(e, NULL, 0) : -1; }
+          if (dc >= 0 && c->pc == 0x6f2b0u && c->icount >= (uint64_t)dc && dcn < 80) {
+              int f; uint32_t idx = c->bus->read(c->bus, 0x40032748u, 1, &f);
+              dcn++;
+              fprintf(stderr, "[DSPCMD] p1=%u cmd=0x%02x photoidx=%u o7=%08x icount=%llu\n",
+                      sparc_get_reg(c, 8), sparc_get_reg(c, 9) & 0xff, idx,
+                      sparc_get_reg(c, 15), (unsigned long long)c->icount);
+          }
+        }
         if (mbt && c->pc == 0x5969cu && c->icount > mbfrom && mbtn < 2000) {
             mbtn++;
             fprintf(stderr, "[MBOX] get caller o7=%08x arg o0=%08x icount=%llu\n",

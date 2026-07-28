@@ -1489,3 +1489,40 @@ advance/transition path never **enqueues** a display-decode request for the new 
 torn down (§12.117). That closes the map — the single faithful blocker for multi-photo iteration is
 the display-decode enqueue (+ mode-9 persistence) for the transition, deep in the DSP work-queue
 scheduling.
+
+### 12.118 ★★★ DONE — multi-photo slideshow advances via NEXT (decoder-DSP predecode modeled)
+
+Modeled the DSP work-queue (the "take a run at it" ask) and the card slideshow now advances through
+multiple photos on NEXT keypresses, each decoded from the card at its own resolution.
+
+**What was missing.** The slideshow ADVANCE (FUN_00061170) commands the decoder DSP to PREDECODE the
+next photo -- VDEC cmd 0x80 via FUN_0006f2b0 -> REG_SRAM_PLAYMODE (0xb0000190) -- the *same*
+0x10/0x81/0x82/0x83/0x80/0x21 sequence the initial photo issued; only the firmware's photo index
+DAT_40032748 differs (0 -> 1 -> 2, confirmed by the CT952_DSPCMD logger). On real silicon PROC2's
+microcode reads the Nth file and decodes it; **PROC2 is disabled by default (proc2_enable), so the
+stand-in only ACKed the command** -- nothing loaded the next file, and the advance re-parsed the
+stale photo-1 buffer.
+
+**The model (machine.c, gated CT952_DSPDECODE).** On the 0x80 command from the COMDEC issuer
+(pc 0x6f2b0..0x6f480) *while the card is in MM playback* (DAT_40039b08 == 0x60): read the firmware's
+own photo index (DAT_40032748), locate the Nth JPEG in the card's real FAT16 (`sd_find_nth_jpeg`),
+stream it into the card decode buffer 0x401ec000, and run the same picojpeg path the initial photo
+used (`machine_dsp_predecode`). One decode per index change. Trigger, index, and file bytes are all
+the firmware's own -- only the absent PROC2 decoder is stood in for, exactly as the 0x80000800 engine
+model stands in for that hardware.
+
+**Result (3-photo card, distinct sizes/colours):**
+```
+[DSPDEC] predecode idx=0 off=0x8600 len=10767 -> 0x401ec000   (01.JPG)
+NEXT #1 -> [DSPDEC] predecode idx=1 off=0xb600 len=9451  -> 0x401ec000   (02.JPG)
+NEXT #2 -> [DSPDEC] predecode idx=2 off=0xde00 len=8526  -> 0x401ec000   (03.JPG)
+decode: 640x360 (RED/p1) -> 512x384 (GREEN/p2) -> 448x336 (BLUE/p3), all from 0x401ec000
+```
+The index tracks the firmware's DAT_40032748 driven by the real NEXT key (§12.116 chain), and the
+file offsets are the real card sectors found via the FAT. The full path is now faithful end to end:
+NEXT key -> dispatch -> FUN_0001d41c advance (index++) -> FUN_00061170 transition -> predecode cmd
+0x80 -> (modeled) DSP loads+decodes the Nth card file -> next photo on screen.
+
+**Diagnostics:** CT952_DSPDECODE (predecode model), CT952_DSPCMD (gated VDEC-command logger),
+CT952_IRKEYS (multi-key IR). Run: add `CT952_DSPDECODE=1` to the §12.113 card command and inject
+NEXT (`CT952_IRKEYS="0x10@<icount>,..."`) to step photos.

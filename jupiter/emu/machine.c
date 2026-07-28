@@ -987,6 +987,89 @@ static void sdc_dma_to_dram(machine_t *m, uint32_t dst, uint32_t src, uint32_t l
         d[i] = (m->sd_img && src + i < m->sd_size) ? m->sd_img[src + i] : 0;
 }
 
+/* ---- Decoder-DSP (PROC2) predecode model (§12.118) --------------------------
+ * The slideshow ADVANCE (FUN_00061170) commands the decoder DSP to PREDECODE the
+ * next photo (VDEC cmd 0x80 via FUN_0006f2b0 -> REG_SRAM_PLAYMODE 0xb0000190),
+ * exactly as the initial photo did (identical 0x10/0x81/0x82/0x83/0x80/0x21
+ * sequence; only the photo index DAT_40032748 differs: 0 -> 1). On real silicon
+ * PROC2's microcode reads the Nth media file and decodes it. PROC2 is not run
+ * here (proc2_enable defaults off), so nothing loads the next file -- the advance
+ * re-parses the stale photo-1 buffer. Model PROC2's predecode faithfully: on the
+ * 0x80 command, locate the Nth JPEG in the card's real FAT16 (using the firmware's
+ * own photo index), stream it into the card decode buffer 0x401ec000, and run the
+ * same picojpeg path the initial photo used. Trigger, index and file bytes are all
+ * the firmware's own -- only the (absent) PROC2 decoder is stood in for, in the
+ * same spirit as the 0x80000800 engine model.
+ *
+ * Reads a little-endian u16/u32 from the raw card image. */
+static uint32_t sd_le16(const uint8_t *p) { return p[0] | (p[1] << 8); }
+static uint32_t sd_le32(const uint8_t *p)
+{ return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+/* Find the Nth (0-based) regular JPEG file in the FAT16 root directory; return
+ * its byte offset + length within m->sd_img, or 0 on failure. */
+static uint32_t sd_find_nth_jpeg(machine_t *m, uint32_t nth, uint32_t *out_len)
+{
+    const uint8_t *img = m->sd_img;
+    uint32_t bps, spc, rsvd, nfat, rootent, spf, first_data_sec, root_sec, i, seen = 0;
+    if (!img || m->sd_size < 512) return 0;
+    if (img[0x1fe] != 0x55 || img[0x1ff] != 0xaa) return 0;   /* BPB signature */
+    bps  = sd_le16(img + 0x0b); spc = img[0x0d]; rsvd = sd_le16(img + 0x0e);
+    nfat = img[0x10]; rootent = sd_le16(img + 0x11); spf = sd_le16(img + 0x16);
+    if (bps != 512 || !spc || !nfat || !spf) return 0;
+    root_sec = rsvd + nfat * spf;
+    first_data_sec = root_sec + (rootent * 32 + bps - 1) / bps;
+    for (i = 0; i < rootent; i++) {
+        const uint8_t *e = img + root_sec * bps + i * 32;
+        uint8_t a = e[0x0b];
+        if (e[0] == 0x00) break;                 /* end of directory */
+        if (e[0] == 0xe5) continue;              /* deleted */
+        if (a & 0x08) continue;                  /* volume label */
+        if ((a & 0x10)) continue;                /* subdirectory */
+        if (a == 0x0f) continue;                 /* LFN entry */
+        /* extension JPG or JPE(G) */
+        if (!((e[8] == 'J' && e[9] == 'P' && e[10] == 'G') ||
+              (e[8] == 'J' && e[9] == 'P' && e[10] == 'E')))
+            continue;
+        if (seen++ != nth) continue;
+        {
+            uint32_t clus = sd_le16(e + 0x1a);
+            uint32_t len  = sd_le32(e + 0x1c);
+            uint32_t off  = (first_data_sec + (clus - 2) * spc) * bps;
+            if (clus < 2 || off >= m->sd_size) return 0;
+            if (out_len) *out_len = len;
+            return off;
+        }
+    }
+    return 0;
+}
+
+/* PROC2 predecode stand-in: load the current photo (FAT index from
+ * DAT_40032748) into the card decode buffer and decode it. Returns 1 on decode. */
+static int machine_dsp_predecode(machine_t *m)
+{
+    static int32_t last_idx = -1;
+    uint32_t idx, foff, flen;
+    uint8_t *dst;
+    if (!m->sd_img) return 0;
+    { uint8_t *ip = machine_dram_ptr(m, 0x40032748u); if (!ip) return 0; idx = *ip; }
+    if ((int32_t)idx == last_idx) return 0;   /* one decode per photo, on index change */
+    last_idx = (int32_t)idx;
+    foff = sd_find_nth_jpeg(m, idx, &flen);
+    if (!foff || !flen) return 0;
+    dst = machine_dram_ptr(m, 0x401ec000u);
+    if (!dst) return 0;
+    if (foff + flen > m->sd_size) flen = m->sd_size - foff;
+    memcpy(dst, m->sd_img + foff, flen);
+    m->jpeg_src = 0x401ec000u;
+    m->jpeg_sig = 0;                 /* force a fresh decode of the new file */
+    machine_maybe_jpeg_decode(m);
+    if (getenv("CT952_DSPDECODE"))
+        fprintf(stderr, "[DSPDEC] predecode photo idx=%u off=0x%x len=%u -> 0x401ec000 icount=%llu\n",
+                idx, foff, flen, (unsigned long long)m->cpu.icount);
+    return 1;
+}
+
 /* Deliver a small read-data block for the command: DMA to DRAM if TRAN_MODE
  * selects DMA, else stage it for PIO DATA_PORT reads (BUFF_READ_RDY). */
 static void sdc_data_block(machine_t *m, const uint8_t *buf, uint32_t len,
@@ -1818,6 +1901,20 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
     if (addr == 0xB0000190u) {
         uint8_t cmd = (uint8_t)val;
         m->proc2_cmd = cmd;
+        /* PROC2 predecode stand-in (§12.118, gated CT952_DSPDECODE): on a
+         * MODE_PREDECODE (0x80) command from the COMDEC issuer during a card
+         * slideshow, model the (disabled) decoder DSP loading + decoding the
+         * current photo from the card FAT, so the slideshow ADVANCE renders the
+         * next photo instead of re-parsing the stale buffer. Only fires while a
+         * card image is present and the JPU-engine model is active. */
+        if (cmd == 0x80u && getenv("CT952_DSPDECODE") && getenv("CT952_JPUENG")
+            && m->sd_img && m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f480u) {
+            /* Only during card MM playback: DAT_40039b08 (0x40039b08) == 0x60 is
+             * the MM-mode flag the parser sets when the card plays -- so boot-time
+             * predecode commands don't prematurely load the card over the demo. */
+            uint8_t *mm = machine_dram_ptr(m, 0x40039b08u);
+            if (mm && *mm == 0x60u) machine_dsp_predecode(m);
+        }
         /* Arm the dwell when the ack differs from the commanded value
          * (e.g. STOP 0x10 -> STOPPED 0x11); hold the commanded state for
          * proc2_ack_dwell cycles so the boot poll can latch it first. */

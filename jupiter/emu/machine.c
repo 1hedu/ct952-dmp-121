@@ -1239,6 +1239,9 @@ static uint8_t hid_usage_of(char c, uint8_t *mod)
     case '\\': return 0x31;
     case ';':  return 0x33;
     case '\'': return 0x34;
+    case '"':  *mod=0x02; return 0x34;
+    case '<':  *mod=0x02; return 0x36;
+    case '>':  *mod=0x02; return 0x37;
     case '`':  return 0x35;
     case ',':  return 0x36;
     case '.':  return 0x37;

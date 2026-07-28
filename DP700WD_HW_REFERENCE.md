@@ -5677,3 +5677,67 @@ analysis + env-gated emulator probes. On-device Python replaces that with
 
 The emulator becomes an interactive firmware lab: seize -> poke/peek/call ->
 observe, with no rebuild between experiments.
+
+### 12.80 On-device debugger applied: park confirmed live; source-detect ruled out
+
+Using the embedded Python app (§12.79) as a live probe, seized into the running
+`dp700wd.bin` at 100M (well past the ~82M park) and inspected/called the
+firmware directly.
+
+**Live park state (confirmed on the running firmware, not a RAM dump):**
+```
+>>> print(ct952.peek32(0x4003cc3c), ct952.peek32(0x4003386c), ct952.peek32(0x40023a10))
+0 0 0        # CC mbox 0x4003cc00 count=0, CC mbox 0x40033830 count=0, __bPOWERONMENUInitial=0
+```
+Both CC mailboxes are empty and the power-on-menu flag is unset -- exactly the
+§12.74 RAM-dump picture, now verified on the live system: the waiting CC threads
+never receive a message, so `Thread_CTKDVD` never advances to `POWERONMENU`.
+
+**Source-detect 0x12b30 ruled out as the producer:**
+```
+>>> print(ct952.call(0x12b30,0,0,0), ct952.peek32(0x40023a10), ct952.peek32(0x4003cc3c))
+0 0 0        # returns 0; neither the flag nor the mbox count changes
+```
+Disassembly confirms why: `0x12b30(idx)` is a per-source *descriptor-setup*
+helper -- it indexes a 52-byte-stride table at `0x40039b08` by its argument and
+writes descriptor fields (size/addr/flags 0x202). It is NOT the media/source-
+*present* event producer. Calling it changes no CC state, so "just call source-
+detect" is not the fix.
+
+**Frontier refined.** `0x4003cc00` is not a lone mailbox but the **CC-application
+state block**, referenced base+offset across the entire CC code region
+(0x83000..0xa2000, 273 sites). The missing step is the higher-level media/source-
+*present* event (the §12.65 "initial source-present" root), which would enqueue
+into the CC mailbox and wake the parked threads. The debugger has now (a) proven
+the park state live, (b) eliminated the low-level source-detect helper, and (c)
+localized the producer to the CC media-present path rather than the descriptor
+layer.
+
+**Method note.** Each probe is a one-liner typed at the on-device REPL against
+the live firmware -- `peek` a variable, `call` a firmware routine, read the
+result. The seize freezes PROC1 (so we observe a frozen snapshot + call effects,
+not thread resumption); a non-freezing variant (run the app on PROC2 alongside
+the firmware) is the next tool for watching threads react to a poke in real time.
+
+### 12.81 Reflash without decapping -- the firmware self-programs its flash
+
+Scan of `dp700wd.bin` for a software reflash path (no chip access needed):
+
+- **Serial-flash program/erase driver** at flash ~`0x3ce34..0x3d1cc` (XIP),
+  printing `serial Flash Cycle`, `Erase sector(64K)`, `Erase sector(4K)`,
+  `Flash ad[%lx,%lx,%lx]`. So the running firmware can erase + program its own
+  SPI/PROM NOR flash (this is what settings-persistence uses).
+- **Two-stage boot + auto-upgrade** in the boot region `~0x3000..0x4400`:
+  `auto-upgrade code: %lx,now: %lx`, `AP_Loader() fail. So, re-booting`,
+  `Unable to get valid boot block!`, `Boot fail flash, this Boot is %hd` -- a
+  boot loader validates a boot block and can auto-upgrade the application image.
+- **Media sector I/O**: `Card ReadSector`/`Card WriteSector`, `SectorCount`.
+
+So a non-destructive reflash is feasible two ways: (1) the firmware's own
+upgrade path -- present an update image on media and let the AP loader reprogram
+flash (safest; the `auto-upgrade` check validates chip/version); (2) in-
+application programming via the on-device debugger -- `ct952.call` the erase
+(`~0x3ce34/0x3ce60`) then the program routine to write a new image to flash,
+straight from the REPL. Both avoid decapping the part. (Reflashing is
+brick-risky: verify the erase/program signatures and keep the boot loader's
+recovery/boot-block path intact before writing.)

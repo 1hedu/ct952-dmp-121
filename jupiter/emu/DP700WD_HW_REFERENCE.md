@@ -1318,3 +1318,28 @@ buffer through the firmware path. (The lower ~40% is corrupted because only the 
 auto‑play), `CT952_GATEDUMP` (dump the `FUN_000237dc` play gates), and the engine pixel‑decode in
 the `CT952_JPUENG` GO handler. Run: `CT952_SDCARD=<img> CT952_MEDIA_AUTOPLAY=1 CT952_JPUENG=1
 CT952_TICK_MULT=64 ./ct952emu dp700wd.bin --instr 50000000 --jpeg-out out.ppm`.
+
+### 12.114 ★★ Negative control — recognized card + valid FAT + no JPEGs → no render (path is enumeration‑gated)
+
+Symmetric proof that the §12.113 render is driven by the firmware's real file enumeration, not a
+hardcoded "always show a photo". Built a FAT16 card with two text files and **zero images**
+(`mkfatimg.py sdcard_nojpg.img README.TXT NOTES.TXT`; verified no `FF D8 FF` anywhere in the image)
+and ran the identical auto‑play path (`CT952_MEDIA_AUTOPLAY=1 CT952_JPUENG=1`).
+
+Traced result:
+- **Recognized + mounted the same way** — BPB read (sector 0), FAT + root‑dir reads (sector 32), run
+  twice (the boot USB‑check and SD‑check passes). The mount/FAT layer is content‑agnostic.
+- **Enumeration finds 0 playable files** — `FUN_000254a4` (playable check) returns **o0=1
+  (not‑playable)** on both passes (caller sites 0x26e70 USB, 0x26f64 SD). With a JPEG card it returns 0.
+- **No file data fetched** — there is **no sector‑67 (data region) read**; with nothing to classify as
+  an image, the firmware never loads a file into 0x401ec000.
+- **Play path never taken** — `FUN_00029348` (play), `FUN_0001b48c` (parse‑decision) and
+  `FUN_0001b5c8` (PARSER START) get **0 hits**; the SD not‑playable branch routes to the no‑content
+  handler `FUN_00003e48(4,…)` (OSD "no photos" resource 0x2e2) instead.
+- **No card decode** — **0** decodes from 0x401ec000; the built‑in demo album keeps playing (decodes
+  from 0x401dc000 only).
+
+So the two cards exercise one recognition path to opposite ends: a card with a JPEG → enumerate →
+playable → play → parser → decode from 0x401ec000 (the photo appears); a FAT‑valid card with no JPEG
+→ enumerate → not‑playable → no play, no decode. The slideshow render is genuinely gated on the
+card's real contents.

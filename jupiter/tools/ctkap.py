@@ -110,6 +110,32 @@ OFF_UNZIP    = 0x34       # u32 dwAP_UNZIP_BUF  (UZIP work buffer for section de
 #   +....   image bytes (srcBodyOff is a byte offset within the body)
 AP_BODY_DRAM = 0x4009a000
 STUB_MAX     = 0x100      # descriptor starts here; stub code must fit below it
+
+# ---- section-table AP (loader-compatible) -----------------------------------
+# A real AP the on-device loader accepts: AP_INFO(0x200) + [AP image header 0x10]
+# + [section table, 32 SECTION_ENTRY] + sections. AP_Loader copies it to
+# AP_BODY_DRAM, ROMLD_MoveSectionTable relocates the table to AP_TABLE_ADDRESS
+# (adding src-dest to every dwRMA), then ROMLD_BOOT_LoadSectionAndRun (@0x4bc ->
+# 0x528) loads the Load-flagged sections to their LMAs and jumps to the
+# Load|ProgEntry section -- so the flasher runs from DRAM (the reloc, for free).
+AP_TABLE_ADDRESS = 0x40000800   # aploader.h; verified 6x in the binary
+AP_IMG_HDR   = 0x10             # ROMLD_SECTION_TABLE_ADDR: table starts image+0x10
+NSEC         = 32               # ROMLD_SECTION_TABLE_SIZE
+SEC_ENTRY    = 24               # sizeof(SECTION_ENTRY)
+SEC_TBL_OFF  = AP_HDR_LEN + AP_IMG_HDR              # 0x210 (file offset of the table)
+CONTENT_OFF  = SEC_TBL_OFF + NSEC * SEC_ENTRY       # 0x510 (sections start after 32 entries)
+FLSH_LMA     = 0x40500000       # runtime-free high DRAM; flasher app runs here
+FLSH_AP_SP   = 0x405f0000       # dwAP_SP for the loaded AP
+SEC_FLAG_LOAD, SEC_FLAG_PROGENTRY, SEC_FLAG_ZIP = 1, 2, 4
+# the section flasher app (source: apstub_sec.S), linked/loaded at FLSH_LMA
+APSTUB_SEC_BIN = bytes.fromhex(
+    "21101400e2042100a404210480a460000280002901000000e604a000d004a004"
+    "ea04a008a8020010031000cd82106323c208400080a060041280000f01000000"
+    "ac102000912da00c9004c0080310007f821062a89fc0400001000000ac05a001"
+    "80a5a01006bffff8010000001080000701000000901000130310007f821062a8"
+    "9fc0400001000000901000149205001594100013031000808210603c9fc04000"
+    "01000000a404a00ca2a4600112bfffdb010000000320001f821063f4053037b4"
+    "8410a00dc420400091d0200001000000")
 APSTUB_BIN = bytes.fromhex(
     "21100268e2042100a404210480a460000280000e01000000d004a000d204a004"
     "d404a00892024010030000f4821060fc9fc0400001000000a404a00ca2a46001"
@@ -312,6 +338,67 @@ def cmd_mkflasher(out_path, writes, code=0x41, stub_path=None):
     print("  verify with:  ctkap.py apinfo %s" % out_path)
     return 0
 
+def cmd_mksectionap(out_path, writes, code=0x41, stub_path=None):
+    """Build a LOADER-COMPATIBLE self-flashing AP (a section-table image).
+
+    The flasher app (apstub_sec.S) is one section (Load|ProgEntry) at FLSH_LMA; it
+    carries a descriptor + image and reflashes via the resident DRAM driver. The
+    on-device loader section-loads it and jumps in -- so it runs from DRAM.
+    """
+    stub = open(stub_path, "rb").read() if stub_path else APSTUB_SEC_BIN
+    if len(stub) > STUB_MAX:
+        print("flasher app too big (0x%x > 0x%x)" % (len(stub), STUB_MAX)); return 1
+
+    # section content = [app padded to 0x100][u32 nchunks][chunk table][image]
+    chunks = []
+    for dst, ip in writes:
+        if dst & 0xFFFF:
+            print("--write dst 0x%x not 64 KB-aligned" % dst); return 1
+        data = open(ip, "rb").read()
+        for off in range(0, len(data), 0x10000):
+            chunks.append((dst + off, data[off:off + 0x10000]))
+    n = len(chunks)
+    img_off = STUB_MAX + 4 + n * 12
+    table, image = bytearray(), bytearray()
+    for dst, data in chunks:
+        table += struct.pack(">III", dst, img_off + len(image), len(data))
+        image += data
+    content = bytearray(STUB_MAX); content[:len(stub)] = stub
+    content += struct.pack(">I", n) + table + image
+    if len(content) % 4:
+        content += b"\x00" * (4 - len(content) % 4)
+
+    # section table (32 entries); entry 0 = FLSH, entry 1.. = 0 (terminator).
+    # dwRMA is stored IMAGE-RELATIVE (offset from the AP image base = file 0x200):
+    # the loader resolves the source as dwRMA + pSecTbl - 0x10 (binary 0x5cc), and
+    # ROMLD_MoveSectionTable first rebases dwRMA by (src_tbl - dest_tbl) -- the two
+    # cancel so an image-relative dwRMA lands on the real DRAM content. (Same
+    # convention as the main image, where the table is at 0x10 and dwRMA == flash
+    # offset.) So dwRMA = content offset within the AP image.
+    rma_file  = CONTENT_OFF - AP_HDR_LEN
+    rma_final = AP_BODY_DRAM + CONTENT_OFF                        # where content lands in DRAM
+    csum = sum16(content)
+    sectbl = bytearray(NSEC * SEC_ENTRY)
+    struct.pack_into(">IIIIII", sectbl, 0,
+                     0x464C5348,                                  # 'FLSH'
+                     FLSH_LMA, rma_file, len(content), len(content),
+                     (csum << 16) | SEC_FLAG_LOAD | SEC_FLAG_PROGENTRY)
+
+    d = bytearray(AP_HDR_LEN + AP_IMG_HDR) + sectbl + content
+    d = _ap_finalize(d, code, FLSH_AP_SP)
+    if len(d) > AP_MAX_SIZE:
+        print("WARNING: size 0x%x exceeds reserved 0x%x" % (len(d), AP_MAX_SIZE))
+    open(out_path, "wb").write(d)
+    print("mksectionap: wrote %s (0x%x bytes, chip=0x%x, dwAP_SP=0x%08x, dwCheckSum=0x%04x)"
+          % (out_path, len(d), code, FLSH_AP_SP, be16(d, OFF_CKSUM)))
+    print("  section FLSH: lma=0x%08x rma=0x%08x(file) -> 0x%08x(after move) size=0x%x cks=0x%04x flags=Load|ProgEntry"
+          % (FLSH_LMA, rma_file, rma_final, len(content), csum))
+    print("  %d WriteSPF chunk(s):" % n)
+    for dst, data in chunks:
+        print("    flash[0x%06x .. 0x%06x)  %u B" % (dst, dst + 0x10000, len(data)))
+    print("  run through the real loader:  ct952emu dp700wd.bin --rom-load --apload %s" % out_path)
+    return 0
+
 def main(argv):
     if len(argv) < 3:
         print(__doc__); return 2
@@ -342,6 +429,22 @@ def main(argv):
             print("usage: mkflasher <out.AP> --write DST:img [--write ...] [--code C] [--stub f]")
             return 2
         return cmd_mkflasher(out, writes, code, stub)
+    if cmd in ("mksectionap", "mksecap"):
+        code, stub, writes, out = 0x41, None, [], None
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--code":   code = int(rest[i+1], 0); i += 2
+            elif a == "--stub": stub = rest[i+1]; i += 2
+            elif a == "--write":
+                dst, ip = rest[i+1].split(":", 1)
+                writes.append((int(dst, 0), ip)); i += 2
+            elif out is None:   out = a; i += 1
+            else:               print("unexpected arg %r" % a); return 2
+        if not out or not writes:
+            print("usage: mksectionap <out.AP> --write DST:img [--write ...] [--code C] [--stub f]")
+            return 2
+        return cmd_mksectionap(out, writes, code, stub)
     print("unknown command %r" % cmd); return 2
 
 if __name__ == "__main__":

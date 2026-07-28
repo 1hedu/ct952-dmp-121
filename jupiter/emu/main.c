@@ -42,6 +42,7 @@ int main(int argc, char **argv)
     uint32_t spi_addr = 0x1a0000u, spi_size = 0x1000u;
     uint64_t spi_boot = 20000000ull;   /* enough to run flash-init (PROM_Config...Ok) */
     const char *apflash_path = NULL;  /* --apflash: full self-flashing AP via the gate-level ctrl */
+    const char *apload_path = NULL;   /* --apload: section-table AP through the REAL loader */
     machine_t *m;
     FILE *f;
     uint8_t *img;
@@ -114,6 +115,8 @@ int main(int argc, char **argv)
             spi_boot = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--apflash") && i + 1 < argc)
             apflash_path = argv[++i];
+        else if (!strcmp(argv[i], "--apload") && i + 1 < argc)
+            apload_path = argv[++i];
         else if (!strcmp(argv[i], "--quiet"))
             uart_path = uart_path;   /* handled below via flag */
         else if (argv[i][0] != '-')
@@ -421,6 +424,84 @@ int main(int argc, char **argv)
             FILE *ff = fopen(flashout_path, "wb");
             if (ff) { fwrite(m->flash, 1, m->flash_size, ff); fclose(ff);
                 fprintf(stderr, "[apflash] dumped flash to %s\n", flashout_path); }
+        }
+        machine_free(m); free(m);
+        return 0;
+    }
+
+    /* --apload FILE: run a LOADER-COMPATIBLE section-table AP through the firmware's
+     * REAL loader. Boot, arm the gate-level SPI controller, stage the whole AP at
+     * DS_AP_CODE_AREA (0x4009a000), replicate ROMLD_MoveSectionTable (copy the 32
+     * SECTION_ENTRYs from body+0x210 to AP_TABLE_ADDRESS 0x40000800, adding
+     * src-dest to each dwRMA -- exactly romld.c), then CALL the binary's
+     * ROMLD_BOOT_LoadSectionAndRun (@0x4bc): it loads the Load-flagged sections to
+     * their LMAs, checksum-verifies them, and jumps to the Load|ProgEntry section.
+     * That flasher app (apstub_sec.S) then reflashes via the resident DRAM driver
+     * -> gate-level controller -> m->flash. Every layer is firmware code except the
+     * modeled controller. §12.92. */
+    if (apload_path) {
+        FILE *af = fopen(apload_path, "rb");
+        long asz; uint8_t *ap; uint8_t *body;
+        if (!af) { perror(apload_path); return 1; }
+        fseek(af, 0, SEEK_END); asz = ftell(af); fseek(af, 0, SEEK_SET);
+        ap = (uint8_t *)malloc((size_t)asz);
+        if (!ap || fread(ap, 1, (size_t)asz, af) != (size_t)asz) {
+            fprintf(stderr, "[apload] read failed\n"); return 1; }
+        fclose(af);
+        fprintf(stderr, "[apload] booting %llu instrs to populate the flash driver...\n",
+                (unsigned long long)spi_boot);
+        machine_run(m, spi_boot);
+        m->spi_ctrl_on = 1;
+        m->spi_erases = m->spi_programs = 0;
+        body = machine_dram_ptr(m, 0x4009a000u);        /* DS_AP_CODE_AREA */
+        if (!body) { fprintf(stderr, "[apload] DRAM 0x4009a000 unmapped\n"); return 1; }
+        memcpy(body, ap, (size_t)asz);                  /* stage the whole AP */
+        {
+            uint32_t unzip = (uint32_t)ap[0x34]<<24 | (uint32_t)ap[0x35]<<16 |
+                             (uint32_t)ap[0x36]<<8  | ap[0x37];   /* dwAP_UNZIP_BUF */
+            uint32_t ap_sp = (uint32_t)ap[0x30]<<24 | (uint32_t)ap[0x31]<<16 |
+                             (uint32_t)ap[0x32]<<8  | ap[0x33];   /* dwAP_SP */
+            uint32_t dwoff = (0x4009a000u + 0x210u) - 0x40000800u; /* MoveSectionTable */
+            uint8_t *src = machine_dram_ptr(m, 0x4009a210u);
+            uint8_t *dst = machine_dram_ptr(m, 0x40000800u);
+            int k; uint64_t ran;
+            for (k = 0; k < 32; k++) {                  /* ROMLD_MoveSectionTable */
+                uint8_t *se = src + k*24, *de = dst + k*24;
+                uint32_t rma;
+                memcpy(de, se, 24);
+                rma = (uint32_t)de[8]<<24 | (uint32_t)de[9]<<16 | (uint32_t)de[10]<<8 | de[11];
+                rma += dwoff;
+                de[8]=(uint8_t)(rma>>24); de[9]=(uint8_t)(rma>>16);
+                de[10]=(uint8_t)(rma>>8); de[11]=(uint8_t)rma;
+            }
+            fprintf(stderr, "[apload] boot pc=0x%08x; controller armed; AP staged @0x4009a000 "
+                    "(%ld B); section table moved to 0x40000800\n", m->cpu.pc, asz);
+            fprintf(stderr, "[apload] calling REAL ROMLD_BOOT_LoadSectionAndRun(0x4bc)"
+                    "(tbl=0x40000800, unzip=0x%08x, sp=0x%08x)\n", unzip, ap_sp);
+            ran = (uint64_t)machine_call(m, 0x4bcu, 0x40000800u, unzip, ap_sp,
+                                         ap_sp, 10000000ull);
+            fprintf(stderr, "[apload] returned (rc as icount unused); stopped: %s (pc=0x%08x); "
+                    "SPI ops: %llu erase, %llu program\n",
+                    m->cpu.halted ? m->cpu.halt_reason : "budget/return", m->cpu.pc,
+                    (unsigned long long)m->spi_erases, (unsigned long long)m->spi_programs);
+            {   /* diagnostics: the moved FLSH entry + whether it loaded to its LMA */
+                uint8_t *e = machine_dram_ptr(m, 0x40000800u);
+                uint8_t *l = machine_dram_ptr(m, 0x40500000u);
+                if (e) fprintf(stderr, "[apload] tbl@0x40000800 entry0: name=%02x%02x%02x%02x "
+                        "lma=%02x%02x%02x%02x rma=%02x%02x%02x%02x lsz=%02x%02x%02x%02x "
+                        "flags=%02x%02x%02x%02x\n", e[0],e[1],e[2],e[3], e[4],e[5],e[6],e[7],
+                        e[8],e[9],e[10],e[11], e[12],e[13],e[14],e[15], e[20],e[21],e[22],e[23]);
+                if (l) fprintf(stderr, "[apload] LMA@0x40500000: %02x%02x%02x%02x %02x%02x%02x%02x "
+                        "(want 21101400 e2042100 = flasher _start)\n",
+                        l[0],l[1],l[2],l[3], l[4],l[5],l[6],l[7]);
+            }
+            (void)ran;
+        }
+        free(ap);
+        if (flashout_path) {
+            FILE *ff = fopen(flashout_path, "wb");
+            if (ff) { fwrite(m->flash, 1, m->flash_size, ff); fclose(ff);
+                fprintf(stderr, "[apload] dumped flash to %s\n", flashout_path); }
         }
         machine_free(m); free(m);
         return 0;

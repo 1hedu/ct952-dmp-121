@@ -6091,3 +6091,46 @@ for the emulator's direct-jump harness (`--aprun`/`--apflash`) -- it proves the 
 mechanism but the on-device loader, which *section-loads*, would not run it. A loader-
 compatible AP needs the section-table wrapper: a small flasher app linked to a DRAM LMA,
 UZIP-packed as a section-table image behind the AP_INFO header (a future `ctkap mksectionap`).
+
+### 12.92 Section-table flasher AP run through the REAL loader (--apload)
+
+Built a loader-compatible self-flashing AP -- a *section-table image*, the format the
+on-device loader actually accepts (12.91) -- and ran it through the firmware's real
+ROM loader. Every layer is firmware code except the modeled SPI controller.
+
+**The AP** (`ctkap.py mksectionap`): AP_INFO(0x200) + [AP image hdr 0x10] + [32
+SECTION_ENTRY table] + the flasher app as ONE section (name `FLSH`, Load|ProgEntry,
+LMA 0x40500000). The flasher (`apstub_sec.S`) reads a descriptor + image and reflashes
+by calling the resident DRAM driver (erase 0x4001fea8 / program 0x4002003c). dwRMA is
+stored IMAGE-RELATIVE (offset within the AP image); the loader resolves the source as
+`dwRMA + pSecTbl - 0x10` after ROMLD_MoveSectionTable rebases it -- the two cancel.
+
+**The run** (`--apload`): boot, arm the gate-level controller, stage the whole AP at
+DS_AP_CODE_AREA=0x4009a000, replicate ROMLD_MoveSectionTable (0x4009a210 -> 0x40000800,
+dwRMA += src-dest), then CALL the binary's ROMLD_BOOT_LoadSectionAndRun (@0x4bc ->
+iterator @0x528). The loader raw-copied the FLSH section to LMA 0x40500000 (verified:
+LMA reads back `21101400 e2042100` = the flasher `_start`), checksum-passed it, and
+jumped to it. The flasher then reflashed: **16 erase + 16 program** SPI ops.
+
+**Verified byte-exact** (flasher writes a 4 KB sentinel to sector 0x1a0000): target ==
+sentinel, sector tail 0xFF, and the boot region [0..0x3000), the XIP WriteSPF sector
+[0x30000:0x40000), and all surrounding flash untouched.
+
+**Two things reversed to get here** (each cost a debug pass against the binary):
+1. `dwRMA` is image-relative, not absolute: the loader adds `pSecTbl-0x10` (binary
+   0x5cc-0x5d0). My first build made it absolute (via MoveSectionTable), the loader
+   added the base again, and it read garbage -> section didn't load. Fix: store the
+   image-relative offset.
+2. The section loader (0x528) skips a section whose dwLMA <= 0x3fffffff and picks the
+   Load|ProgEntry section to jump to (dwCheckSumFlag bit1); its checksum is the byte-sum
+   of the UNPACKED bytes at the LMA (romld.c ROMLD_LoadSectionTo).
+
+**Known harness artifact:** after the reflash the flasher error-traps (trap 0x02) instead
+of its clean `ta 0`, because the driver's `wr %psr` (PIL mask/restore) desyncs CWP under
+the single-stepped machine_call (WIM=0). The reflash completes first (16+16 ops, bytes
+verified); on hardware the AP reboots rather than halting, so this path is emulator-only.
+
+So the COMPLETE on-device update path -- AP_INFO validation, MoveSectionTable, the real
+ROMLD_BOOT_LoadSectionAndRun section loader, the flasher app running from its DRAM LMA,
+the firmware's own flash driver, and the SPI controller -- executes end-to-end for a
+self-built, loader-compatible AP, with only the controller modeled.

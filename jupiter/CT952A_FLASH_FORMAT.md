@@ -205,6 +205,21 @@ header entry (as loader `0x3e48` does), and lets the body reflash. Verified: 16 
 + 16 program ops, target sector matches the payload, and the boot region + the XIP
 `WriteSPF` sector are untouched. See §12.90.
 
+And a LOADER-COMPATIBLE AP — a section-table image the real ROM loader accepts and
+runs (the OEM format), so the whole update path executes as the device would:
+```sh
+ctkap.py mksectionap out.AP --write 0x1a0000:new.bin      # AP_INFO + section table + flasher app
+ct952emu dp700wd.bin --rom-load --apload out.AP --flash-out after.bin
+```
+`--apload` stages the AP at `0x4009a000`, replicates `ROMLD_MoveSectionTable`, then
+CALLs the binary's `ROMLD_BOOT_LoadSectionAndRun` (`0x4bc`) — which loads the flasher
+*section* to its DRAM LMA (`0x40500000`), checksum-verifies it, and jumps in. The
+flasher reflashes via the resident DRAM driver + the gate-level controller. This is
+the DRAM-driver relocation for real: the flasher runs from a decompressed DRAM section,
+never from the flash it erases. Verified byte-exact (16 erase + 16 program; boot region
++ XIP `WriteSPF` sector untouched). See §12.91–92. `dwRMA` in the section table is
+IMAGE-RELATIVE (the loader resolves `dwRMA + pSecTbl − 0x10`).
+
 ### Two constraints on a *hardware-ready* body (do not skip)
 1. **Size / compression.** A full `0..0x166000` image cannot be carried **raw**
    inside an AP that must itself be `<= 0x166000` — the OEM body is UZIP-compressed

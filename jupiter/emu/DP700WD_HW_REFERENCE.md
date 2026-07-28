@@ -1526,3 +1526,17 @@ NEXT key -> dispatch -> FUN_0001d41c advance (index++) -> FUN_00061170 transitio
 **Diagnostics:** CT952_DSPDECODE (predecode model), CT952_DSPCMD (gated VDEC-command logger),
 CT952_IRKEYS (multi-key IR). Run: add `CT952_DSPDECODE=1` to the §12.113 card command and inject
 NEXT (`CT952_IRKEYS="0x10@<icount>,..."`) to step photos.
+
+### 12.118-final ★ Clean result with corrected gating
+
+Final verified sequence (3-photo card, one decode per photo, demo not disturbed):
+```
+decode #1 480x270 from 0x401dc000   (built-in demo -- plays first, boot not hijacked)
+[DSPDEC] idx=0 off=0x8600           -> decode #2 640x360 from 0x401ec000  RED   (01.JPG, photo 1)
+NEXT #1 -> [DSPDEC] idx=1 off=0xb600 -> decode #3 512x384 from 0x401ec000  GREEN (02.JPG, photo 2)
+NEXT #2 -> [DSPDEC] idx=2 off=0xde00 -> decode #4 448x336 from 0x401ec000  BLUE  (03.JPG, photo 3)
+```
+Gating (final): predecode fires only while the card parser is active (DAT_4003274a != 0, so boot is
+untouched) and only when the current photo's file (distinguished by its unique card offset, since
+JPEG headers are identical across files) is not already staged in 0x401ec000 -- one decode per
+distinct photo, advance and wrap correct.

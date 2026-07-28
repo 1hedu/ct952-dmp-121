@@ -1048,17 +1048,20 @@ static uint32_t sd_find_nth_jpeg(machine_t *m, uint32_t nth, uint32_t *out_len)
  * DAT_40032748) into the card decode buffer and decode it. Returns 1 on decode. */
 static int machine_dsp_predecode(machine_t *m)
 {
-    static int32_t last_idx = -1;
     uint32_t idx, foff, flen;
     uint8_t *dst;
     if (!m->sd_img) return 0;
     { uint8_t *ip = machine_dram_ptr(m, 0x40032748u); if (!ip) return 0; idx = *ip; }
-    if ((int32_t)idx == last_idx) return 0;   /* one decode per photo, on index change */
-    last_idx = (int32_t)idx;
     foff = sd_find_nth_jpeg(m, idx, &flen);
     if (!foff || !flen) return 0;
     dst = machine_dram_ptr(m, 0x401ec000u);
     if (!dst) return 0;
+    /* Only (re)load when the buffer isn't already this file -- so the initial
+     * photo (loaded by the firmware's own info.a) is left to the real engine
+     * path, and we act only when the advance leaves a stale buffer. */
+    if (dst[0] == m->sd_img[foff] && dst[1] == m->sd_img[foff+1] &&
+        dst[6] == m->sd_img[foff+6] && dst[0x20] == m->sd_img[foff+0x20])
+        return 0;
     if (foff + flen > m->sd_size) flen = m->sd_size - foff;
     memcpy(dst, m->sd_img + foff, flen);
     m->jpeg_src = 0x401ec000u;
@@ -1909,11 +1912,13 @@ static void bus_wr(machine_t *m, uint32_t addr, uint32_t val,
          * card image is present and the JPU-engine model is active. */
         if (cmd == 0x80u && getenv("CT952_DSPDECODE") && getenv("CT952_JPUENG")
             && m->sd_img && m->cpu.pc >= 0x6f2b0u && m->cpu.pc < 0x6f480u) {
-            /* Only during card MM playback: DAT_40039b08 (0x40039b08) == 0x60 is
-             * the MM-mode flag the parser sets when the card plays -- so boot-time
-             * predecode commands don't prematurely load the card over the demo. */
-            uint8_t *mm = machine_dram_ptr(m, 0x40039b08u);
-            if (mm && *mm == 0x60u) machine_dsp_predecode(m);
+            /* Only while the card parser is active: DAT_4003274a (0x4003274a) == 1
+             * is set when the card slideshow starts (§12.116, ~33.4M) and is 0
+             * during boot -- so boot-time predecode commands don't load the card
+             * over the demo. machine_dsp_predecode further no-ops unless the buffer
+             * is stale for the current index. */
+            uint8_t *pa = machine_dram_ptr(m, 0x4003274au);
+            if (pa && *pa != 0) machine_dsp_predecode(m);
         }
         /* Arm the dwell when the ack differs from the commanded value
          * (e.g. STOP 0x10 -> STOPPED 0x11); hold the commanded state for

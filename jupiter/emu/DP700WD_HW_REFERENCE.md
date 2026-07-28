@@ -1370,3 +1370,40 @@ would route a debounced KEY_NEXT into FUN_0001f4d0/FUN_00022494 is not pumping, 
 debounce but never dispatch. The single‑photo render is complete and faithful; multi‑photo iteration
 is gated on closing that input‑dispatch gap (the same one that blocks all interactive key handling
 after the boot plateau).
+
+### 12.116 ★★ Slideshow ADVANCE traced end-to-end: input dispatch is fully wired; stall is the CC event mailbox
+
+Fresh dig on why NEXT doesn't advance the card slideshow (§12.115). Result: the input-dispatch gap
+is **closed** — a NEXT keypress drives the firmware's own advance logic all the way to the parser
+re-arm. The remaining block is a downstream CC event delivery, not key routing.
+
+**The full NEXT chain (all Ghidra-verified, traced live at 46M):**
+1. IR ISR `FUN_00042370` decodes scancode 0x10 → keycode 0x3d into __bISRKey (0x40039074) and raw
+   key `0x400235ac <- 0x3d`.
+2. Key debounce `FUN_0000a2c4` (@0xa2cc) → dispatcher `FUN_0000a6cc`, which indirect-calls the
+   **active UI record**'s (`_DAT_40020ec8`) +8 handler at **0xa720**. ICALL confirms:
+   `site=0xa720 target=0x260f4 msgtype=0x3d`.
+3. `FUN_000260f4` (active handler): `DAT_4002fb2a = 0x3d`; because the parser is active
+   (`DAT_4003274a != 0`) it calls **`FUN_0001bec0`** — NOT `FUN_00022494` (§12.115's zero-hit watch
+   was on the wrong branch; parser-off → 22494, parser-on → 1bec0).
+4. `FUN_0001bec0` switch `case '='` (0x3d) → **`FUN_0001d41c(0)`** = the photo-advance (0=next,
+   1=prev for `'>'`).
+5. `FUN_0001d41c` increments the photo index (`DAT_40032748++`, wrap at `_DAT_40032620` total) and
+   re-arms the parser via `FUN_0001d57c` (`DAT_4003274a=1`, `FUN_00037068` transition-buffer setup).
+   PCWATCH confirms 0x260f4→0xb1ac→0x1bec0→0x1d41c→0x1d344 all execute at 46.19M.
+
+**Where it stalls.** After the advance, `PARSERHEADER` (`FUN_0001b800`) re-runs and then **spins**
+(dozens of calls). Its file-read trigger ("THUMB trigger -> bm_read_file", loads the next JPEG into
+0x401ec000) fires only when `FUN_00007658(0)` — a read of CC event mailbox **slot 0 (0x40026eb0[0])**
+— returns **0x168 or 5**. That event is never posted after the advance, so the trigger never fires:
+**no card read for 02.JPG, no engine GO, no photo-2 decode** (confirmed: 0 READ18 and 0 ENGGO after
+46M, only the spinning PARSERHEADER).
+
+**Diagnosis.** This is the pre-existing **CC event-delivery gap** (same mailbox/thread-scheduling
+layer as §12.75/tasks #10–#11), not the input path. The advance correctly asks for the next file;
+the CC event that would satisfy `PARSERHEADER`'s read-trigger (`0x40026eb0[0] == 0x168/5`) isn't
+delivered in the emulated boot. Single-photo render is complete and faithful; multi-photo iteration
+is now blocked solely on posting/delivering that mailbox event.
+
+**Diagnostics added:** `CT952_IRKEYS` (multi-key timed IR injection) and event-slot watch on
+0x40026eb0.

@@ -484,17 +484,6 @@ int main(int argc, char **argv)
                     "SPI ops: %llu erase, %llu program\n",
                     m->cpu.halted ? m->cpu.halt_reason : "budget/return", m->cpu.pc,
                     (unsigned long long)m->spi_erases, (unsigned long long)m->spi_programs);
-            {   /* diagnostics: the moved FLSH entry + whether it loaded to its LMA */
-                uint8_t *e = machine_dram_ptr(m, 0x40000800u);
-                uint8_t *l = machine_dram_ptr(m, 0x40500000u);
-                if (e) fprintf(stderr, "[apload] tbl@0x40000800 entry0: name=%02x%02x%02x%02x "
-                        "lma=%02x%02x%02x%02x rma=%02x%02x%02x%02x lsz=%02x%02x%02x%02x "
-                        "flags=%02x%02x%02x%02x\n", e[0],e[1],e[2],e[3], e[4],e[5],e[6],e[7],
-                        e[8],e[9],e[10],e[11], e[12],e[13],e[14],e[15], e[20],e[21],e[22],e[23]);
-                if (l) fprintf(stderr, "[apload] LMA@0x40500000: %02x%02x%02x%02x %02x%02x%02x%02x "
-                        "(want 21101400 e2042100 = flasher _start)\n",
-                        l[0],l[1],l[2],l[3], l[4],l[5],l[6],l[7]);
-            }
             (void)ran;
         }
         free(ap);

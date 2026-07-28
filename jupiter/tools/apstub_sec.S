@@ -68,5 +68,15 @@ done:
     set   0x80007ff4, %g1        ! completion signal for the harness
     set   0xc0ded00d, %g2
     st    %g2, [%g1]
-    ta    0                      ! clean emulator halt (ET=0)
+    ! The firmware driver/loader leaves traps enabled (ET=1), so a bare `ta 0`
+    ! would take a real trap to the (bogus) vector. Clear ET first so the halting
+    ! trap is error-mode (a clean emulator stop). On real hardware the AP reboots
+    ! here instead; this halt is the emulator harness's end-of-run marker.
+    rd    %psr, %l0
+    andn  %l0, 0x20, %l0         ! clear ET (PSR bit 5)
+    wr    %l0, 0, %psr
+    nop
+    nop
+    nop
+    ta    0                      ! ET=0 now -> clean error-mode halt (tt 0x80)
      nop

@@ -29,7 +29,7 @@ into DRAM, and runs a Python script, printing over UART1.
 | `micropython/` | MicroPython core, as a git submodule pinned to a tested commit |
 | `main.c` | `mpy_main()`: GC heap in DRAM, `mp_init`, run the demo script |
 | `uart_core.c` | `mp_hal_stdout_tx_strn` / `mp_hal_stdin_rx_chr` on UART1 (`0x80000070`) |
-| `modct952.c` | `ct952` display module: draw to the OSD plane from Python (`init`, `palette`, `pixel`, `fill`, `rect`, `WIDTH`, `HEIGHT`) |
+| `modct952.c` | `ct952` hardware module: OSD draw (`init`, `palette`, `pixel`, `fill`, `rect`), the **GPU 2-D engine** (`gpu_fill`, `text`), the **JPU decoder** (`decode_jpeg`), the **IR remote** (`ir_poll`), and raw register access (`peek32`, `poke32`, `poke_bytes`) |
 | `modusb_kbd.c` | `usb_kbd` module: a bare-metal EHCI + USB HID boot-keyboard driver (`init`, `poll`, `getchar`) — enumerate and read a USB keyboard from Python |
 | `mpconfigport.h` | Feature config (minimal + compiler + GC + MPZ long ints; `MICROPY_NLR_SETJMP`) |
 | `setjmp.h` | `setjmp`/`longjmp` → gcc builtins (handle SPARC register windows, no libc) |
@@ -94,6 +94,28 @@ SET_ADDRESS / SET_CONFIGURATION / HID SET_PROTOCOL); the REPL's stdin
 no `CT952_USB_KEYS`, the root hub is empty and the REPL reads UART1 only
 (`--uart-in`). The `usb_kbd` module (`init`, `poll`, `getchar`) exposes the same
 driver to Python.
+
+### Driving the hardware from Python
+
+The `ct952` module binds the emulator's modeled peripherals, so the REPL drives
+the real blocks, not just the framebuffer:
+
+```python
+ct952.gpu_fill(20, 20, 220, 60, 1)        # 2-D engine fill-rectangle
+ct952.text(30, 100, 'HELLO CT952', 9, 10) # GPU 1-bit font engine (built-in 8x8 font)
+ct952.decode_jpeg(0x41000000)             # kick the JPU JPEG decoder -> video plane
+ct952.ir_poll()                           # read the IR remote (feed with CT952_IRKEY)
+ct952.poke32(0x80001a54, 0x10f001e0)      # any register
+v = ct952.peek32(0x80001a54)              # ...read it back
+ct952.poke_bytes(0x41000000, jpeg_data)   # stage bytes in DRAM (e.g. before decode_jpeg)
+```
+
+`gpu_fill` and `text` program the GPU's shared JPU/GPU block (`0x80002880`) and
+kick the engine; the emulator's `gpu_exec()` writes the pixels into the 8bpp OSD
+plane. `decode_jpeg` points the MCU-BIU bitstream source at a DRAM address and
+runs a JPU op, so the functional picojpeg decoder reconstructs the frame onto
+the video plane the display composites under the OSD. (Set `CT952_OSD_FULL=1` to
+composite the whole 240-row OSD in `--fb-out`; the default clamps to ~51 rows.)
 
 ## SPARC bring-up notes
 

@@ -202,8 +202,13 @@ typedef struct machine {
     uint16_t usb_ep0_off;          /* bytes of usb_ep0_buf already returned     */
     uint8_t  usb_setaddr_armed;    /* adopt usb_setaddr at next EP0 status IN   */
     uint8_t  usb_setaddr;          /* address pending from SET_ADDRESS          */
-    uint8_t  usb_kbd_reports[256][8]; /* pending 8-byte HID boot reports (ring) */
-    int      usb_kbd_rq_head, usb_kbd_rq_tail;
+    /* Pending keystrokes as an ASCII feed. HID boot reports are generated
+     * lazily on each interrupt-IN poll (a key-down then a key-up per char), so
+     * the queue length is unbounded by any report ring. */
+    char     usb_kbd_feed[2048];   /* queued ASCII keystrokes                   */
+    uint32_t usb_kbd_feed_len;     /* valid bytes in usb_kbd_feed               */
+    uint32_t usb_kbd_feed_pos;     /* next character to emit                    */
+    uint8_t  usb_kbd_feed_phase;   /* 0=emit key-down next, 1=emit key-up next  */
     uint64_t usb_kbd_polls;        /* interrupt-IN transactions serviced        */
     uint64_t usb_kbd_reports_sent; /* non-NAK interrupt-IN reports delivered    */
 

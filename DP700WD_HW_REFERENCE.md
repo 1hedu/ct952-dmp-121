@@ -5526,3 +5526,49 @@ Every keystroke traversed the full stack — HID boot report → EHCI async sche
 → bare-metal driver → REPL stdin — and `ct952.fill(11)` repainted the OSD plane
 live. A DVD-player SoC, emulated from its own firmware, now takes typed Python at
 a `>>>` prompt over a USB keyboard.
+
+### 12.77 Bind the rest of the player into `ct952` — GPU, JPU, IR, raw registers
+
+With the REPL live, the `ct952` module grew from a framebuffer poker into a
+binding for the emulator's actual peripheral models, so Python drives the real
+blocks:
+
+- **GPU 2-D engine** (`gpu_fill`, `text`). The shared JPU/GPU block at
+  `0x80002880` is programmed and kicked; `gpu_exec()` in the emulator writes the
+  pixels. `gpu_fill(x,y,w,h,color)` issues fill-rectangle ops (opmode 6),
+  computing `AG_OFF` so the plane pitch stays 480 bytes (`ag_offset = 61 -
+  ag_width`, valid to ~244 px wide; wider fills are tiled). `text(x,y,s,fg,bg)`
+  drives the 1-bit font path: a built-in 8x8 font (public-domain font8x8_basic)
+  is expanded once into a DRAM glyph table (MSB-first, one DW/row), then each
+  glyph index is pushed to `FONT_IDX` and a font op is kicked.
+- **JPU decoder** (`decode_jpeg(addr)`). Writes the MCU-BIU bitstream source
+  (`0x80002a20`) and runs a JPU op (`CTL0[28]=0`), so the functional picojpeg
+  decode reconstructs the frame onto the video plane the display composites.
+- **IR remote** (`ir_poll()`). Reads `IR_DATA` (`0x80000390`), returning the
+  scancode of a pending key (and consuming it) — the input the emulator's
+  `CT952_IRKEY`/`CT952_IRKEYS` injector feeds through the HW-NEC decoder path.
+- **Raw registers** (`peek32`, `poke32`, `poke_bytes`). Full 32-bit access to
+  any modeled register or memory, plus a bytes-to-DRAM copy for staging data
+  (e.g. a JPEG before `decode_jpeg`).
+
+**Verified (REPL session over the USB keyboard):**
+
+```
+>>> ct952.gpu_fill(20,20,220,60,1)
+>>> ct952.text(30,100,'HELLO CT952',9,10)
+>>> print(ct952.peek32(0x80001a54))
+284426208            # 0x10f001e0: OSD enable | 240<<16 | 480
+```
+
+`--fb-out` (with `CT952_OSD_FULL=1`) shows the exact result: a 220x60 red
+rectangle (13200 px) laid down by the 2-D engine and "HELLO CT952" rendered
+white-on-navy by the GPU font engine. Two findings worth noting: (1) the USB
+key feed was refactored from a fixed 256-entry report ring to a lazily-generated
+report stream over an ASCII buffer, after the ring overflowed at ~127 characters
+and stalled input mid-session; (2) the OSD `--fb-out` composite clamps at row
+~51 (`0x40065000`) unless `CT952_OSD_FULL=1`, which had hidden the lower rect
+rows and the text until the flag was set.
+
+The player is now scriptable end to end from a `>>>` prompt: display plane,
+palette, 2-D blitter, font engine, JPEG decoder, IR remote, and arbitrary
+registers — all from Python typed on a USB keyboard.

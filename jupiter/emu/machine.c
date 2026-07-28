@@ -1080,6 +1080,8 @@ static void usb_dev_setup(machine_t *m, const uint8_t *sp)
     if (m->usb_ep0_len > wLength) m->usb_ep0_len = wLength;  /* never exceed request */
 }
 
+static uint8_t hid_usage_of(char c, uint8_t *mod);   /* fwd: ASCII -> HID usage */
+
 /* IN transfer: fill up to maxlen bytes for endpoint `ep`; return byte count, or
  * -1 for NAK (interrupt endpoint with no report queued). */
 static int usb_dev_in(machine_t *m, uint8_t ep, uint8_t *dst, int maxlen)
@@ -1099,15 +1101,31 @@ static int usb_dev_in(machine_t *m, uint8_t ep, uint8_t *dst, int maxlen)
         m->usb_ep0_off = (uint16_t)(m->usb_ep0_off + n);
         return n;
     }
-    /* interrupt IN (endpoint 1): deliver the next queued HID report, else NAK */
+    /* interrupt IN (endpoint 1): generate the next HID boot report from the
+     * ASCII feed -- a key-down (usage + shift modifier) then a key-up (zeros)
+     * per character. NAK (return -1) when the feed is exhausted, so the qTD
+     * stays Active for the host's next poll. */
     m->usb_kbd_polls++;
-    if (m->usb_kbd_rq_head == m->usb_kbd_rq_tail)
-        return -1;  /* no key change -> NAK (report stays Active in the qTD) */
     int n = maxlen < 8 ? maxlen : 8;
-    memcpy(dst, m->usb_kbd_reports[m->usb_kbd_rq_head], n);
-    m->usb_kbd_rq_head = (m->usb_kbd_rq_head + 1) & 0xFF;
-    m->usb_kbd_reports_sent++;
-    return n;
+    for (;;) {
+        if (m->usb_kbd_feed_pos >= m->usb_kbd_feed_len)
+            return -1;  /* no more keys -> NAK */
+        if (m->usb_kbd_feed_phase == 1) {           /* key-up: all zero */
+            memset(dst, 0, n);
+            m->usb_kbd_feed_phase = 0;
+            m->usb_kbd_feed_pos++;
+            m->usb_kbd_reports_sent++;
+            return n;
+        }
+        uint8_t mod, usage = hid_usage_of(m->usb_kbd_feed[m->usb_kbd_feed_pos], &mod);
+        if (!usage) { m->usb_kbd_feed_pos++; continue; }  /* skip unmappable */
+        uint8_t rep[8]; memset(rep, 0, 8);
+        rep[0] = mod; rep[2] = usage;
+        memcpy(dst, rep, n);
+        m->usb_kbd_feed_phase = 1;
+        m->usb_kbd_reports_sent++;
+        return n;
+    }
 }
 
 /* qTD token bits (EHCI 1.0 Table 3-16). */
@@ -1244,17 +1262,6 @@ static uint8_t hid_usage_of(char c, uint8_t *mod)
     }
 }
 
-static void usb_kbd_push(machine_t *m, uint8_t mod, uint8_t usage)
-{
-    int next = (m->usb_kbd_rq_tail + 1) & 0xFF;
-    if (next == m->usb_kbd_rq_head) return;   /* queue full: drop */
-    uint8_t *r = m->usb_kbd_reports[m->usb_kbd_rq_tail];
-    memset(r, 0, 8);
-    r[0] = mod;
-    r[2] = usage;
-    m->usb_kbd_rq_tail = next;
-}
-
 void machine_usb_kbd_feed(machine_t *m, const char *keys)
 {
     if (!keys) return;
@@ -1264,12 +1271,18 @@ void machine_usb_kbd_feed(machine_t *m, const char *keys)
         /* signal a new high-speed connection on port 0 (CCS + CSC) */
         m->ehci_portsc[0] = 0x00000003u;
     }
-    for (const char *p = keys; *p; p++) {
-        uint8_t mod, usage = hid_usage_of(*p, &mod);
-        if (!usage) continue;
-        usb_kbd_push(m, mod, usage);      /* key down */
-        usb_kbd_push(m, 0, 0);            /* key up   */
+    /* Append to the ASCII feed; reports are generated lazily as the interrupt
+     * endpoint is polled (see usb_dev_in). Compact away already-consumed keys
+     * if needed to make room. */
+    if (m->usb_kbd_feed_pos > 0 && m->usb_kbd_feed_pos <= m->usb_kbd_feed_len) {
+        uint32_t rem = m->usb_kbd_feed_len - m->usb_kbd_feed_pos;
+        memmove(m->usb_kbd_feed, m->usb_kbd_feed + m->usb_kbd_feed_pos, rem);
+        m->usb_kbd_feed_len = rem;
+        m->usb_kbd_feed_pos = 0;
+        m->usb_kbd_feed_phase = 0;
     }
+    for (const char *p = keys; *p && m->usb_kbd_feed_len < sizeof m->usb_kbd_feed; p++)
+        m->usb_kbd_feed[m->usb_kbd_feed_len++] = *p;
 }
 
 /* ---- SD Host Controller model (standard SDHC spec, base 0xa0001100) ---------

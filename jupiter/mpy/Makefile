@@ -38,8 +38,11 @@ LIBS =
 SRC_C = \
 	main.c \
 	uart_core.c \
+	modct952.c \
 	shared/libc/string0.c \
 	shared/runtime/stdout_helpers.c \
+
+SRC_QSTR += modct952.c
 
 SRC_S = \
 	start.S \

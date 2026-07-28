@@ -34,17 +34,50 @@ static char *stack_top;
 static char heap[MICROPY_HEAP_SIZE];
 #endif
 
-// The demo script the milestone runs. Kept small; exercises the lexer,
-// parser, compiler, VM, ints, strings, list comprehension and print.
+// The demo script the milestone runs: exercise the interpreter, then draw
+// to the panel through the ct952 display module -- Python pixels on a DVD
+// player's OSD plane.
 static const char *demo_script =
     "print('hello from MicroPython on a CT952 DVD player!')\n"
-    "print('2**32 - 1 =', 2**32 - 1)\n"
-    "print('squares:', [x*x for x in range(1, 11)])\n"
-    "s = 0\n"
-    "for i in range(1, 101):\n"
-    "    s += i\n"
-    "print('sum(1..100) =', s)\n"
-    "print('big-endian bytes of 0x01020304:', (0x01020304).to_bytes(4, 'big'))\n"
+    "import ct952\n"
+    "W = ct952.WIDTH\n"
+    "H = ct952.HEIGHT\n"
+    "print('OSD panel:', W, 'x', H)\n"
+    "ct952.init()\n"
+    "# palette: 0=bg, 1..8=colour bars, 9=white, 10=navy, 11=cyan, 16..47=grey ramp\n"
+    "ct952.palette(0, 0x101018)\n"
+    "bars = [0xff3030,0xff9020,0xf0e000,0x30c040,0x2090ff,0x5030ff,0xc040ff,0xf0f0f0]\n"
+    "for i in range(len(bars)):\n"
+    "    ct952.palette(1 + i, bars[i])\n"
+    "ct952.palette(9, 0xffffff)\n"
+    "ct952.palette(10, 0x101840)\n"
+    "ct952.palette(11, 0x40d0ff)\n"
+    "for i in range(32):\n"
+    "    s = i * 255 // 31\n"
+    "    ct952.palette(16 + i, (s << 16) | (s << 8) | s)\n"
+    "ct952.fill(0)\n"
+    "# eight colour bars across the top band\n"
+    "bw = W // 8\n"
+    "for i in range(8):\n"
+    "    ct952.rect(i * bw, 8, bw - 2, 70, 1 + i)\n"
+    "# a 32-step grey gradient bar\n"
+    "gw = W // 32\n"
+    "for i in range(32):\n"
+    "    ct952.rect(i * gw, 88, gw, 28, 16 + i)\n"
+    "# a navy 'dialog' with a cyan border, drawn entirely in Python\n"
+    "ct952.rect(40, 128, W - 80, H - 152, 11)\n"
+    "ct952.rect(44, 132, W - 88, H - 160, 10)\n"
+    "# a bar-chart of the first Fibonacci numbers, computed in Python\n"
+    "fib = [1, 1]\n"
+    "for i in range(9):\n"
+    "    fib.append(fib[len(fib) - 1] + fib[len(fib) - 2])\n"
+    "print('fib:', fib)\n"
+    "base = H - 30\n"
+    "top = fib[len(fib) - 1]\n"
+    "for i in range(len(fib)):\n"
+    "    bh = fib[i] * 80 // top\n"
+    "    ct952.rect(60 + i * 32, base - bh, 24, bh, 1 + (i % 8))\n"
+    "print('drawn: colour bars + grey ramp + dialog + Fibonacci bar chart')\n"
     ;
 
 // Entry from start.S (after .data copy / .bss zero / stack set up).

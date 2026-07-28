@@ -24,8 +24,14 @@ _tt:
         b       _win_ovf; nop; nop; nop
         /* tt 0x06: window underflow */
         b       _win_unf; nop; nop; nop
-        /* tt 0x07.. : everything else is fatal */
-        .rept   249
+        /* tt 0x07..0x82: fatal (124 entries) */
+        .rept   124
+        b       _bad; nop; nop; nop
+        .endr
+        /* tt 0x83: ta 3 = ST_FLUSH_WINDOWS (gcc setjmp/longjmp emit this) */
+        b       _win_flush; nop; nop; nop
+        /* tt 0x84..0xff: fatal (124 entries) */
+        .rept   124
         b       _bad; nop; nop; nop
         .endr
 
@@ -110,6 +116,44 @@ _win_ovf:
         T_NOP
         jmp     %l1
         rett    %l2
+
+        /* ---- ST_FLUSH_WINDOWS (tt 0x83, ta 3): spill every register window
+         * except the trap window to its stack, so setjmp/longjmp (and any
+         * stack walk) see all frames. Counter lives in %g1 (global, survives
+         * save/restore); WIM and the interrupted %g1 are parked in trap-window
+         * locals. NWIN = 8, so 7 windows are flushed. ---- */
+_win_flush:
+        mov     %wim, %l3           /* save WIM (trap-window local) */
+        mov     %g1, %l5            /* save interrupted %g1 */
+        mov     %g0, %wim           /* disable window traps during the walk */
+        T_NOP
+        mov     7, %g1              /* flush NWIN-1 windows */
+1:
+        restore                     /* move toward caller windows */
+        std     %l0, [%sp + 0]
+        std     %l2, [%sp + 8]
+        std     %l4, [%sp + 16]
+        std     %l6, [%sp + 24]
+        std     %i0, [%sp + 32]
+        std     %i2, [%sp + 40]
+        std     %i4, [%sp + 48]
+        std     %i6, [%sp + 56]
+        subcc   %g1, 1, %g1
+        bne     1b
+        nop
+        mov     7, %g1
+2:
+        save                        /* walk back to the trap window */
+        subcc   %g1, 1, %g1
+        bne     2b
+        nop
+        mov     %l3, %wim           /* restore WIM */
+        T_NOP
+        mov     %l5, %g1            /* restore %g1 */
+        /* software trap: return PAST the ta (to nPC), not re-execute it */
+        add     %l2, 4, %l4
+        jmp     %l2
+        rett    %l4
 
         /* ---- window underflow (tt 6) ---- */
 _win_unf:

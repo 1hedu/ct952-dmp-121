@@ -3196,7 +3196,12 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
      * OSD content regardless of the enable bit (firmware draws before flipping
      * enable); enable state is still reported via the return value. */
     {
-        const uint32_t osd_end = 0x40065000u;   /* DS_OSDFRAME_END */
+        /* DS_OSDFRAME_END caps the firmware OSD region so the tiled video
+         * buffer past it isn't misread as OSD (§ green-stripes). A bare-metal
+         * / MicroPython client owns the whole plane and has no video buffer, so
+         * CT952_OSD_FULL lifts the cap to the full w*stride framebuffer. */
+        uint32_t osd_end = getenv("CT952_OSD_FULL")
+            ? osd_base + (uint32_t)(h * stride) : 0x40065000u;   /* DS_OSDFRAME_END */
         int have_video = (m->jpeg_rgb && m->jpeg_w > 0 && m->jpeg_h > 0);
         /* CT952_OSD_ONLY: render the OSD plane on a black field (transparent
          * index 0 -> black) instead of compositing the photo behind it, so the

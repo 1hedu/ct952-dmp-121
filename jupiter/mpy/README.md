@@ -29,6 +29,7 @@ into DRAM, and runs a Python script, printing over UART1.
 | `micropython/` | MicroPython core, as a git submodule pinned to a tested commit |
 | `main.c` | `mpy_main()`: GC heap in DRAM, `mp_init`, run the demo script |
 | `uart_core.c` | `mp_hal_stdout_tx_strn` / `mp_hal_stdin_rx_chr` on UART1 (`0x80000070`) |
+| `modct952.c` | `ct952` display module: draw to the OSD plane from Python (`init`, `palette`, `pixel`, `fill`, `rect`, `WIDTH`, `HEIGHT`) |
 | `mpconfigport.h` | Feature config (minimal + compiler + GC + MPZ long ints; `MICROPY_NLR_SETJMP`) |
 | `setjmp.h` | `setjmp`/`longjmp` → gcc builtins (handle SPARC register windows, no libc) |
 | `start.S` | Reset trap table, window overflow/underflow handlers, `.data` copy, `.bss` zero, stack, `mpy_main` |
@@ -62,10 +63,13 @@ UART1 output is echoed to stdout.
 - **Register windows.** The parser/compiler/VM recurse deeply; `start.S`
   provides the canonical SPARC V8 window overflow (tt 5) / underflow (tt 6)
   handlers (NWIN = 8) so windows spill/reload transparently.
-- **Exceptions (NLR).** MicroPython has no dedicated SPARC NLR, so we use
-  `MICROPY_NLR_SETJMP`; `setjmp.h` maps `setjmp`/`longjmp` to
-  `__builtin_setjmp`/`__builtin_longjmp`, which the compiler implements
-  correctly for the register-window ABI without a C library.
+- **Exceptions (NLR) + `ta 3`.** MicroPython has no dedicated SPARC NLR, so we
+  use `MICROPY_NLR_SETJMP`; `setjmp.h` maps `setjmp`/`longjmp` to
+  `__builtin_setjmp`/`__builtin_longjmp`. On SPARC `__builtin_longjmp` emits
+  `ta 3` (`ST_FLUSH_WINDOWS`) to spill the register windows before the jump, so
+  `start.S` implements the tt 0x83 flush-windows handler (spills 7 windows to
+  their stacks, returns past the `ta`). Without it, the first raised exception
+  traps.
 - **Big-endian.** Verified live: `(0x01020304).to_bytes(4, 'big')` yields
   `b'\x01\x02\x03\x04'`, and MPZ long ints (`2**32 - 1`) are exact.
 - **No 32-bit libgcc / libc.** The link is `-nostdlib`; `shared/libc/string0.c`

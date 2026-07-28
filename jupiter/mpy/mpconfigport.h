@@ -2,8 +2,11 @@
 
 // MicroPython build options for the CheerTek CT952/CT909 (big-endian SPARC V8).
 
-// Start from the minimal feature set, then enable what the demo needs.
+// Minimal feature set + the cheap compiler extensions the demo uses
+// (tuple assignment). These are compile-time only, no extra link deps.
 #define MICROPY_CONFIG_ROM_LEVEL (MICROPY_CONFIG_ROM_LEVEL_MINIMUM)
+#define MICROPY_COMP_DOUBLE_TUPLE_ASSIGN (1)
+#define MICROPY_COMP_TRIPLE_TUPLE_ASSIGN (1)
 
 #define MICROPY_ENABLE_COMPILER     (1)
 

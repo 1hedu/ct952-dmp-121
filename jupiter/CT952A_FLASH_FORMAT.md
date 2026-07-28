@@ -49,6 +49,33 @@ section's payload at its `rma`.
 The boot ROM loads sections whose `lma >= 0x40000000` into DRAM (decompressing
 when `rsz < lsz`), leaves XIP/data sections in place, and jumps to `ROMV`'s `lma`.
 
+### UZIP section compression (`rsz < lsz`)
+
+**UZIP is plain LZMA1** (props `0x63` ⇒ **lc=0, lp=1, pb=2**) inside a custom
+**13-byte XOR-obfuscated container**. The decompressor is at flash `0x2C50`
+(wrapper) → parser `0x2028` → LZMA range-decoder `0x20b4`. Independently
+confirmed: Python `lzma`/system liblzma decode the firmware's stream to the
+identical bytes, and a re-encode reproduces near-OEM size.
+
+Container (the `rsz` bytes stored at `rma`):
+```
++0x00  u32 word0 ^ 0x5A5A5A5A   deobf = 0x63000080  (high byte 0x63 = LZMA props)
++0x04  u32 word1 ^ 0x5A5A5A5A   \  uncompressed size, 32-bit, byte-shuffled:
++0x08  u32 word2 ^ 0x5A5A5A5A   /   size = ((w1>>16)&0xff) | (w1&0xff00)
+                                          | ((w1&0xff)<<16) | (w2&0xff000000)
++0x0C  byte 0x5A                 (unused)
++0x0D  ...                       raw LZMA1 stream (no .lzma/xz framing)
+```
+The decoder uses the **output buffer as its window**, so re-compressing with any
+`dict_size >= uncompressed_size` (and no end marker; it stops at the header size)
+produces a stream the firmware accepts. `ctkap.py` does exactly this via Python
+`lzma` FORMAT_RAW, and `ctkap.py sections` decompresses every UZIP section and
+checks its 16-bit byte-sum against the section table.
+
+A modified section may be shipped **raw** (flags `0x0000`, `rsz==lsz`) or
+**re-UZIP'd** (`ctkap.py repack`, flags `0x0005`) — raw is simplest, UZIP keeps
+the image within the `0x166000` AP-area cap.
+
 ---
 
 ## 2. `UPG952A.AP` update container

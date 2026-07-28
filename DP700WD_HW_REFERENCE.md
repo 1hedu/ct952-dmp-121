@@ -5896,3 +5896,25 @@ for a safe software reflash. Full spec: `jupiter/CT952A_FLASH_FORMAT.md`; tool:
 `ctkap.py sections dp700wd.bin` verifies all content-section checksums; a
 wrap->validate->corrupt roundtrip confirms the AP body-checksum detects a
 single flipped byte.
+
+### 12.87 UZIP reversed = LZMA1; ctkap.py now packs/unpacks + verifies every section
+
+UZIP (the section compression, `rsz<lsz`) is **plain LZMA1** with props 0x63
+(lc=0, lp=1, pb=2) inside a 13-byte XOR-obfuscated (key 0x5A5A5A5A) container:
+word0 deobf=0x63000080 (props in high byte), word1/word2 carry the byte-shuffled
+uncompressed size, byte12=0x5A, LZMA1 stream at +0x0D. Decompressor wrapper
+@0x2C50, parser @0x2028, range-decoder @0x20b4. The decoder uses the output as
+its window (no explicit dict_size / end marker; stops at the header size).
+
+Independently corroborated: Python `lzma` FORMAT_RAW (and system liblzma
+FORMAT_ALONE) decode the firmware stream byte-exactly (TEXT->0xc759,
+ENGL->0xe14e), and re-encoding reproduces near-OEM size (TEXT 5972->5970,
+round-trips). `jupiter/tools/ctkap.py` now:
+- `sections` decompresses + checksum-verifies EVERY section (ROMV/TEXT/DATA/
+  ENGL/SFAT all OK, not just raw ones);
+- `unpack <flash> NAME out` extracts+decompresses a section;
+- `repack body out` UZIP-compresses (real LZMA1 matching) with the correct
+  obfuscated header, verified to round-trip.
+
+So a modified section can be re-packed to firmware-format UZIP (or shipped raw).
+CT952A_FLASH_FORMAT.md updated with the UZIP container + LZMA params.

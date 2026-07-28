@@ -1477,3 +1477,15 @@ sole faithful blocker is the DSP mode-9 re-entry for the transition path (FUN_00
 the engine re-driver `FUN_0009b9ac` / info.a read not firing for the advanced index). This is the
 same DSP-mode/scheduling layer that has gated the boot throughout; resolving it faithfully is a deep
 change, not a localized fix. Single-photo render remains complete and faithful.
+
+### 12.117-b ★ Confirmed: the engine is thread-driven and no photo-2 request is enqueued
+
+The engine driver `FUN_0009b9ac` runs inside the **DSP-display thread `FUN_00083098`** (entry
+0x83098) — an infinite loop that dequeues display work (`_DAT_4003d6d4` count, `_DAT_4003d2fc`
+channel via `FUN_0009b2cc`) and calls the engine (`0x8323c → FUN_0009b9ac`) when a channel has work.
+PCWATCH on the engine-call site 0x8323c: **exactly one hit — photo 1 at 44.865M (o7=0x831f0) — and
+ZERO after NEXT.** So the thread is alive but never gets a photo-2 channel to process: the
+advance/transition path never **enqueues** a display-decode request for the new index, and mode-9 is
+torn down (§12.117). That closes the map — the single faithful blocker for multi-photo iteration is
+the display-decode enqueue (+ mode-9 persistence) for the transition, deep in the DSP work-queue
+scheduling.

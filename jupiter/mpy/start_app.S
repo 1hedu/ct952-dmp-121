@@ -96,15 +96,21 @@ _app_init:
         st      %g3, [%g1 + 4]          /* [1] = mix_en | white */
         set     0x01010101, %g3         /* index-1 words */
         mov     %g2, %g4
-        set     28800, %g5              /* 480*240/4 */
+        set     49152, %g5              /* fill 192 KB (covers up to ~480x409); stays
+                                         * below both the AP body and our code even
+                                         * when base is near the validity bound */
 12:     st      %g3, [%g4]
         subcc   %g5, 1, %g5
         bne     12b
         add     %g4, 4, %g4
-        set     0x80001A50, %g1
-        st      %g0, [%g1]              /* REG_DISP_OSD_POS = 0 */
-        set     0x10F001E0, %g3         /* enable(bit28) | (240<<16) | 480 */
-        st      %g3, [%g1 + 4]          /* REG_DISP_OSD_SIZE (0x80001A54) */
+        /* Ensure the OSD plane is enabled but KEEP the loader's geometry
+         * (REG_DISP_OSD_SIZE encodes this panel's real w/h -- do not clobber it,
+         * console_setup reads it back). Just OR in the enable bit (bit28). */
+        set     0x80001A54, %g1         /* REG_DISP_OSD_SIZE */
+        ld      [%g1], %g3
+        sethi   %hi(0x10000000), %g4    /* DISP_OSD_EN (bit28) */
+        or      %g3, %g4, %g3
+        st      %g3, [%g1]
         set     0x80000D80, %g1
         st      %g2, [%g1]              /* VCR20 = base */
         st      %g2, [%g1 + 4]          /* VCR21 = base */

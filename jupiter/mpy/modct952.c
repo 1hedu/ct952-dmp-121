@@ -56,6 +56,13 @@
  * to DS_OSDFRAME_ST until then. */
 static volatile uint8_t *g_osd_fb = OSD_FB;
 
+/* Live OSD geometry -- resolved at console_setup() from REG_DISP_OSD_SIZE (the
+ * value the AP loader programmed for THIS panel). We used to hardcode 480x240
+ * (the emulator's geometry); if the real panel's OSD is taller, a 240-row clear
+ * leaves the loader's screen showing below it (the "white line 2/3 down"). */
+static int g_osd_w = OSD_W, g_osd_h = OSD_H;
+static int g_cols  = OSD_W / 8, g_rows = OSD_H / 8;
+
 /* Disable the hardware watchdog (clear SYSCFG1[28]). No PROC1/PROC2 key-lock is
  * needed: our AP owns the CPU and eCos/PROC2 are gone. Called first thing in the
  * app, and exposed as ct952.watchdog_off(). */
@@ -271,15 +278,16 @@ static void osd_glyph(int cx, int cy, uint8_t ch) {
     if (ch < 0x20 || ch > 0x7F) ch = 0x20;
     const uint8_t *g = font8x8[ch - 0x20];
     for (int row = 0; row < 8; row++) {
-        volatile uint8_t *p = g_osd_fb + (cy * 8 + row) * OSD_W + cx * 8;
+        volatile uint8_t *p = g_osd_fb + (cy * 8 + row) * g_osd_w + cx * 8;
         uint8_t bits = g[row];                    /* LSB = leftmost pixel */
         for (int b = 0; b < 8; b++)
             p[b] = (bits & (1u << b)) ? con_fg : con_bg;
     }
 }
 static void osd_scroll(void) {
-    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * OSD_W), (size_t)(OSD_H - 8) * OSD_W);
-    memset((void *)(g_osd_fb + (OSD_H - 8) * OSD_W), con_bg, 8 * OSD_W);
+    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * g_osd_w),
+            (size_t)(g_osd_h - 8) * g_osd_w);
+    memset((void *)(g_osd_fb + (g_osd_h - 8) * g_osd_w), con_bg, 8 * g_osd_w);
 }
 static void osd_putc(char c) {
     if (c == '\n')      { con_col = 0; con_row++; }
@@ -287,12 +295,12 @@ static void osd_putc(char c) {
     else if (c == '\b') { if (con_col > 0) { con_col--; osd_glyph(con_col, con_row, ' '); } }
     else if (c == '\t') { con_col = (con_col + 4) & ~3; }
     else {
-        if (con_col >= CON_COLS) { con_col = 0; con_row++; }
-        if (con_row >= CON_ROWS) { osd_scroll(); con_row = CON_ROWS - 1; }
+        if (con_col >= g_cols) { con_col = 0; con_row++; }
+        if (con_row >= g_rows) { osd_scroll(); con_row = g_rows - 1; }
         osd_glyph(con_col, con_row, (uint8_t)c);
         con_col++;
     }
-    if (con_row >= CON_ROWS) { osd_scroll(); con_row = CON_ROWS - 1; }
+    if (con_row >= g_rows) { osd_scroll(); con_row = g_rows - 1; }
 }
 /* external: called from uart_core.c so print()/REPL echo appear on screen */
 void ct952_console_write(const char *s, unsigned int len) {
@@ -303,6 +311,23 @@ void ct952_console_write(const char *s, unsigned int len) {
 /* palette + clear + enable the plane + turn the console on */
 static void console_setup(void) {
     ct952_watchdog_off();                         /* belt-and-suspenders: no reset */
+
+    /* Adopt the panel's REAL OSD geometry from REG_DISP_OSD_SIZE, which the AP
+     * loader programmed for THIS display (value = enable(bit28)|(h<<16)|w). We
+     * used to hardcode 480x240; if the panel is taller, a 240-row clear leaves
+     * the loader's screen visible below it. Validate to sane ranges, else keep
+     * the default. */
+    {
+        uint32_t sz = REG_OSD_SIZE;
+        int w = (int)(sz & 0x7FF);                /* OSD width  */
+        int h = (int)((sz >> 16) & 0x7FF);        /* OSD height */
+        if (w >= 64 && w <= 1024 && h >= 64 && h <= 768) {
+            g_osd_w = w; g_osd_h = h;
+        }
+        g_cols = g_osd_w / 8;
+        g_rows = g_osd_h / 8;
+    }
+
     /* Resolve the LIVE OSD framebuffer: draw where the display DMA is actually
      * scanning (REG_MCU_VCR20), which the AP loader set to its "Loading" buffer.
      * Writing to our own fixed 0x4005F000 leaves the panel showing the loader's
@@ -310,29 +335,50 @@ static void console_setup(void) {
      * point the channel at it ourselves. */
     {
         uint32_t base = REG_MCU_VCR20;
-        if (base < DRAM_BASE || base + (uint32_t)(OSD_W * OSD_H) > DRAM_TOP) {
+        uint32_t bytes = (uint32_t)(g_osd_w * g_osd_h);
+        if (base < DRAM_BASE || base + bytes > DRAM_TOP) {
             base = OSD_FB_ADDR;
             REG_MCU_VCR20 = base;
             REG_MCU_VCR21 = base;
         }
         g_osd_fb = (volatile uint8_t *)(uintptr_t)base;
+        /* Safety clamp: never let the framebuffer (base + w*h) run into our own
+         * code/data at 0x400c0000 (or past DRAM). Shrink the height if a bogus
+         * geometry read would overrun. */
+        {
+            uint32_t ceil = base < 0x400c0000u ? 0x400c0000u : DRAM_TOP;
+            int maxrows = (int)((ceil - base) / (uint32_t)g_osd_w);
+            if (g_osd_h > maxrows) g_osd_h = maxrows;
+            g_rows = g_osd_h / 8;
+        }
     }
     /* OSD palette entries carry the mix_en attribute in bit24 (ctkav: the DISP
      * blends the OSD onto the output only when set); without it the pixel is
      * transparent and the text is invisible. Set bit24 on both entries. */
     GAM_OSD[con_bg] = 0x01000000;                 /* background: opaque black */
     GAM_OSD[con_fg] = 0x01FFFFFF;                 /* text: opaque white       */
-    for (int i = 0; i < OSD_W * OSD_H; i++) g_osd_fb[i] = con_bg;
+    for (int i = 0; i < g_osd_w * g_osd_h; i++) g_osd_fb[i] = con_bg;   /* FULL clear */
     con_col = con_row = 0;
     con_on = 1;
-    REG_OSD_POS = 0;
-    REG_OSD_SIZE = DISP_OSD_EN | ((uint32_t)OSD_H << 16) | (uint32_t)OSD_W;
     osd_flush();                                  /* the cleared plane must reach DRAM */
+
+    /* Self-test banner drawn DIRECTLY (not via MicroPython's print path): if the
+     * panel already shows these lines, the console + geometry are correct and any
+     * remaining problem is in the interpreter, not the display. */
+    {
+        static const char probe[] =
+            "CT952 ON-SCREEN CONSOLE OK\n"
+            "geometry resolved from REG_DISP_OSD_SIZE\n"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789\n"
+            "MicroPython REPL follows...\n";
+        for (const char *p = probe; *p; p++) osd_putc(*p);
+        osd_flush();
+    }
 }
 
 // cls() -- clear the screen and home the cursor.
 static mp_obj_t ct952_cls(void) {
-    for (int i = 0; i < OSD_W * OSD_H; i++) g_osd_fb[i] = con_bg;
+    for (int i = 0; i < g_osd_w * g_osd_h; i++) g_osd_fb[i] = con_bg;
     con_col = con_row = 0;
     osd_flush();
     return mp_const_none;

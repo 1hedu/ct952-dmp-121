@@ -52,13 +52,11 @@
  * is valid while ag_width <= 61 (op width up to ~244 px). Wider ops are tiled. */
 #define GPU_MAX_OPW   240
 
-// init() -- clear the framebuffer, set the window, and enable the plane.
+// init() -- enable the OSD plane and bring up the on-screen text console, so
+// print()/REPL output goes to the frame's screen. Forward-declared below.
+static void console_setup(void);
 static mp_obj_t ct952_init(void) {
-    for (int i = 0; i < OSD_W * OSD_H; i++) {
-        OSD_FB[i] = 0;
-    }
-    REG_OSD_POS = 0;
-    REG_OSD_SIZE = DISP_OSD_EN | ((uint32_t)OSD_H << 16) | (uint32_t)OSD_W;
+    console_setup();          /* palette + clear + enable plane + console on */
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(ct952_init_obj, ct952_init);
@@ -207,6 +205,67 @@ static const uint8_t font8x8[96][8] = {
 static uint8_t g_glyphtab[96 * 32];   /* DRAM (.bss): 8 rows x 4 bytes/glyph */
 static int g_glyphtab_ready;
 
+/* ---- on-screen text console (software 8x8 blit into the OSD plane) ----------
+ * Routes MicroPython stdout (print output + REPL echo) to the frame's SCREEN, so
+ * the REPL is usable with no serial cable -- a real on-device terminal. Cursor +
+ * scroll; fg/bg are palette indices set up by console_setup(). uart_core.c's
+ * mp_hal_stdout_tx_strn calls ct952_console_write() so every byte also lands here. */
+#define CON_COLS (OSD_W / 8)          /* 60 columns */
+#define CON_ROWS (OSD_H / 8)          /* 30 rows    */
+static int con_col, con_row, con_on;
+static uint8_t con_fg = 0x0F, con_bg = 0x00;
+
+static void osd_glyph(int cx, int cy, uint8_t ch) {
+    if (ch < 0x20 || ch > 0x7F) ch = 0x20;
+    const uint8_t *g = font8x8[ch - 0x20];
+    for (int row = 0; row < 8; row++) {
+        volatile uint8_t *p = OSD_FB + (cy * 8 + row) * OSD_W + cx * 8;
+        uint8_t bits = g[row];                    /* LSB = leftmost pixel */
+        for (int b = 0; b < 8; b++)
+            p[b] = (bits & (1u << b)) ? con_fg : con_bg;
+    }
+}
+static void osd_scroll(void) {
+    memmove((void *)OSD_FB, (void *)(OSD_FB + 8 * OSD_W), (size_t)(OSD_H - 8) * OSD_W);
+    memset((void *)(OSD_FB + (OSD_H - 8) * OSD_W), con_bg, 8 * OSD_W);
+}
+static void osd_putc(char c) {
+    if (c == '\n')      { con_col = 0; con_row++; }
+    else if (c == '\r') { con_col = 0; }
+    else if (c == '\b') { if (con_col > 0) { con_col--; osd_glyph(con_col, con_row, ' '); } }
+    else if (c == '\t') { con_col = (con_col + 4) & ~3; }
+    else {
+        if (con_col >= CON_COLS) { con_col = 0; con_row++; }
+        if (con_row >= CON_ROWS) { osd_scroll(); con_row = CON_ROWS - 1; }
+        osd_glyph(con_col, con_row, (uint8_t)c);
+        con_col++;
+    }
+    if (con_row >= CON_ROWS) { osd_scroll(); con_row = CON_ROWS - 1; }
+}
+/* external: called from uart_core.c so print()/REPL echo appear on screen */
+void ct952_console_write(const char *s, unsigned int len) {
+    if (!con_on) return;
+    for (unsigned int i = 0; i < len; i++) osd_putc(s[i]);
+}
+/* palette + clear + enable the plane + turn the console on */
+static void console_setup(void) {
+    GAM_OSD[con_bg] = 0x00000000;                 /* background: black */
+    GAM_OSD[con_fg] = 0x00FFFFFF;                 /* text: white       */
+    for (int i = 0; i < OSD_W * OSD_H; i++) OSD_FB[i] = con_bg;
+    con_col = con_row = 0;
+    con_on = 1;
+    REG_OSD_POS = 0;
+    REG_OSD_SIZE = DISP_OSD_EN | ((uint32_t)OSD_H << 16) | (uint32_t)OSD_W;
+}
+
+// cls() -- clear the screen and home the cursor.
+static mp_obj_t ct952_cls(void) {
+    for (int i = 0; i < OSD_W * OSD_H; i++) OSD_FB[i] = con_bg;
+    con_col = con_row = 0;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(ct952_cls_obj, ct952_cls);
+
 static uint8_t bitrev8(uint8_t b) {
     b = (uint8_t)((b >> 4) | (b << 4));
     b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
@@ -337,6 +396,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ct952_call_obj, 1, 5, ct952_call);
 static mp_obj_t ct952_resume(void) {
     *(volatile uint32_t *)0x80007FE8u = 0x0C0FFEE0u;
     for (;;) { }   // spin until the emulator restores the firmware context
+    return mp_const_none;   // unreachable; satisfies -Werror=return-type
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(ct952_resume_obj, ct952_resume);
 
@@ -426,6 +486,7 @@ static const mp_rom_map_elem_t ct952_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_WIDTH), MP_ROM_INT(OSD_W) },
     { MP_ROM_QSTR(MP_QSTR_HEIGHT), MP_ROM_INT(OSD_H) },
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&ct952_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cls), MP_ROM_PTR(&ct952_cls_obj) },
     { MP_ROM_QSTR(MP_QSTR_palette), MP_ROM_PTR(&ct952_palette_obj) },
     { MP_ROM_QSTR(MP_QSTR_pixel), MP_ROM_PTR(&ct952_pixel_obj) },
     { MP_ROM_QSTR(MP_QSTR_fill), MP_ROM_PTR(&ct952_fill_obj) },

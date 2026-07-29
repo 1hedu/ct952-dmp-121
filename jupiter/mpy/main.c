@@ -105,8 +105,14 @@ int pyapp_main(void) {
     mp_init();
 
     #if MICROPY_ENABLE_COMPILER
-    // Bind the hardware module up front (ct952.peek32/poke32/call).
-    do_str("import ct952", MP_PARSE_FILE_INPUT);
+    // Bind the hardware module and bring up the ON-SCREEN console, so the REPL is
+    // visible on the frame's display (no serial cable needed). After ct952.init()
+    // every print()/REPL byte is mirrored to the OSD plane.
+    do_str("import ct952\n"
+           "ct952.init()\n"
+           "print('MicroPython on the CT952 frame -- ct952.peek32/poke32/call ready')\n"
+           "print('OSD console', ct952.WIDTH, 'x', ct952.HEIGHT, '  >>>')\n",
+           MP_PARSE_FILE_INPUT);
 
     // An experiment script staged by the emulator (CT952_PYAPP_SCRIPT) at
     // 0x40740000 with a "PYSC" header runs non-interactively -- used by the

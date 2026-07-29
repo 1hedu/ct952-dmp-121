@@ -29,10 +29,15 @@ int mp_hal_stdin_rx_chr(void) {
     }
 }
 
-// Send string of given length.
+/* On-screen text console (modct952.c): mirrors stdout to the OSD plane so the
+ * REPL is visible on the frame with no serial cable. Inert until ct952.init(). */
+extern void ct952_console_write(const char *str, unsigned int len);
+
+// Send string of given length: to UART1 AND to the on-screen console.
 mp_uint_t mp_hal_stdout_tx_strn(const char *str, mp_uint_t len) {
     for (mp_uint_t i = 0; i < len; i++) {
         UART1_DATA = (uint8_t)str[i];
     }
+    ct952_console_write(str, (unsigned int)len);
     return len;
 }

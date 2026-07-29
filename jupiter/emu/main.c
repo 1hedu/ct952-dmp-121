@@ -465,6 +465,9 @@ int main(int argc, char **argv)
             uint8_t *src = machine_dram_ptr(m, 0x4009a210u);
             uint8_t *dst = machine_dram_ptr(m, 0x40000800u);
             int k; uint64_t ran;
+            uint64_t apbudget = 600000000ull;           /* enough for the full 22-sector image */
+            const char *be = getenv("CT952_APLOAD_BUDGET");
+            if (be && *be) apbudget = strtoull(be, NULL, 0);
             for (k = 0; k < 32; k++) {                  /* ROMLD_MoveSectionTable */
                 uint8_t *se = src + k*24, *de = dst + k*24;
                 uint32_t rma;
@@ -479,7 +482,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "[apload] calling REAL ROMLD_BOOT_LoadSectionAndRun(0x4bc)"
                     "(tbl=0x40000800, unzip=0x%08x, sp=0x%08x)\n", unzip, ap_sp);
             ran = (uint64_t)machine_call(m, 0x4bcu, 0x40000800u, unzip, ap_sp,
-                                         ap_sp, 600000000ull);
+                                         ap_sp, apbudget);
             fprintf(stderr, "[apload] returned (rc as icount unused); stopped: %s (pc=0x%08x); "
                     "SPI ops: %llu erase, %llu program\n",
                     m->cpu.halted ? m->cpu.halt_reason : "budget/return", m->cpu.pc,
@@ -491,6 +494,17 @@ int main(int argc, char **argv)
             FILE *ff = fopen(flashout_path, "wb");
             if (ff) { fwrite(m->flash, 1, m->flash_size, ff); fclose(ff);
                 fprintf(stderr, "[apload] dumped flash to %s\n", flashout_path); }
+        }
+        /* For a run-AP (e.g. MicroPython via mkrunap) the payload draws to the
+         * OSD plane and then spins in its REPL -- scan out the frame so the
+         * on-screen console is captured. */
+        if (fb_path) {
+            int r = machine_disp_scanout(m, fb_addr, fb_w, fb_h, fb_stride, fb_path);
+            if (r < 0)
+                fprintf(stderr, "[apload] fb scanout FAILED\n");
+            else
+                fprintf(stderr, "[apload] wrote %s (%ux%u, OSD %s @ 0x%08x)\n",
+                        fb_path, fb_w, fb_h, r == 0 ? "enabled" : "DISABLED", fb_addr);
         }
         machine_free(m); free(m);
         return 0;

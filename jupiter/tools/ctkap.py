@@ -126,6 +126,7 @@ SEC_TBL_OFF  = AP_HDR_LEN + AP_IMG_HDR              # 0x210 (file offset of the 
 CONTENT_OFF  = SEC_TBL_OFF + NSEC * SEC_ENTRY       # 0x510 (sections start after 32 entries)
 FLSH_LMA     = 0x40500000       # runtime-free high DRAM; flasher app runs here
 FLSH_AP_SP   = 0x405f0000       # dwAP_SP for the loaded AP (below IMAG_LMA_BASE)
+RUN_AP_SP    = 0x407f0000       # dwAP_SP for a run-AP (transient; start_app.S sets its own)
 IMAG_LMA_BASE= 0x40600000       # decompressed --image section(s) land here
 FLSH_UNZIP_BUF = 0x40780000     # dwAP_UNZIP_BUF: UZIP work buffer for section decompression
 SEC_FLAG_LOAD, SEC_FLAG_PROGENTRY, SEC_FLAG_ZIP = 1, 2, 4
@@ -431,6 +432,40 @@ def cmd_mksectionap(out_path, writes, images, code=0x41, stub_path=None):
     print("  run through the real loader:  ct952emu dp700wd.bin --rom-load --apload %s" % out_path)
     return 0
 
+def cmd_mkrunap(out_path, payload_path, lma=FLSH_LMA, code=0x41):
+    """Build a NON-DESTRUCTIVE run-AP: a section-table AP whose single ProgEntry
+    section IS the payload (e.g. MicroPython), UZIP-compressed. The on-device
+    loader decompresses it to `lma` and jumps in -- it RUNS from DRAM and writes
+    NOTHING to flash, so it's brick-safe and a reboot restores stock firmware.
+    The payload must have its entry at offset 0 of `lma` (start_app.S does)."""
+    data = open(payload_path, "rb").read()
+    comp = uzip_compress(data)
+    zipped = len(comp) < len(data)
+    blob = comp if zipped else data
+    flags = SEC_FLAG_LOAD | SEC_FLAG_PROGENTRY | (SEC_FLAG_ZIP if zipped else 0)
+    rma = CONTENT_OFF - AP_HDR_LEN                     # image-relative (loader adds pSecTbl-0x10)
+    sectbl = bytearray(NSEC * SEC_ENTRY)
+    struct.pack_into(">IIIIII", sectbl, 0,
+                     0x4d505920,                        # 'MPY '
+                     lma, rma, len(data), len(blob), (sum16(data) << 16) | flags)
+    d = bytearray(AP_HDR_LEN + AP_IMG_HDR + NSEC * SEC_ENTRY)
+    d[SEC_TBL_OFF:SEC_TBL_OFF + len(sectbl)] = sectbl
+    d += blob
+    d = _ap_finalize(d, code, RUN_AP_SP)
+    struct.pack_into(">I", d, OFF_UNZIP, FLSH_UNZIP_BUF)
+    if len(d) > AP_MAX_SIZE:
+        print("WARNING: AP size 0x%x exceeds reserved 0x%x -- the loader will refuse it"
+              % (len(d), AP_MAX_SIZE))
+    open(out_path, "wb").write(d)
+    print("mkrunap: wrote %s (0x%x bytes, chip=0x%x, dwAP_SP=0x%08x, dwCheckSum=0x%04x)"
+          % (out_path, len(d), code, RUN_AP_SP, be16(d, OFF_CKSUM)))
+    print("  sec[0] MPY  lma=0x%08x rma=0x%06x lsz=0x%x rsz=0x%x flags=%s"
+          % (lma, rma, len(data), len(blob),
+             "Load|ProgEntry" + ("|ZIP" if zipped else "")))
+    print("  NON-DESTRUCTIVE: runs from DRAM, writes no flash. Verify:")
+    print("    ct952emu dp700wd.bin --rom-load --apload %s" % out_path)
+    return 0
+
 def main(argv):
     if len(argv) < 3:
         print(__doc__); return 2
@@ -445,6 +480,17 @@ def main(argv):
         if "--code" in rest:
             code = int(rest[rest.index("--code")+1], 0); rest = rest[:rest.index("--code")]
         return cmd_apwrap(rest[0], rest[1], code)
+    if cmd == "mkrunap":
+        code, lma, args = 0x41, FLSH_LMA, []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--code": code = int(rest[i+1], 0); i += 2
+            elif rest[i] == "--lma": lma = int(rest[i+1], 0); i += 2
+            else: args.append(rest[i]); i += 1
+        if len(args) < 2:
+            print("usage: mkrunap <out.AP> <payload.bin> [--lma 0x40500000] [--code 0x41]")
+            return 2
+        return cmd_mkrunap(args[0], args[1], lma, code)
     if cmd == "mkflasher":
         code, stub, writes, out = 0x41, None, [], None
         i = 0

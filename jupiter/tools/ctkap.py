@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 """
 ctkap.py -- CheerTek CT909/CT952A flash-image + UPG952A.AP tool.
 
@@ -445,7 +446,7 @@ def cmd_mkrunap(out_path, payload_path, lma=FLSH_LMA, code=0x41):
     The payload must have its entry at offset 0 of `lma` (start_app.S does)."""
     data = open(payload_path, "rb").read()
     comp = uzip_compress(data)
-    zipped = len(comp) < len(data)
+    zipped = len(comp) < len(data) and not os.environ.get("CTKAP_NOZIP")
     blob = comp if zipped else data
     flags = SEC_FLAG_LOAD | SEC_FLAG_PROGENTRY | (SEC_FLAG_ZIP if zipped else 0)
     rma = CONTENT_OFF - AP_HDR_LEN                     # image-relative (loader adds pSecTbl-0x10)

@@ -6423,3 +6423,22 @@ and identifies the pitch in a single flash. Candidates: 308, 320, 336, 344, 352,
 360/384 -- in each case exactly the matching zone renders a straight column at
 x=120. (Note: zone boundaries do not align to row boundaries, so a single
 boundary row can carry a neighbouring zone's mark; ignore one stray.)
+
+**Pitch sweep pass 1 result: NEGATIVE, and it bounds the answer.** No zone in the
+308..384 sweep produced a vertical column on hardware, so the true line pitch is
+**below 308**. The same photo also yields an independent estimate: the 24024-byte
+region renders over ~83 panel lines (panel interior ~960 photo px for 234 lines =>
+4.10 px/line; the top copy's content spans ~340 px), so
+
+    pitch ~= 24024 / 83 ~= 290 bytes
+
+Note 290 is nowhere near 360 (the 720px-window hypothesis) and not 308 either, so
+BOTH earlier hypotheses are dead. 480 px * 4bpp = 240 B (the panel width) is also
+excluded by this estimate.
+
+Pass 2 sweeps 276..304 in 4-byte steps, and improves the readout: marks are 24 B
+(48 px) wide, so at the true pitch consecutive marks ABUT into a solid vertical
+bar, while any other pitch breaks into a visible staircase -- much easier to judge
+than a column of thin dashes. Verified in the emulator against synthetic pitches
+288 and 292: only the matching zone renders a solid bar (1 distinct left edge; all
+others 8-10).

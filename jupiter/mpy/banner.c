@@ -39,7 +39,13 @@
 
 /* candidate row pitches in bytes, low -> high, one per zone (top -> bottom).
  * 308 = region width at 4bpp; 360 = 720px window at 4bpp; the rest bracket them. */
-static const uint16_t P[NZONE] = { 308, 320, 336, 344, 352, 360, 368, 384 };
+/* Pass 2. Pass 1 swept 308..384 and NO zone lined up, and the photo's content
+ * height (24024 B rendered over ~83 panel lines) implies a pitch near 290 -- i.e.
+ * the whole first sweep sat ABOVE the true value. This sweep brackets 290 in
+ * 4-byte steps. Marks are also 24 B (48 px) wide now, so a correct candidate
+ * renders as a SOLID VERTICAL BAR (consecutive marks abut) while a wrong one
+ * breaks into a staircase -- far easier to judge than aligned thin dashes. */
+static const uint16_t P[NZONE] = { 276, 280, 284, 288, 292, 296, 300, 304 };
 
 static volatile uint8_t *const FB = (volatile uint8_t *)APBASE;
 
@@ -73,10 +79,11 @@ int pyapp_main(void){
          * for some candidates lands past the visible edge and the straight line
          * would be invisible even when the candidate is right. */
         rem   = start % P[k];
-        delta = (60u + P[k] - rem) % P[k];
+        delta = (40u + P[k] - rem) % P[k];
         start += delta;
         for (uint32_t off = start; off < z + ZONE; off += P[k])
-            fill_bytes(off, 8u, IDX_MARK);  /* 8 bytes = 16 px wide mark */
+            fill_bytes(off, 24u, IDX_MARK); /* 24 B = 48 px: abuts into a SOLID
+                                            * vertical bar at the true pitch */
     }
 
     flush();

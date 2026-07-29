@@ -24,6 +24,38 @@
 /* I/O register access (peripheral space at 0x80000000). */
 #define IOREG(off)    (*(volatile uint32_t *)(0x80000000u + (off)))
 
+/* Platform registers needed to survive on REAL silicon (the emulator hides
+ * these -- see ctkav_platform.h / hsystem.c):
+ *   - REG_PLAT_SYSTEM_CONFIGURATION1 bit28 gates the hardware WATCHDOG. A normal
+ *     upgrade-AP flashes and reboots within the watchdog window; our run-AP takes
+ *     the CPU bare-metal and never pets it, so the SoC resets ~a fraction of a
+ *     second in -> boot loop. We clear the bit to disable the watchdog outright.
+ *   - The PROC1 D-cache is copy-back; CPU writes to the OSD framebuffer sit in
+ *     cache and never reach the display DMA until flushed. HAL flushes via
+ *     REG_PLAT_CACHE_CONTROL (PLAT_PROC1_DCACHE_FLUSH). */
+#define REG_PLAT_SYSCFG1      (*(volatile uint32_t *)0x8000031Cu)
+#define WDOG_ENABLE_BIT       0x10000000u   /* SYSCFG1[28] = watchdog enable      */
+#define REG_PLAT_CACHE_CTRL   (*(volatile uint32_t *)0x80000014u)
+#define CACHE_FLUSH_DCACHE    0x00400000u
+#define CACHE_DCACHE_PWRSAVE  0x00040000u
+
+/* Disable the hardware watchdog (clear SYSCFG1[28]). No PROC1/PROC2 key-lock is
+ * needed: our AP owns the CPU and eCos/PROC2 are gone. Called first thing in the
+ * app, and exposed as ct952.watchdog_off(). */
+void ct952_watchdog_off(void) {
+    REG_PLAT_SYSCFG1 &= ~WDOG_ENABLE_BIT;
+}
+
+/* Flush the PROC1 D-cache so CPU writes to the OSD plane become visible to the
+ * display DMA (replicates PLAT_PROC1_DCACHE_FLUSH: drop power-saving, raise the
+ * flush bit, idle >=128 cycles for the 2KB/16B-line cache, restore power-saving). */
+static void osd_flush(void) {
+    REG_PLAT_CACHE_CTRL &= ~CACHE_DCACHE_PWRSAVE;
+    REG_PLAT_CACHE_CTRL |= CACHE_FLUSH_DCACHE;
+    for (volatile int i = 0; i < 256; i++) { __asm__ __volatile__("nop"); }
+    REG_PLAT_CACHE_CTRL |= CACHE_DCACHE_PWRSAVE;
+}
+
 /* GPU 2-D engine (ctkav_gpu.h offsets), shared JPU/GPU block at 0x2880. The
  * emulator's gpu_exec() runs fill-rectangle and 1-bit font expansion into the
  * OSD plane; the JPU path decodes a staged JPEG to the video plane. */
@@ -76,6 +108,7 @@ static mp_obj_t ct952_pixel(mp_obj_t x_in, mp_obj_t y_in, mp_obj_t idx_in) {
     mp_int_t y = mp_obj_get_int(y_in);
     if (x >= 0 && x < OSD_W && y >= 0 && y < OSD_H) {
         OSD_FB[y * OSD_W + x] = (uint8_t)mp_obj_get_int(idx_in);
+        osd_flush();
     }
     return mp_const_none;
 }
@@ -87,6 +120,7 @@ static mp_obj_t ct952_fill(mp_obj_t idx_in) {
     for (int i = 0; i < OSD_W * OSD_H; i++) {
         OSD_FB[i] = v;
     }
+    osd_flush();
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(ct952_fill_obj, ct952_fill);
@@ -108,6 +142,7 @@ static mp_obj_t ct952_rect(size_t n_args, const mp_obj_t *args) {
             row[xx] = idx;
         }
     }
+    osd_flush();
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ct952_rect_obj, 5, 5, ct952_rect);
@@ -246,9 +281,11 @@ static void osd_putc(char c) {
 void ct952_console_write(const char *s, unsigned int len) {
     if (!con_on) return;
     for (unsigned int i = 0; i < len; i++) osd_putc(s[i]);
+    osd_flush();   /* push the glyphs from the D-cache to DRAM so the panel updates */
 }
 /* palette + clear + enable the plane + turn the console on */
 static void console_setup(void) {
+    ct952_watchdog_off();                         /* belt-and-suspenders: no reset */
     GAM_OSD[con_bg] = 0x00000000;                 /* background: black */
     GAM_OSD[con_fg] = 0x00FFFFFF;                 /* text: white       */
     for (int i = 0; i < OSD_W * OSD_H; i++) OSD_FB[i] = con_bg;
@@ -256,14 +293,30 @@ static void console_setup(void) {
     con_on = 1;
     REG_OSD_POS = 0;
     REG_OSD_SIZE = DISP_OSD_EN | ((uint32_t)OSD_H << 16) | (uint32_t)OSD_W;
+    osd_flush();                                  /* the cleared plane must reach DRAM */
 }
 
 // cls() -- clear the screen and home the cursor.
 static mp_obj_t ct952_cls(void) {
     for (int i = 0; i < OSD_W * OSD_H; i++) OSD_FB[i] = con_bg;
     con_col = con_row = 0;
+    osd_flush();
     return mp_const_none;
 }
+
+// watchdog_off() -- disable the hardware watchdog (exposed for manual use).
+static mp_obj_t ct952_watchdog_off_py(void) {
+    ct952_watchdog_off();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(ct952_watchdog_off_obj, ct952_watchdog_off_py);
+
+// flush() -- flush the D-cache so CPU-drawn pixels reach the panel.
+static mp_obj_t ct952_flush_py(void) {
+    osd_flush();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(ct952_flush_obj, ct952_flush_py);
 static MP_DEFINE_CONST_FUN_OBJ_0(ct952_cls_obj, ct952_cls);
 
 static uint8_t bitrev8(uint8_t b) {
@@ -487,6 +540,8 @@ static const mp_rom_map_elem_t ct952_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_HEIGHT), MP_ROM_INT(OSD_H) },
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&ct952_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_cls), MP_ROM_PTR(&ct952_cls_obj) },
+    { MP_ROM_QSTR(MP_QSTR_watchdog_off), MP_ROM_PTR(&ct952_watchdog_off_obj) },
+    { MP_ROM_QSTR(MP_QSTR_flush), MP_ROM_PTR(&ct952_flush_obj) },
     { MP_ROM_QSTR(MP_QSTR_palette), MP_ROM_PTR(&ct952_palette_obj) },
     { MP_ROM_QSTR(MP_QSTR_pixel), MP_ROM_PTR(&ct952_pixel_obj) },
     { MP_ROM_QSTR(MP_QSTR_fill), MP_ROM_PTR(&ct952_fill_obj) },

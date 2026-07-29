@@ -58,6 +58,15 @@ _app_init:
         set     _tt, %g1
         wr      %g1, %tbr
         T_NOP
+        /* Kill the hardware watchdog IMMEDIATELY: SYSCFG1 (0x8000031C) &= ~(1<<28).
+         * The AP loader leaves it armed; a bare-metal takeover that never pets it
+         * gets reset a fraction of a second in -> boot loop. Do this before the
+         * (large) .bss zero below so no long op runs under an armed watchdog. */
+        set     0x8000031C, %g1
+        ld      [%g1], %g2
+        sethi   %hi(0x10000000), %g3
+        andn    %g2, %g3, %g2
+        st      %g2, [%g1]
         /* fresh stack at the top of the payload window */
         set     _stack_top, %sp
         clr     %fp

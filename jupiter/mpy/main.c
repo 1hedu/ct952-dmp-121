@@ -46,6 +46,10 @@ static const char *startup_script =
 // EHCI port 0 so the REPL below can read from it. Returns 1 if one attached.
 extern int usb_kbd_bringup(void);
 
+// Disable the hardware watchdog (modct952.c) -- must run before mp_init on real
+// silicon, or the SoC resets us mid-boot.
+extern void ct952_watchdog_off(void);
+
 // Entry from start.S (after .data copy / .bss zero / stack set up).
 int mpy_main(void) {
     int stack_dummy;
@@ -96,6 +100,13 @@ int mpy_main(void) {
 int pyapp_main(void) {
     int stack_dummy;
     stack_top = (char *)&stack_dummy;
+
+    /* FIRST: kill the hardware watchdog. On real silicon the AP loader leaves it
+     * armed (a normal upgrade-AP flashes and reboots within its window); our
+     * bare-metal takeover never pets it, so the SoC resets a fraction of a second
+     * in -> boot loop. Disable it before anything slow (mp_init / GC). The
+     * emulator has no watchdog on this path, which is why it never showed up. */
+    ct952_watchdog_off();
 
     mp_hal_stdout_tx_strn("\n[pyapp] MicroPython launched inside the firmware\n", 49);
 

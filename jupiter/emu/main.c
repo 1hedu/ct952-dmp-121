@@ -506,6 +506,19 @@ int main(int argc, char **argv)
                 fprintf(stderr, "[apload] wrote %s (%ux%u, OSD %s @ 0x%08x)\n",
                         fb_path, fb_w, fb_h, r == 0 ? "enabled" : "DISABLED", fb_addr);
         }
+        if (getenv("CT952_DUMP_OSD")) {
+            fprintf(stderr, "[OSD-CHAN] 21c0=0x%08x 2440=0x%08x 2444=0x%08x 2448=0x%08x "
+                    "244c=0x%08x 2450=0x%08x 2454=0x%08x 2458=0x%08x 245c=0x%08x 2460=0x%08x\n",
+                    machine_io_get(m,0x21c0), machine_io_get(m,0x2440), machine_io_get(m,0x2444),
+                    machine_io_get(m,0x2448), machine_io_get(m,0x244c), machine_io_get(m,0x2450),
+                    machine_io_get(m,0x2454), machine_io_get(m,0x2458), machine_io_get(m,0x245c),
+                    machine_io_get(m,0x2460));
+            fprintf(stderr, "[OSD-REGS] OSD_POS=0x%08x OSD_SIZE=0x%08x OSD_CR=0x%08x OSD_CR1=0x%08x "
+                    "VSCALE=0x%08x SYNC_WH=0x%08x TGEN=0x%08x NLREP=0x%08x\n",
+                    machine_io_get(m,0x1A50), machine_io_get(m,0x1A54), machine_io_get(m,0x1A58),
+                    machine_io_get(m,0x1A5C), machine_io_get(m,0x1A1C), machine_io_get(m,0x1A3C),
+                    machine_io_get(m,0x1A38), machine_io_get(m,0x1A64));
+        }
         machine_free(m); free(m);
         return 0;
     }
@@ -596,6 +609,23 @@ int main(int argc, char **argv)
         for (i = 0; i < 16; i++)
             fprintf(stderr, "[OSD-REGS] GAM_OSD[%2d]=0x%08x\n",
                     i, machine_io_get(m, 0x1C00 + (uint32_t)i * 4));
+        /* OSD read-channel block @0x80002400 (DISP_OSDSet writes base to 0x2450) */
+        fprintf(stderr, "[OSD-CHAN] 21c0=0x%08x  2440=0x%08x 2444=0x%08x 2448=0x%08x "
+                "244c=0x%08x 2450=0x%08x 2454=0x%08x 2458=0x%08x 245c=0x%08x\n",
+                machine_io_get(m, 0x21c0), machine_io_get(m, 0x2440),
+                machine_io_get(m, 0x2444), machine_io_get(m, 0x2448),
+                machine_io_get(m, 0x244c), machine_io_get(m, 0x2450),
+                machine_io_get(m, 0x2454), machine_io_get(m, 0x2458),
+                machine_io_get(m, 0x245c));
+        /* scan-mode / scaling / interlace DISP regs */
+        fprintf(stderr, "[OSD-SCAN] VSCALE(1A1C)=0x%08x HU(1A20)=0x%08x HD(1A24)=0x%08x "
+                "TGEN(1A38)=0x%08x SYNC_WH(1A3C)=0x%08x NLREP(1A64)=0x%08x "
+                "ODD0(1A8C)=0x%08x ODD1(1A90)=0x%08x VCR25(D94)=0x%08x\n",
+                machine_io_get(m, 0x1A1C), machine_io_get(m, 0x1A20),
+                machine_io_get(m, 0x1A24), machine_io_get(m, 0x1A38),
+                machine_io_get(m, 0x1A3C), machine_io_get(m, 0x1A64),
+                machine_io_get(m, 0x1A8C), machine_io_get(m, 0x1A90),
+                machine_io_get(m, 0xD94));
     }
 
     if (fb_path) {

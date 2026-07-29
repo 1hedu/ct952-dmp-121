@@ -1,15 +1,42 @@
-/* v4: bracket the stride ABOVE 360 (308->360 reduced the shear, so Sr>360).
- * Draw one labelled line per candidate stride {384,416,448,480,512}, each at a
- * FIXED small byte base (i*3600) inside the OSD region so nothing overflows/
- * faults. A line's glyphs are only crisp when its stride == the hardware pitch;
- * others shear. Tell me which S=NNN line is crispest. 4bpp @ 0x40084000. */
+/* On-screen banner -- display bring-up milestone 1 (no MicroPython, no keyboard).
+ *
+ * The SD-boot AP loader (aploader.c STEP2) reconfigures OSD region 0 to a
+ * 616x78, 4bpp (GDI_OSD_4B_MODE) plane at DS_OSDFRAME_ST_AP = 0x40084000, then
+ * jumps here. We INHERIT that exact environment:
+ *   - stride = wWidth >> bColorMode = 616 >> 1 = 308 bytes/row  (gdi.c _gdi_SetPixel)
+ *   - 2 px/byte, big-endian nibbles: even x = high nibble, odd x = low nibble
+ *   - region size = 308 * 78 = 24024 bytes (0x5DD8)
+ * The GDI writes the loader's own "Loading" text into this plane at stride 308,
+ * and the scanout reads it back at 308 -- so 308 is authoritative, not a guess.
+ *
+ * We set our own YUV palette (BT.601, 0x00YYUUVV, unlocked via BRIGHT_CR bit24),
+ * paint an opaque blue box over the whole region, and draw white text. If the
+ * panel shows a blue banner with legible white text, on-screen render works and
+ * the stride is correct -- the foundation the REPL console will build on. */
 #include <stdint.h>
-#define APBASE 0x40084000u
-#define REG_VCR20 (*(volatile uint32_t *)0x80000D80u)
-#define REG_OSDSZ (*(volatile uint32_t *)0x80001A54u)
-#define REG_CACHE (*(volatile uint32_t *)0x80000014u)
+
+#define APBASE      0x40084000u
+#define OSD_W       616
+#define OSD_H       78
+#define STRIDE      308               /* OSD_W >> 1 (4bpp)                     */
+#define REGION_END  (STRIDE*OSD_H)    /* 24024 = 0x5DD8; never write past this */
+
+#define REG_VCR20   (*(volatile uint32_t *)0x80000D80u)  /* OSD scanout base   */
+#define REG_VCR21   (*(volatile uint32_t *)0x80000D84u)
+#define REG_OSDSZ   (*(volatile uint32_t *)0x80001A54u)  /* bit28 = OSD enable */
+#define REG_BRIGHT  (*(volatile uint32_t *)0x80001A60u)  /* bit24 unlocks pal  */
+#define GAM_OSD     ((volatile uint32_t *)0x80001C00u)   /* palette RAM        */
+#define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
 #define REG_SYSCFG1 (*(volatile uint32_t *)0x8000031Cu)
-static volatile uint8_t *FB=(volatile uint8_t*)APBASE;
+
+/* palette indices */
+#define C_KEY   0   /* transparent color key (DISP_OSD_T_EN)                    */
+#define C_BG    1   /* opaque blue background box                              */
+#define C_TXT   2   /* white text                                             */
+#define C_HI    3   /* yellow highlight                                        */
+
+static volatile uint8_t *const FB = (volatile uint8_t *)APBASE;
+
 static const uint8_t font8x8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
     {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
@@ -61,33 +88,67 @@ static const uint8_t font8x8[96][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
 };
 
-static void flush(void){ REG_CACHE&=~0x00040000u; REG_CACHE|=0x00400000u;
-    for(volatile int i=0;i<256;i++)__asm__ __volatile__("nop"); REG_CACHE|=0x00040000u; }
-static void px(uint32_t base,int x,int y,int st,uint8_t c){
-    uint32_t off=base+(uint32_t)y*st+(x>>1);
-    if(off>=0x5A00u) return;                 /* hard cap inside the region */
-    volatile uint8_t *p=FB+off;
-    if(x&1) *p=(uint8_t)((*p&0xF0)|(c&0x0F));
-    else    *p=(uint8_t)((*p&0x0F)|((c&0x0F)<<4));
+static void flush(void){
+    REG_CACHE &= ~0x00040000u; REG_CACHE |= 0x00400000u;
+    for (volatile int i = 0; i < 256; i++) __asm__ __volatile__("nop");
+    REG_CACHE |= 0x00040000u;
 }
-static void glyph(uint32_t base,int cx,int cy,int st,uint8_t ch,uint8_t fg){
-    if(ch<0x20||ch>0x7F)ch=0x20; const uint8_t *g=font8x8[ch-0x20];
-    for(int r=0;r<8;r++){uint8_t b=g[r];for(int x=0;x<8;x++)if(b&(1u<<x))px(base,cx*8+x,cy*8+r,st,fg);}
+
+/* one 4bpp pixel; big-endian nibbles, hard-clamped inside the 616x78 region */
+static void px(int x, int y, uint8_t c){
+    if ((unsigned)x >= OSD_W || (unsigned)y >= OSD_H) return;
+    uint32_t off = (uint32_t)y * STRIDE + (x >> 1);
+    if (off >= REGION_END) return;
+    volatile uint8_t *p = FB + off;
+    if (x & 1) *p = (uint8_t)((*p & 0xF0) | (c & 0x0F));
+    else       *p = (uint8_t)((*p & 0x0F) | ((c & 0x0F) << 4));
 }
-static void draw(uint32_t base,int col,int cy,int st,const char *s,uint8_t fg){
-    for(int i=0;s[i];i++)glyph(base,col+i,cy,st,s[i],fg);
+
+static void fill(uint8_t c){
+    for (int y = 0; y < OSD_H; y++)
+        for (int x = 0; x < OSD_W; x++) px(x, y, c);
 }
+
+static void glyph(int px0, int py0, uint8_t ch, uint8_t fg){
+    if (ch < 0x20 || ch > 0x7F) ch = 0x20;
+    const uint8_t *g = font8x8[ch - 0x20];
+    for (int r = 0; r < 8; r++){
+        uint8_t b = g[r];
+        for (int x = 0; x < 8; x++) if (b & (1u << x)) px(px0 + x, py0 + r, fg);
+    }
+}
+
+/* text at pixel (px0,py0) so lines can be placed precisely inside 78 rows */
+static void text(int px0, int py0, const char *s, uint8_t fg){
+    for (int i = 0; s[i]; i++) glyph(px0 + i*8, py0, (uint8_t)s[i], fg);
+}
+
+static void set_pal(int idx, uint32_t yuv){ GAM_OSD[idx] = yuv; }
+
 int pyapp_main(void){
-    REG_SYSCFG1 &= ~0x10000000u; REG_VCR20=APBASE; REG_OSDSZ|=0x10000000u;
-    static const int st[5]={352,356,360,364,368};
-    static const char *lab[5]={
-        "S=352 CT952 stride ABCDEFG abc 0123",
-        "S=356 CT952 stride ABCDEFG abc 0123",
-        "S=360 CT952 stride ABCDEFG abc 0123",
-        "S=364 CT952 stride ABCDEFG abc 0123",
-        "S=368 CT952 stride ABCDEFG abc 0123"};
-    for(int i=0;i<5;i++) draw((uint32_t)i*3600u, 0, 0, st[i], lab[i], (uint8_t)(i+1));
+    REG_SYSCFG1 &= ~0x10000000u;              /* keep watchdog dead            */
+
+    /* palette: unlock RAM, then define our indices (BT.601 0x00YYUUVV) */
+    REG_BRIGHT |= 0x01000000u;
+    set_pal(C_KEY, 0x00108080u);              /* black (also the transparent key)*/
+    set_pal(C_BG,  0x002951EFu);              /* blue                          */
+    set_pal(C_TXT, 0x00EB8080u);              /* white                         */
+    set_pal(C_HI,  0x00E20095u);              /* yellow                        */
+
+    /* point scanout at our region and enable the OSD plane */
+    REG_VCR20 = APBASE;
+    REG_VCR21 = APBASE;
+    REG_OSDSZ |= 0x10000000u;
+
+    /* opaque blue box + white banner text (78 rows -> up to 9 lines of 8px) */
+    fill(C_BG);
+    text(8,  2,  "CT952A  ON-SCREEN  BANNER", C_HI);
+    text(8,  14, "4bpp OSD 616x78 @ 0x40084000  stride=308", C_TXT);
+    text(8,  26, "if you can read this, render + stride are", C_TXT);
+    text(8,  36, "correct -- on-panel output WORKS.", C_TXT);
+    text(8,  50, "next: MicroPython REPL -> this OSD console", C_TXT);
     flush();
-    for(;;){}
+
+    for (;;){}
     return 0;
 }

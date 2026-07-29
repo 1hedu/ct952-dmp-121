@@ -7,7 +7,7 @@ set -e
 CROSS=sparc64-linux-gnu-
 F="-m32 -mcpu=v8 -msoft-float -mno-app-regs -nostdlib -ffreestanding -fno-common"
 cd "$(dirname "$0")"
-${CROSS}gcc $F -c start_app.S -o /tmp/bstart.o
+${CROSS}gcc $F -c start_banner.S -o /tmp/bstart.o
 ${CROSS}gcc $F -Os -std=c99 -c banner.c -o /tmp/banner.o
 ${CROSS}gcc -m32 -mcpu=v8 -nostdlib -Wl,-N,--build-id=none,-T,ct952_app.ld \
     /tmp/bstart.o /tmp/banner.o -o /tmp/banner.elf

@@ -126,11 +126,13 @@ static void text(int px0, int py0, const char *s, uint8_t fg){
 }
 
 int pyapp_main(void){
-    REG_SYSCFG1 &= ~0x10000000u;
-    REG_VCR20 = APBASE;
-    REG_VCR21 = APBASE;
-    REG_OSDSZ |= 0x10000000u;
-
+    /* Touch NO display registers. The AP loader already configured OSD region 0
+     * (GDI_InitialRegion -> DISP_OSDSet, DISP block @0x80002xxx) pointing at
+     * 0x40084000 with the correct geometry/stride, and activated it. My earlier
+     * VCR20/OSDSZ pokes were emulator crutches (the emu doesn't run the loader's
+     * DISP setup) and on real silicon they CLOBBER that working config. So here
+     * we only write pixels at the loader's stride and let its scanout show them.
+     * (watchdog already disabled in start_banner.S; nothing else to set.) */
     fill(C_BG);                               /* solid yellow field            */
 
     /* full-height vertical lines: any slant => stride wrong, and the total

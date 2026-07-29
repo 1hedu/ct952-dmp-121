@@ -6199,3 +6199,51 @@ the firmware's DRAM state stays intact and inspectable from Python.
 2. `python3 jupiter/tools/ctkap.py apinfo UPG952A.AP`   (every field OK)
 3. copy UPG952A.AP to the ROOT of a FAT USB stick / SD card
 4. trigger the player's update mode -> MicroPython REPL over UART1 (no flash touched)
+
+---
+
+### 10.17 Bare-metal AP OSD bring-up — how a run-from-DRAM AP must (not) touch the display
+
+Context: getting a bare-metal AP (banner / MicroPython console) to render legibly
+on the REAL frame, loaded via the SD/USB AP-loader path (`--apload` / `UPG952A.AP`).
+Verified against `dp700wd.bin` by direct disassembly (symbol addresses from the
+DVD909-toolchain map are valid XIP offsets for this binary — the *chip* is 952A,
+the *build lineage* is DVD909; the addresses check out against the actual bytes).
+
+- **The AP loader configures + activates the OSD BEFORE jumping to the AP.**
+  `aploader.c` STEP2: `GDI_ConfigRegionInfo(0,&RegionInfo)` (wWidth=616, wHeight=78,
+  bColorMode=`GDI_OSD_4B_MODE`=1, dwTAddr=`DS_OSDFRAME_ST_AP`=0x40084000) →
+  `GDI_InitialRegion(0)` → `GDI_ClearRegion(0)` → `GDI_ActivateRegion(0)`. So when
+  the AP starts, region 0 is already live, pointed at 0x40084000, correct stride.
+- **Stride = `wWidth >> bColorMode` = 616>>1 = 308 bytes/row** (`gdi.c _gdi_SetPixel`,
+  `dwRegionWidthInByte`). GDI writes at 308 and the scanout reads at 308, so the
+  loader's own text is coherent — 308 is authoritative.
+- **The OSD scanout is driven by the DISP block at `0x80002xxx`, NOT `VCR20`.**
+  `DISP_OSDSet` (`0x7e594` XIP) computes `base+byteoffset` from the region struct
+  and stores to `0x80002450`; it pokes `0x800021c0`; it never writes `REG_MCU_VCR20`
+  (0x80000D80). `VCR20` ("VOU OSD Read Channel base") is a *different* path. The
+  ct952emu scanout honors `VCR20` as a **crutch** because `--apload` does NOT run
+  the loader's `DISP_OSDSet` (it only replays `MoveSectionTable` + the low-level
+  `ROMLD_BOOT_LoadSectionAndRun` @0x4bc). Consequence: **on real hardware a bare
+  AP must touch NO display registers** — writing `VCR20`/`REG_DISP_OSD_SIZE` only
+  clobbers the loader's working DISP config. The AP should ONLY write pixels into
+  0x40084000 at stride 308 and let the loader's scanout show them.
+- **Palette RAM writes need the DISP-blob handshake, not a bare store.** `GDI_LoadPalette`
+  → `DISP_SetPalette` wraps every `REG_DISP_GAM_OSD(i)` access in `REG_VLD_SHO32 =
+  0xFFFFFFFF` + double-read + `GDI_WaitPaletteComplete` (`gdi.c:3911-3925`). A plain
+  `*(0x80001C00+i*4)=yuv` is accepted by the emulator (models palette RAM as memory)
+  but IGNORED on silicon. So a bare AP inherits the LOADER's live palette:
+  empirically index 1 = yellow, 2/3 = black/white.
+- **A solid fill hides stride errors** (all bytes equal → uniform at any pitch). Only
+  text / thin lines expose the true stride. Do not conclude "stride correct" from a
+  clean solid background.
+- **The faithful path if raw-pixel bring-up keeps fighting the hardware:** call the
+  firmware's own renderer from the AP (verified XIP addresses, region globals left
+  intact by the loader): `GDI_FillRect` @0x7cdc, `GDI_DrawString` @0x9664,
+  `GDI_ClearRegion` @0x78b4 — they write at the real stride by construction.
+- **Emulator honesty:** ct952emu's `--apload` never runs `DISP_OSDSet`, so it cannot
+  validate "no-register-poke" AP display behavior. That is a genuine gap, not a
+  detail — historically papered over with `--fb-addr` + forced 4bpp `--fb-wh`, which
+  makes the emu agree with whatever stride/base you pass it. Real-display bring-up
+  must be judged on the frame, or by first teaching the emu to run the loader's DISP
+  setup.

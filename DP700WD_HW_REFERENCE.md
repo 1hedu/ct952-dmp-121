@@ -6367,3 +6367,24 @@ NEXT: pin the vertical mapping -- probe with 6-row alternating bands (count of
 bands on screen gives the vertical scale/duplication factor) plus a hard
 left/right colour split, whose boundary is a straight vertical edge iff the
 stride is right (pixel-space confirmation of 308).
+
+**CORRECTION (from the device owner) -- "all black + one white line" is the AP-mode
+DEFAULT SCREEN, not a failure.** The frame always shows a black screen with a
+single solid white line ~2/3 down when it enters SD/USB AP mode; everything an AP
+draws appears ON TOP of that. Consequences for earlier notes in this document:
+
+- Runs previously recorded as "all black => our content did not render / the AP
+  crashed / wrote past the region and faulted" were, in at least some cases, simply
+  **nothing visible drawn** (fully transparent, or drawn outside the visible
+  window). Do NOT treat a black screen as evidence of a crash or a write fault.
+- The white line is part of that default screen. It is NOT an artifact of our
+  content, a stride symptom, or a leftover from a previous AP. Ignore it entirely
+  as a diagnostic signal.
+- Black areas inside our region are index 0 = the OSD transparent colour key
+  (DISP_OSD_T_EN), letting the default screen show through -- so "black" means
+  "transparent/undrawn here", not "broken".
+- Re-reading the 10.19 photo with this in mind: the pattern is
+  [content][transparent][content][transparent], i.e. our 78-row region is painted
+  TWICE inside the taller (240-line) OSD window, each copy followed by undrawn
+  lines showing the black default. 240/2 = 120 lines per copy ~= 78 drawn + 42
+  undrawn, which matches the observed content:black ratio.

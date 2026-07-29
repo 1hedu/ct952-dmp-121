@@ -6461,3 +6461,44 @@ when the pitch matches the hardware, so the screen literally displays the right
 answer and needs no measuring, counting or ordinal reporting. Verified unbiased in
 the emulator: rendered at 288/292/296 the readable number is 288/292/296
 respectively, with the other two zones sheared into diagonal hash.
+
+### 10.20 MILESTONE: legible text on the real panel (pitch 292 CONFIRMED)
+
+The self-identifying probe came back **"292 perfect"** from the device owner: the
+zone that drew its own number using 292 as the row pitch was legible, its 288/296
+neighbours sheared into hash. So:
+
+**OSD scanout line pitch = 292 bytes = 584 px at 4bpp. CONFIRMED ON HARDWARE.**
+
+Authoritative recipe for drawing to the OSD from a bare-metal AP loaded via the
+SD/USB AP path (all of it verified on silicon):
+
+```
+    base   = 0x40084000        /* DS_OSDFRAME_ST_AP, dvd_dram_16m.h -- 2MB part */
+    pitch  = 292               /* MEASURED; do NOT derive it from a register    */
+    rows   = 24024 / 292 = 82  /* region is 24024 B; clamp every write to it    */
+    4bpp, big-endian nibbles: even x = high nibble, odd x = low
+    off    = y*292 + (x>>1)
+    palette (loader's live one): 0 = transparent key, 1 = yellow, 2 = white
+    write NO display registers -- doing so clobbers the loader's working config
+```
+
+Why the pitch must be hardcoded from measurement: it matches NO register found so
+far. It is not the GDI region width (308 B / 616 px), not the OSD window width
+(360 B / 720 px); `REG_MCU_VCR23 >> 16` reads 308 while the panel scans 292. That
+discrepancy is still unexplained and is the main open item on the display axis --
+until it is resolved, 292 is an empirical constant, and the emulator's
+register-derived scanout (10.18) will disagree with hardware for AP-drawn content.
+
+Cosmetic, not yet addressed: the region is painted ~twice inside the taller
+240-line OSD window, and the panel's AP-mode default screen (black + one white
+line ~2/3 down) shows through wherever we leave index 0.
+
+What finally worked, after ~10 failed hardware rounds, was fixing the MEASUREMENT
+method rather than guessing harder:
+ 1. never trust a uniform fill to validate a pitch (it looks right at any pitch);
+ 2. draw probes in BYTE space when the pixel mapping is the unknown;
+ 3. make the readout SELF-IDENTIFYING (render each candidate using itself, so the
+    screen names the answer) instead of asking a human to count zones or estimate
+    fractions -- ambiguous ordinal reporting cost several rounds;
+ 4. get one photo and measure it, rather than iterating on prose descriptions.

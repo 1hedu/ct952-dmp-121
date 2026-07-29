@@ -39,6 +39,23 @@
 #define CACHE_FLUSH_DCACHE    0x00400000u
 #define CACHE_DCACHE_PWRSAVE  0x00040000u
 
+/* VOU OSD Read Channel Base Address (ctkav_mcu.h REG_MCU_VCR20/21 @ REG_MCU_BASE
+ * 0x80000880 + 0x500/0x504): the DRAM address the DISPLAY DMA fetches the OSD
+ * plane from. GDI sets it via __dwOSD_Region_Base when a region is created. The
+ * AP loader points it at DS_OSDFRAME_ST_AP (0x40084000) to draw its "Loading"
+ * screen; if we draw to a different buffer without repointing this, the panel
+ * keeps scanning the loader's buffer and our console is invisible. The emulator
+ * takes the scanout address as a parameter, so it never modelled this register. */
+#define REG_MCU_VCR20         (*(volatile uint32_t *)0x80000D80u)   /* OSD base (SP1) */
+#define REG_MCU_VCR21         (*(volatile uint32_t *)0x80000D84u)   /* OSD base (SP2) */
+#define DRAM_BASE             0x40000000u
+#define DRAM_TOP              0x40200000u   /* real 2 MB frame */
+
+/* Live OSD framebuffer base -- resolved at console_setup() from REG_MCU_VCR20
+ * (where the display is actually scanning) so our text lands on-screen. Defaults
+ * to DS_OSDFRAME_ST until then. */
+static volatile uint8_t *g_osd_fb = OSD_FB;
+
 /* Disable the hardware watchdog (clear SYSCFG1[28]). No PROC1/PROC2 key-lock is
  * needed: our AP owns the CPU and eCos/PROC2 are gone. Called first thing in the
  * app, and exposed as ct952.watchdog_off(). */
@@ -254,15 +271,15 @@ static void osd_glyph(int cx, int cy, uint8_t ch) {
     if (ch < 0x20 || ch > 0x7F) ch = 0x20;
     const uint8_t *g = font8x8[ch - 0x20];
     for (int row = 0; row < 8; row++) {
-        volatile uint8_t *p = OSD_FB + (cy * 8 + row) * OSD_W + cx * 8;
+        volatile uint8_t *p = g_osd_fb + (cy * 8 + row) * OSD_W + cx * 8;
         uint8_t bits = g[row];                    /* LSB = leftmost pixel */
         for (int b = 0; b < 8; b++)
             p[b] = (bits & (1u << b)) ? con_fg : con_bg;
     }
 }
 static void osd_scroll(void) {
-    memmove((void *)OSD_FB, (void *)(OSD_FB + 8 * OSD_W), (size_t)(OSD_H - 8) * OSD_W);
-    memset((void *)(OSD_FB + (OSD_H - 8) * OSD_W), con_bg, 8 * OSD_W);
+    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * OSD_W), (size_t)(OSD_H - 8) * OSD_W);
+    memset((void *)(g_osd_fb + (OSD_H - 8) * OSD_W), con_bg, 8 * OSD_W);
 }
 static void osd_putc(char c) {
     if (c == '\n')      { con_col = 0; con_row++; }
@@ -286,9 +303,23 @@ void ct952_console_write(const char *s, unsigned int len) {
 /* palette + clear + enable the plane + turn the console on */
 static void console_setup(void) {
     ct952_watchdog_off();                         /* belt-and-suspenders: no reset */
+    /* Resolve the LIVE OSD framebuffer: draw where the display DMA is actually
+     * scanning (REG_MCU_VCR20), which the AP loader set to its "Loading" buffer.
+     * Writing to our own fixed 0x4005F000 leaves the panel showing the loader's
+     * buffer. If VCR20 isn't a sane DRAM address, fall back to DS_OSDFRAME_ST and
+     * point the channel at it ourselves. */
+    {
+        uint32_t base = REG_MCU_VCR20;
+        if (base < DRAM_BASE || base + (uint32_t)(OSD_W * OSD_H) > DRAM_TOP) {
+            base = OSD_FB_ADDR;
+            REG_MCU_VCR20 = base;
+            REG_MCU_VCR21 = base;
+        }
+        g_osd_fb = (volatile uint8_t *)(uintptr_t)base;
+    }
     GAM_OSD[con_bg] = 0x00000000;                 /* background: black */
     GAM_OSD[con_fg] = 0x00FFFFFF;                 /* text: white       */
-    for (int i = 0; i < OSD_W * OSD_H; i++) OSD_FB[i] = con_bg;
+    for (int i = 0; i < OSD_W * OSD_H; i++) g_osd_fb[i] = con_bg;
     con_col = con_row = 0;
     con_on = 1;
     REG_OSD_POS = 0;
@@ -298,7 +329,7 @@ static void console_setup(void) {
 
 // cls() -- clear the screen and home the cursor.
 static mp_obj_t ct952_cls(void) {
-    for (int i = 0; i < OSD_W * OSD_H; i++) OSD_FB[i] = con_bg;
+    for (int i = 0; i < OSD_W * OSD_H; i++) g_osd_fb[i] = con_bg;
     con_col = con_row = 0;
     osd_flush();
     return mp_const_none;

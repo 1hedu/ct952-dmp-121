@@ -3816,6 +3816,20 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     uint32_t x, y;
     int osd_en, i;
 
+    /* Faithful OSD base: on silicon the display DMA fetches the OSD plane from
+     * REG_MCU_VCR20 (VOU OSD Read Channel Base Address, io 0xD80), which GDI and
+     * the AP loader program. Honor it when it holds a sane DRAM address so a
+     * client that repoints the channel -- or fails to -- is reflected here just
+     * as on hardware. The passed osd_base is the fallback for callers/tests that
+     * haven't set VCR20. (Modelling this is what would have caught the AP drawing
+     * to a buffer the display wasn't scanning.) */
+    {
+        uint32_t vcr20 = io_get(m, 0xD80u);
+        if (vcr20 >= 0x40000000u &&
+            (uint64_t)(vcr20 - 0x40000000u) + (uint64_t)h * stride <= MACH_DRAM_SIZE)
+            osd_base = vcr20;
+    }
+
     {
         int loaded = 0;
         for (i = 0; i < 256; i++) {

@@ -131,9 +131,17 @@ static void text(int x0, int y0, const char *str, uint8_t fg, int s){
  * by reading the live registers (10.22).
  *
  * Both copies derive from the same window and so move together with OSD_POS.
- * Raising y by enough puts copy 2 past the panel's last line (233) while copy 1
- * stays fully on screen: y=95 -> copy1 95..172, copy2 at 252 (off-screen), with
- * ~18 lines of margin against error in the measured 157-line period.
+ * Raising y puts copy 2 past the panel's last line (233) while copy 1 stays on
+ * screen. y=95 worked for the repeat but SHEARED the window's lower rows (rows
+ * 44+; the identical drawing was clean at the loader's y=28), so pushing the
+ * window that far down evidently exceeds some OSD/line-buffer limit. Use the
+ * MINIMUM y that still hides the duplicate instead: y=80 -> window 80..157,
+ * copy 2 at 237, off-screen by 4 lines, and only 52 lines below the loader's
+ * original position rather than 67.
+ *
+ * The right-hand vertical bar is a built-in shear detector: it spans all 78 rows,
+ * so it is straight only if the pitch holds for the whole window. If the lower
+ * rows shear again, the bar shows exactly where it starts.
  *
  * This is the ONE display register we write, and it is the narrowest possible
  * change: position only, no base/stride/size/timing, and trivially reversible
@@ -150,10 +158,13 @@ int pyapp_main(void){
     text(8,  26, "PITCH 292  WINDOW 616X78", C_TXT, 2);
     text(8,  44, "SINGLE COPY - REPEAT FIXED", C_TXT, 2);
     text(8,  60, "NEXT: MICROPYTHON REPL", C_HI,  2);
+    /* full-height shear detector: straight iff the pitch holds over all 78 rows */
+    for (uint32_t y = 0; y < ROWS; y++)
+        for (int x = 440; x < 462; x++) px(x, (int)y, C_TXT);
     flush();
 
     /* move the window down so the duplicate falls off the bottom edge */
-    REG_OSD_POS = (95u << 16) | 102u;          /* y=95, keep the loader's x=102 */
+    REG_OSD_POS = (80u << 16) | 102u;          /* y=80, keep the loader's x=102 */
 
     for (;;){}
     return 0;

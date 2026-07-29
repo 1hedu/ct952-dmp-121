@@ -6625,3 +6625,22 @@ display, so recorded and left open.
     write OSD_POS = (95<<16)|102 to drop the duplicate off-screen; touch no other
     display register
 ```
+
+**Caveat on the OSD_POS fix -- do not move the window too far down.** With
+`OSD_POS y = 95` the duplicate did vanish (single copy confirmed on the panel), but
+the window's LOWER ROWS then sheared: rows 0..~43 rendered perfectly while rows 44+
+smeared progressively. The identical drawing at the loader's `y = 28` was clean over
+all four text lines, and nothing else changed -- same pitch, same buffer rows, same
+code -- so pushing the window that far down evidently exceeds some OSD/line-buffer
+limit in the display path (candidates: REG_DISP_LB_CR1/CR2 line-buffer control at
+0x1A28/0x1A2C, or DRAM-bandwidth/H_REQ budget for a window that late in the frame).
+
+Use the **minimum** y that still hides the duplicate: copy 2 sits at `y + 157`, so
+`y >= 77` clears the last line (233). **`y = 80`** gives window 80..157 and copy 2
+at 237 (off-screen by 4 lines) while sitting only 52 lines below the loader's
+original position instead of 67.
+
+Also worth building into any probe: a **full-height vertical bar** as a shear
+detector. It is straight only if the pitch holds across every row of the window, so
+it reveals both the presence and the starting row of any shear without needing text
+to be legible.

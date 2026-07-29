@@ -18,14 +18,14 @@
  *     through, which gives maximum contrast and avoids full-region banding.
  *   - the region is painted ~twice inside the taller 240-line OSD window; that
  *     duplication is cosmetic and left as-is.
- * All writes are clamped to the 24024-byte region.
+ * All writes are clamped to the 24576-byte region (DS_OSDFRAME_ST_AP..END_AP).
  */
 #include <stdint.h>
 
 #define APBASE   0x40084000u
 #define PITCH    292u                 /* MEASURED on hardware */
-#define REGION   24024u
-#define ROWS     (REGION / PITCH)     /* 82 lines */
+#define REGION   24576u            /* DS_OSDFRAME_END_AP-ST_AP = 0x6000 */
+#define ROWS     (REGION / PITCH)     /* 84 lines */
 #define VIS_W    480                  /* panel's visible width */
 
 #define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
@@ -118,16 +118,40 @@ static void text(int x0, int y0, const char *str, uint8_t fg, int s){
     for (int i = 0; str[i]; i++) glyph(x0 + i*8*s, y0, (uint8_t)str[i], fg, s);
 }
 
+/* --- read the frame's own display config and PRINT it ----------------------
+ * Now that text renders legibly (pitch 292), the panel itself is the readout
+ * channel: no UART, no guessing. This dumps the registers that decide the
+ * vertical mapping, so the "repeat" can be diagnosed from actual values instead
+ * of inferred from photo proportions. Reads only -- writes no display register. */
+#define R(a) (*(volatile uint32_t *)(uintptr_t)(a))
+
+static void hex8(int x, int y, const char *lbl, uint32_t v, uint8_t fg){
+    char b[16]; int i;
+    b[0]=lbl[0]; b[1]=lbl[1]; b[2]='=';
+    for (i = 0; i < 8; i++) {
+        uint32_t nib = (v >> (28 - 4*i)) & 0xFu;
+        b[3+i] = (char)(nib < 10 ? '0' + nib : 'A' + (nib - 10));
+    }
+    b[11] = 0;
+    text(x, y, b, fg, 2);
+}
+
 int pyapp_main(void){
     REG_SYSCFG1 &= ~0x10000000u;               /* keep the watchdog dead */
 
     for (uint32_t i = 0; i < REGION; i++) FB[i] = 0;   /* transparent */
 
-    /* 82 lines available. Title at 3x (24px), body at 2x (16px). */
-    text(8,  2,  "CT952A LIVE", C_HI,  3);
-    text(8,  30, "PITCH 292 CONFIRMED", C_TXT, 2);
-    text(8,  48, "BARE METAL ON SILICON", C_TXT, 2);
-    text(8,  64, "NEXT: MICROPYTHON", C_HI,  2);
+    /* 84 lines available (region 24576 B / pitch 292). 2x text = 16px rows. */
+    hex8(4,   1, "20", R(0x80000D80), C_HI);   /* OSD base, field 0      */
+    hex8(200, 1, "21", R(0x80000D84), C_HI);   /* OSD base, field 1      */
+    hex8(4,  18, "22", R(0x80000D88), C_TXT);  /* (height<<16)|width     */
+    hex8(200,18, "23", R(0x80000D8C), C_TXT);  /* (Yinc<<16)|Xinc        */
+    hex8(4,  35, "SZ", R(0x80001A54), C_TXT);  /* OSD window size        */
+    hex8(200,35, "PO", R(0x80001A50), C_TXT);  /* OSD window position    */
+    hex8(4,  52, "SW", R(0x80001A3C), C_HI);   /* SYNC_WH: bit28 = PSCAN */
+    hex8(200,52, "NL", R(0x80001A64), C_HI);   /* N_LINE_REPEAT          */
+    hex8(4,  68, "TG", R(0x80001A38), C_TXT);  /* TGEN totals            */
+    hex8(200,68, "CR", R(0x80001A58), C_TXT);  /* OSD control            */
 
     flush();
     for (;;){}

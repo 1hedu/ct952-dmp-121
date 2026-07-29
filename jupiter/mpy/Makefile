@@ -44,7 +44,11 @@ endif
 #   make APP=1 BUILD=build-app
 ifdef APP
 LDSCRIPT  = ct952_app.ld
-STARTFILE = start_app.S
+# start_banner.S, not start_app.S: the latter's early asm paint reconfigures the
+# display to an 8bpp plane at 0x4005F000, which CLOBBERS the AP loader's working
+# 4bpp config on real silicon (proven on hardware -- see HW reference 10.17/10.20).
+# start_banner.S is the same entry/trap table minus that paint.
+STARTFILE = start_banner.S
 # --build-id=none: drop the .note.gnu.build-id that would otherwise sit at the
 # segment start and push .text off the window base. -N (OMAGIC): don't
 # page-align. Together, .text starts exactly at 0x40500000, so the raw .bin

@@ -12,14 +12,21 @@
 #include "py/runtime.h"
 #include "py/obj.h"
 
-#define OSD_FB        ((volatile uint8_t *)0x4005F000u)
-#define OSD_FB_ADDR   0x4005F000u
+/* CONFIRMED-ON-HARDWARE OSD target (see DP700WD_HW_REFERENCE 10.20): the AP
+ * loader's 4bpp plane at DS_OSDFRAME_ST_AP, drawn at a line pitch of 292 bytes.
+ * The pitch was MEASURED on the panel (a self-identifying probe rendered
+ * "288"/"292"/"296" each using itself as the pitch; only 292 was legible) and
+ * matches no register: VCR23>>16 reads 308 and the window width implies 360. */
+#define OSD_FB        ((volatile uint8_t *)0x40084000u)
+#define OSD_FB_ADDR   0x40084000u
+#define OSD_PITCH     292u                  /* bytes per display line (measured) */
+#define OSD_REGION    24024u                /* AP region size; clamp all writes  */
 #define GAM_OSD       ((volatile uint32_t *)0x80001C00u)
 #define REG_OSD_POS   (*(volatile uint32_t *)0x80001A50u)
 #define REG_OSD_SIZE  (*(volatile uint32_t *)0x80001A54u)
 #define DISP_OSD_EN   0x10000000u
-#define OSD_W         480
-#define OSD_H         240
+#define OSD_W         480                   /* panel's visible width in pixels   */
+#define OSD_H         82                    /* 24024/292 lines                    */
 
 /* I/O register access (peripheral space at 0x80000000). */
 #define IOREG(off)    (*(volatile uint32_t *)(0x80000000u + (off)))
@@ -278,22 +285,28 @@ static uint8_t con_fg = 0x0F, con_bg = 0x00;
  * stride = width bytes, one byte per pixel = palette index (DP700WD_HW_REFERENCE
  * §8.4/§10.16; _gdi_SetPixel 8B mode). We reconfigure the display to this plane
  * rather than the AP loader's 4bpp band. */
-#define OSD_STRIDE   (g_osd_w)                     /* bytes per row (8bpp) */
-#define BG_FILL_BYTE (con_bg)
+#define OSD_STRIDE   OSD_PITCH                     /* measured line pitch  */
+#define BG_FILL_BYTE ((uint8_t)((con_bg << 4) | (con_bg & 0x0F)))  /* 4bpp: 2px/byte */
 static void osd_glyph(int cx, int cy, uint8_t ch) {
     if (ch < 0x20 || ch > 0x7F) ch = 0x20;
     const uint8_t *g = font8x8[ch - 0x20];
     for (int row = 0; row < 8; row++) {
-        volatile uint8_t *p = g_osd_fb + (uint32_t)(cy * 8 + row) * OSD_STRIDE + cx * 8;
+        uint32_t off = (uint32_t)(cy * 8 + row) * OSD_STRIDE + (uint32_t)(cx * 8) / 2u;
+        volatile uint8_t *p = g_osd_fb + off;
         uint8_t bits = g[row];                    /* LSB = leftmost pixel */
-        for (int b = 0; b < 8; b++)
-            p[b] = (bits & (1u << b)) ? con_fg : con_bg;
+        if (off + 4u > OSD_REGION) return;        /* never leave the region */
+        for (int b = 0; b < 4; b++) {             /* 4bpp: 8 px = 4 bytes */
+            uint8_t hi = (bits & (1u << (2*b)))     ? con_fg : con_bg;
+            uint8_t lo = (bits & (1u << (2*b + 1))) ? con_fg : con_bg;
+            p[b] = (uint8_t)((hi << 4) | (lo & 0x0F));
+        }
     }
 }
 static void osd_scroll(void) {
-    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * OSD_STRIDE),
-            (size_t)(g_osd_h - 8) * OSD_STRIDE);
-    memset((void *)(g_osd_fb + (g_osd_h - 8) * OSD_STRIDE), BG_FILL_BYTE, 8 * OSD_STRIDE);
+    uint32_t keep = (uint32_t)(g_osd_h - 8) * OSD_STRIDE;
+    if (keep + 8u * OSD_STRIDE > OSD_REGION) keep = OSD_REGION - 8u * OSD_STRIDE;
+    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * OSD_STRIDE), (size_t)keep);
+    memset((void *)(g_osd_fb + keep), BG_FILL_BYTE, 8u * OSD_STRIDE);
 }
 static void osd_putc(char c) {
     if (c == '\n')      { con_col = 0; con_row++; }
@@ -334,27 +347,23 @@ static uint32_t g_osd_clearbytes = OSD_W * OSD_H;
 static void console_setup(void) {
     ct952_watchdog_off();                         /* belt-and-suspenders: no reset */
 
-    /* Draw to the firmware's OSD plane: 8bpp, 480-wide, at DS_OSDFRAME_ST. */
-    g_osd_w = OSD_W; g_osd_h = OSD_H;              /* 480 x 240, stride 480 */
-    g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;
-    g_osd_fb = OSD_FB;                             /* 0x4005F000 */
+    /* INHERIT the AP loader's display configuration -- do not reprogram it.
+     * aploader.c STEP2 has already configured and activated the OSD (4bpp plane
+     * at 0x40084000) before jumping to us. Writing VCR20/OSD_POS/OSD_SIZE, or
+     * poking palette RAM directly, CLOBBERS that working config on real silicon:
+     * proven on hardware, and palette RAM only accepts writes through the DISP
+     * blob's REG_VLD_SHO32 handshake anyway (GDI_LoadPalette -> DISP_SetPalette).
+     * So: touch no display registers, and use the loader's LIVE palette, whose
+     * indices are empirically 0 = transparent key, 1 = yellow, 2 = white. */
+    g_osd_w = OSD_W; g_osd_h = OSD_H;              /* 480 x 82, pitch 292 */
+    g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;   /* 60 cols x 10 rows   */
+    g_osd_fb = OSD_FB;                             /* 0x40084000          */
 
-    /* Point the OSD read channel at our plane and program the window the firmware
-     * uses (the emulator/hardware scans the OSD from REG_MCU_VCR20). */
-    REG_MCU_VCR20 = OSD_FB_ADDR;
-    REG_MCU_VCR21 = OSD_FB_ADDR;
-    REG_DISP_OSD_POS_R = 0x0017006Cu;             /* documented OSD window position */
-    REG_OSD_SIZE = DISP_OSD_EN | 0x00F002D0u;     /* enable | 720x240 window */
+    con_bg = 0x00;                                 /* transparent: panel shows through */
+    con_fg = 0x02;                                 /* white in the loader's palette    */
 
-    /* Palette: unlock gamma/palette RAM (BRIGHT_CR bit24), then load YUV entries.
-     * Index 0 is the transparent key -- use a non-zero background index. */
-    REG_DISP_BRIGHT_CR |= 0x01000000u;
-    con_bg = 0x01; con_fg = 0x0F;
-    GAM_OSD[con_bg] = YUV_BLACK;
-    GAM_OSD[con_fg] = YUV_WHITE;
-
-    /* Clear the whole plane (480*240) to the opaque background. */
-    g_osd_clearbytes = (uint32_t)(g_osd_w * g_osd_h);
+    /* Clear exactly the AP region -- never past it. */
+    g_osd_clearbytes = OSD_REGION;
     for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = BG_FILL_BYTE;
     con_col = con_row = 0;
     con_on = 1;
@@ -365,10 +374,9 @@ static void console_setup(void) {
      * remaining problem is in the interpreter, not the display. */
     {
         static const char probe[] =
-            "CT952 ON-SCREEN CONSOLE OK\n"
-            "MicroPython on the CT952 frame\n"
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789\n"
-            "REPL follows...\n";
+            "CT952A MICROPYTHON - ON-SCREEN CONSOLE\n"
+            "pitch 292 4bpp @0x40084000  60x10\n"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789\n";
         for (const char *p = probe; *p; p++) osd_putc(*p);
         osd_flush();
     }

@@ -6502,3 +6502,38 @@ method rather than guessing harder:
     screen names the answer) instead of asking a human to count zones or estimate
     fractions -- ambiguous ordinal reporting cost several rounds;
  4. get one photo and measure it, rather than iterating on prose descriptions.
+
+### 10.21 The vertical "repeat": constraint found, and the panel as a register readout
+
+Confirmed on hardware: the banner renders legibly at pitch 292, but the region's
+content is painted TWICE down the panel with a black band between the copies.
+Photo geometry puts the repeat period at ~160-168 lines, i.e. roughly 2x the
+region height, with the second copy truncated at the bottom.
+
+**Hard constraint -- the repeat CANNOT be fixed by drawing more lines.** The AP OSD
+region is bounded by `DS_OSDFRAME_ST_AP = 0x40084000` and
+`DS_OSDFRAME_END_AP = 0x4008A000` (dvd_dram_16m.h:246-247), i.e. exactly
+**0x6000 = 24576 bytes = 84 lines at pitch 292**. Filling a 240-line window would
+need 240*292 = 70080 B, running to 0x40095140 -- straight through
+`DS_USERDATA_BUF_ST_AP`/`DS_AP_CODE_AREA` at 0x4008B000, i.e. over the AP's own
+staged code. So the fix must be in the display configuration, not in the drawing.
+(This also corrects the earlier note that the region is 24024 B; 24024 = 308*78 was
+the GDI region's size, not the AP OSD allocation. 84 usable lines, not 78/82.)
+
+Two candidate mechanisms, not yet distinguished:
+  a) **Interlace / dual field.** PSCAN_EN (REG_DISP_SYNC_WH 0x1A3C bit28) is CLEAR
+     = interlaced, and there are two OSD base registers (VCR20 = field 0,
+     VCR21 = field 1) plus two near-identical setup blocks in the DISP code
+     (0xa5760 / 0xa5814). If a progressive panel stacks the two fields instead of
+     interleaving them, the buffer appears twice. Fix would be PSCAN_EN, or
+     VCR21 = VCR20.
+  b) **REG_DISP_N_LINE_REPEAT (0x1A64, "back to 1st line after access n lines")**,
+     dumped as 0x02000000, wrapping the OSD fetch and re-showing the buffer.
+
+**Method note worth keeping: the panel is now the diagnostic channel.** With legible
+text at pitch 292 there is no need to infer the display config from photo
+proportions or guess register semantics -- an AP can simply READ the registers and
+PRINT them in hex on the screen. That closes the loop that made this whole display
+bring-up so slow (no UART, no JTAG, emulator blind on the display axis). The
+current banner does exactly that for VCR20/21/22/23, OSD_SIZE, OSD_POS, SYNC_WH,
+N_LINE_REPEAT, TGEN and OSD_CR.

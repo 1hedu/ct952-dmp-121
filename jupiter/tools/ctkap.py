@@ -124,11 +124,16 @@ NSEC         = 32               # ROMLD_SECTION_TABLE_SIZE
 SEC_ENTRY    = 24               # sizeof(SECTION_ENTRY)
 SEC_TBL_OFF  = AP_HDR_LEN + AP_IMG_HDR              # 0x210 (file offset of the table)
 CONTENT_OFF  = SEC_TBL_OFF + NSEC * SEC_ENTRY       # 0x510 (sections start after 32 entries)
-FLSH_LMA     = 0x40500000       # runtime-free high DRAM; flasher app runs here
-FLSH_AP_SP   = 0x405f0000       # dwAP_SP for the loaded AP (below IMAG_LMA_BASE)
-RUN_AP_SP    = 0x407f0000       # dwAP_SP for a run-AP (transient; start_app.S sets its own)
-IMAG_LMA_BASE= 0x40600000       # decompressed --image section(s) land here
-FLSH_UNZIP_BUF = 0x40780000     # dwAP_UNZIP_BUF: UZIP work buffer for section decompression
+# The real CT952A frame has 2 MB DRAM (0x40000000..0x40200000). The AP body is
+# copied to DS_AP_CODE_AREA=0x4009a000; the decompressed payload, its stack and
+# the unzip work buffer must all live ABOVE the AP body and BELOW the 2 MB top.
+# (These were 0x405xxxxx/0x407xxxxx when the emulator wrongly modelled 8 MB --
+# on silicon those are megabytes past the end of DRAM and the frame boot-loops.)
+FLSH_LMA     = 0x400c0000       # run-AP / flasher payload decompresses here (above the AP body)
+FLSH_AP_SP   = 0x401e0000       # dwAP_SP for a loaded flasher AP (below the unzip buffer)
+RUN_AP_SP    = 0x401f0000       # dwAP_SP for a run-AP (start_app.S then sets _stack_top)
+IMAG_LMA_BASE= 0x40140000       # decompressed --image section(s) land here (flasher use)
+FLSH_UNZIP_BUF = 0x401f8000     # dwAP_UNZIP_BUF: UZIP work buffer (0x401f8000..0x40200000)
 SEC_FLAG_LOAD, SEC_FLAG_PROGENTRY, SEC_FLAG_ZIP = 1, 2, 4
 # the section flasher app (source: apstub_sec.S), linked/loaded at FLSH_LMA
 APSTUB_SEC_BIN = bytes.fromhex(

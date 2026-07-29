@@ -89,8 +89,9 @@ _app_init:
         nop
 
 _bad:
-        /* unexpected trap: park (record tt in a scratch DRAM word) */
-        set     0x40780000, %g2
+        /* unexpected trap: park (record tt in a scratch DRAM word, in-bounds for
+         * the real 2 MB frame -- top of DRAM, below the unzip buffer) */
+        set     0x401f4000, %g2
         mov     %l1, %g4
         st      %g4, [%g2]
         set     0xDEADDEAD, %g3

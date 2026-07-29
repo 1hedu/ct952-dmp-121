@@ -24,7 +24,18 @@
 #include "sparc.h"
 #include <stdio.h>
 
-#define MACH_DRAM_SIZE   (8u << 20)
+/* The real CT952A frame has a 16 Mbit (2 MB) SDRAM -- HAL_GetDRAMSize() decodes
+ * REG_PLAT_SYSTEM_CONFIGURATION1[4:0]==0x1B as HAL_DRAM_16M. Modelling the true
+ * size is what makes out-of-DRAM writes (e.g. an AP that decompresses past the
+ * top of memory) FAIL here the way they fail on silicon, instead of silently
+ * "working" in an oversized model. Override with CT952_DRAM_MB for the 4/8/16 MB
+ * board variants or for high-DRAM experiments. */
+#ifndef MACH_DRAM_MB_DEFAULT
+#define MACH_DRAM_MB_DEFAULT 2u
+#endif
+#define MACH_DRAM_SIZE   (mach_dram_size())
+extern uint32_t mach_dram_size(void);
+#define MACH_DRAM_SIZE_MAX (16u << 20)
 #define MACH_FLASH_MAX   (4u << 20)
 #define MACH_IO_SIZE     0x8000u        /* 0x80000000..0x80007FFF backed */
 #define MACH_LOG_MAX     512

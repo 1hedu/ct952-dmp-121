@@ -2756,6 +2756,23 @@ static void machine_cycle(machine_t *m)
     }
 }
 
+/* Accessible DRAM size, in bytes. Defaults to the real CT952A's 2 MB (16 Mbit);
+ * override with CT952_DRAM_MB={2,4,8,16} for other board variants or experiments.
+ * Cached on first call. Writes above 0x40000000+this are rejected by the bus
+ * bounds checks -- exactly as they are on silicon with no memory there. */
+uint32_t mach_dram_size(void)
+{
+    static uint32_t sz = 0;
+    if (sz == 0) {
+        const char *e = getenv("CT952_DRAM_MB");
+        uint32_t mb = e && *e ? (uint32_t)strtoul(e, NULL, 0) : MACH_DRAM_MB_DEFAULT;
+        if (mb < 1) mb = 1;
+        if (mb > 16) mb = 16;             /* clamp to the allocated maximum */
+        sz = mb << 20;
+    }
+    return sz;
+}
+
 int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
 {
     memset(m, 0, sizeof(*m));

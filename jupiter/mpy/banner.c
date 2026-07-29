@@ -1,10 +1,10 @@
-/* v3: back to the v2 structure that RENDERED (9 dense lines in the visible
- * region), but at stride 360 (=720/2, from the dumped OSD_SIZE 720-wide window).
- * If the 9 lines are now clean instead of sheared, 360 is the pitch. 4bpp into
- * the loader's inherited region at 0x40084000. */
+/* v4: bracket the stride ABOVE 360 (308->360 reduced the shear, so Sr>360).
+ * Draw one labelled line per candidate stride {384,416,448,480,512}, each at a
+ * FIXED small byte base (i*3600) inside the OSD region so nothing overflows/
+ * faults. A line's glyphs are only crisp when its stride == the hardware pitch;
+ * others shear. Tell me which S=NNN line is crispest. 4bpp @ 0x40084000. */
 #include <stdint.h>
-#define APBASE   0x40084000u
-#define STRIDE   360               /* bytes/row (4bpp, 720px window) */
+#define APBASE 0x40084000u
 #define REG_VCR20 (*(volatile uint32_t *)0x80000D80u)
 #define REG_OSDSZ (*(volatile uint32_t *)0x80001A54u)
 #define REG_CACHE (*(volatile uint32_t *)0x80000014u)
@@ -63,29 +63,30 @@ static const uint8_t font8x8[96][8] = {
 
 static void flush(void){ REG_CACHE&=~0x00040000u; REG_CACHE|=0x00400000u;
     for(volatile int i=0;i<256;i++)__asm__ __volatile__("nop"); REG_CACHE|=0x00040000u; }
-static void px(int x,int y,uint8_t c){
-    uint32_t off=(uint32_t)y*STRIDE+(x>>1);
-    if(off>=0x5A00u) return;   /* stay INSIDE the ~24KB 4bpp region (no fault) */
+static void px(uint32_t base,int x,int y,int st,uint8_t c){
+    uint32_t off=base+(uint32_t)y*st+(x>>1);
+    if(off>=0x5A00u) return;                 /* hard cap inside the region */
     volatile uint8_t *p=FB+off;
     if(x&1) *p=(uint8_t)((*p&0xF0)|(c&0x0F));
     else    *p=(uint8_t)((*p&0x0F)|((c&0x0F)<<4));
 }
-static void glyph(int cx,int cy,uint8_t ch,uint8_t fg){
+static void glyph(uint32_t base,int cx,int cy,int st,uint8_t ch,uint8_t fg){
     if(ch<0x20||ch>0x7F)ch=0x20; const uint8_t *g=font8x8[ch-0x20];
-    for(int r=0;r<8;r++){uint8_t b=g[r];for(int x=0;x<8;x++)if(b&(1u<<x))px(cx*8+x,cy*8+r,fg);}
+    for(int r=0;r<8;r++){uint8_t b=g[r];for(int x=0;x<8;x++)if(b&(1u<<x))px(base,cx*8+x,cy*8+r,st,fg);}
 }
-static void draw(int col,int cy,const char *s,uint8_t fg){ for(int i=0;s[i];i++)glyph(col+i,cy,s[i],fg); }
-static char d1(int v){return (char)('0'+v);}
+static void draw(uint32_t base,int col,int cy,int st,const char *s,uint8_t fg){
+    for(int i=0;s[i];i++)glyph(base,col+i,cy,st,s[i],fg);
+}
 int pyapp_main(void){
-    REG_SYSCFG1 &= ~0x10000000u; REG_VCR20 = APBASE; REG_OSDSZ |= 0x10000000u;
-    for(int r=0;r<6;r++){                 /* 6 lines * 8 * 360 = 17280 < region */
-        char line[40];int n=0;
-        line[n++]='S';line[n++]='=';line[n++]='3';line[n++]='6';line[n++]='0';line[n++]=' ';
-        line[n++]='r';line[n++]=d1(r);line[n++]=' ';
-        const char *t="CT952 stride360 ABCDEFG abcdefg 0123";
-        for(int k=0;t[k];k++)line[n++]=t[k]; line[n]=0;
-        draw(0,r,line,(uint8_t)(r+1));            /* index r+1 (1..9) */
-    }
+    REG_SYSCFG1 &= ~0x10000000u; REG_VCR20=APBASE; REG_OSDSZ|=0x10000000u;
+    static const int st[5]={384,416,448,480,512};
+    static const char *lab[5]={
+        "S=384 CT952 stride ABCDEFG abc 0123",
+        "S=416 CT952 stride ABCDEFG abc 0123",
+        "S=448 CT952 stride ABCDEFG abc 0123",
+        "S=480 CT952 stride ABCDEFG abc 0123",
+        "S=512 CT952 stride ABCDEFG abc 0123"};
+    for(int i=0;i<5;i++) draw((uint32_t)i*3600u, 0, 0, st[i], lab[i], (uint8_t)(i+1));
     flush();
     for(;;){}
     return 0;

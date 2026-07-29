@@ -67,6 +67,63 @@ _app_init:
         sethi   %hi(0x10000000), %g3
         andn    %g2, %g3, %g2
         st      %g2, [%g1]
+
+        /* ---- early screen paint: diagnostic + validates the OSD path ----------
+         * Before the C runtime even starts, fill the LIVE OSD buffer (the address
+         * the display DMA reads, REG_MCU_VCR20) with palette index 1, set that
+         * entry to OPAQUE white (mix_en bit24 | white -- the firmware always sets
+         * bit24; our earlier 0x00FFFFFF had it clear, so the OSD pixel was never
+         * mixed onto the output = invisible), enable the plane, point the OSD DMA
+         * at the buffer, and flush the D-cache. If the panel turns solid white,
+         * our code runs and the OSD path is correct; the C console then clears it
+         * and draws text. Uses only %g regs (no stack yet). */
+        set     0x80000D80, %g1         /* REG_MCU_VCR20: OSD read base */
+        ld      [%g1], %g2              /* g2 = live OSD buffer */
+        set     0x40000000, %g3
+        cmp     %g2, %g3
+        blu     10f                     /* < 0x40000000 -> invalid */
+        nop
+        set     0x401d0000, %g3
+        cmp     %g2, %g3
+        blu     11f                     /* 0x40000000 <= base < 0x401d0000 -> ok */
+        nop
+10:     set     0x40084000, %g2         /* fallback: DS_OSDFRAME_ST_AP */
+11:
+        set     0x80001C00, %g1         /* GAM_OSD palette RAM */
+        set     0x01000000, %g3
+        st      %g3, [%g1]              /* [0] = mix_en | black */
+        set     0x01FFFFFF, %g3
+        st      %g3, [%g1 + 4]          /* [1] = mix_en | white */
+        set     0x01010101, %g3         /* index-1 words */
+        mov     %g2, %g4
+        set     28800, %g5              /* 480*240/4 */
+12:     st      %g3, [%g4]
+        subcc   %g5, 1, %g5
+        bne     12b
+        add     %g4, 4, %g4
+        set     0x80001A50, %g1
+        st      %g0, [%g1]              /* REG_DISP_OSD_POS = 0 */
+        set     0x10F001E0, %g3         /* enable(bit28) | (240<<16) | 480 */
+        st      %g3, [%g1 + 4]          /* REG_DISP_OSD_SIZE (0x80001A54) */
+        set     0x80000D80, %g1
+        st      %g2, [%g1]              /* VCR20 = base */
+        st      %g2, [%g1 + 4]          /* VCR21 = base */
+        set     0x80000014, %g1         /* REG_PLAT_CACHE_CTRL */
+        ld      [%g1], %g3
+        set     0x00040000, %g4
+        andn    %g3, %g4, %g3
+        st      %g3, [%g1]              /* clear DCACHE_POWER_SAVING */
+        set     0x00400000, %g4
+        or      %g3, %g4, %g3
+        st      %g3, [%g1]              /* set FLUSH_DCACHE */
+        set     512, %g5
+13:     subcc   %g5, 1, %g5
+        bne     13b
+        nop
+        set     0x00040000, %g4
+        or      %g3, %g4, %g3
+        st      %g3, [%g1]              /* restore power saving */
+
         /* fresh stack at the top of the payload window */
         set     _stack_top, %sp
         clr     %fp

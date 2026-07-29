@@ -317,8 +317,11 @@ static void console_setup(void) {
         }
         g_osd_fb = (volatile uint8_t *)(uintptr_t)base;
     }
-    GAM_OSD[con_bg] = 0x00000000;                 /* background: black */
-    GAM_OSD[con_fg] = 0x00FFFFFF;                 /* text: white       */
+    /* OSD palette entries carry the mix_en attribute in bit24 (ctkav: the DISP
+     * blends the OSD onto the output only when set); without it the pixel is
+     * transparent and the text is invisible. Set bit24 on both entries. */
+    GAM_OSD[con_bg] = 0x01000000;                 /* background: opaque black */
+    GAM_OSD[con_fg] = 0x01FFFFFF;                 /* text: opaque white       */
     for (int i = 0; i < OSD_W * OSD_H; i++) g_osd_fb[i] = con_bg;
     con_col = con_row = 0;
     con_on = 1;

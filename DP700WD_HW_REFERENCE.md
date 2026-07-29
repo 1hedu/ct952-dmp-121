@@ -6287,6 +6287,46 @@ dp700wd.bin directly (NOT via DVD909.sym -- see the warning below):
   (0x2440-0x2460), OSD window/CR, and scan/scale/interlace regs, in both the
   normal and --apload paths. CT952_OSD_FORCE ungates the debug scanout readback.
 
-NEXT: finish decoding the VCR22/VCR23 (stride) formula and the two-field layout,
-then rewrite machine_disp_scanout to read VCR20-23 + PSCAN_EN and composite
-(4bpp/8bpp, interlaced fields) instead of taking geometry from the command line.
+**STRIDE FORMULA -- SOLVED and VERIFIED.** The real DISP setup code (file offset
+0xa5758-0xa580c) computes, from W=0x40040eb4, H=0x40040e78, and a mode byte whose
+low 2 bits go to CM=0x40040d64 and whose high nibble goes to SEL=0x40040ec0
+(writer at 0xa45e4-0xa4604: `CM = mode & 3`, `SEL = mode & 0xF0`):
+
+```
+    shift  = (SEL > 0x1F) ? CM+1 : CM+2
+    VCR22  = (H << 16) | (W >> shift)                      /* io 0xD88 */
+    VCR23  = ((W << (16 - CM + (SEL > 0x1F))) & 0xFFFF0000) + 4   /* io 0xD8C */
+```
+
+so the registers decompose as
+
+```
+    VCR22 = (height_lines << 16) | (width / X_increment)
+    VCR23 = (Y_increment  << 16) | X_increment      /* X_increment = 4 */
+    SCANOUT ROW STRIDE (bytes) = VCR23 >> 16
+                               = W >> CM        if (mode & 0xF0) <= 0x1F
+                               = W >> (CM-1)    if (mode & 0xF0) >= 0x20  (doubled)
+```
+
+Verified end-to-end: an AP programming the channel for W=616,H=78,CM=1,SEL=0
+produces VCR22=0x004e004d ((78<<16)|77) and VCR23=0x01340004 ((308<<16)|4),
+i.e. **stride 308** -- and a 32-bit block readout drawn at that stride decodes
+back byte-exact from the rendered framebuffer.
+
+**Consequence -- no more stride guessing anywhere.** The stride is READABLE at
+runtime: `stride = REG_MCU_VCR23 >> 16`, `height = REG_MCU_VCR22 >> 16`. Any AP
+should read it rather than assume 308/360/616, because the loader's DISP setup
+has already programmed it.
+
+**Emulator (now faithful on this axis):** machine_disp_scanout derives stride and
+height from VCR22/VCR23 when the channel is programmed, and when it is NOT it
+prints a loud WARNING that the geometry is the caller's and the scanout is not
+authoritative (CT952_OSD_NOREGS forces the old behavior). It also fixes a real
+unfaithfulness: the 4bpp decode used `w>>1` as the row pitch instead of the
+hardware stride, which silently made the scanout agree with whatever --fb-wh the
+caller passed -- the reason earlier "the emulator confirms stride 308" checks were
+circular and worthless.
+
+STILL OPEN: what the SEL>=0x20 stride doubling means physically (interlaced field
+scan vs OSD horizontal upscale, cf. REG_MCU_VCR25 "OSD upscalling"), and the
+two-field layout (two near-identical VCR setup blocks at 0xa5760/0xa5814).

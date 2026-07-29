@@ -3852,6 +3852,47 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
             }
     }
 
+    /* ---- FAITHFUL OSD GEOMETRY: derive it from the registers the firmware
+     * actually programs, instead of taking it from the command line ------------
+     * The OSD read channel is REG_MCU_VCR20..23 (io 0xD80..0xD8C). The real DISP
+     * setup code in dp700wd.bin (file offset ~0xa5760, located by register
+     * footprint -- NOT via DVD909.sym, whose DISP addresses are misaligned with
+     * this binary) computes, from the display-config globals W=0x40040eb4,
+     * H=0x40040e78, CM=(mode&3)@0x40040d64, SEL=(mode&0xF0)@0x40040ec0:
+     *
+     *   VCR22 = (H << 16) | (W >> (CM + (SEL > 0x1F ? 1 : 2)))
+     *   VCR23 = ((W << (16 - CM + (SEL > 0x1F ? 1 : 0))) & 0xFFFF0000) + 4
+     *
+     * so VCR23 splits as (Y_increment << 16) | X_increment, where the Y increment
+     * IS the scanout row stride in bytes and X increment is the per-fetch width
+     * (4). VCR22 splits as (height_lines << 16) | width_in_X_increments.
+     *
+     * Therefore: stride = VCR23 >> 16, height = VCR22 >> 16. Both come straight
+     * off the hardware register, so a client that programs the channel wrongly
+     * now renders wrongly here too -- which is the whole point. When the channel
+     * has never been programmed (VCR23 == 0, e.g. the emulator never reaches the
+     * firmware's display init) we KEEP the caller's values and say so loudly
+     * rather than silently pretending the geometry is confirmed. */
+    {
+        uint32_t vcr22 = io_get(m, 0xD88u), vcr23 = io_get(m, 0xD8Cu);
+        uint32_t reg_stride = vcr23 >> 16, reg_h = vcr22 >> 16;
+        int interlaced = (io_get(m, R_DISP_SYNC_WH) & DISP_PSCAN_EN) == 0;
+        if (reg_stride && !getenv("CT952_OSD_NOREGS")) {
+            if (reg_stride != stride || (reg_h && reg_h != h))
+                fprintf(stderr, "[disp] OSD geometry from VCR22/23: stride %u->%u "
+                        "h %u->%u (VCR22=0x%08x VCR23=0x%08x, %s)\n",
+                        stride, reg_stride, h, reg_h ? reg_h : h,
+                        vcr22, vcr23, interlaced ? "interlaced" : "progressive");
+            stride = reg_stride;
+            if (reg_h) h = reg_h;
+        } else {
+            fprintf(stderr, "[disp] WARNING: OSD read channel UNPROGRAMMED "
+                    "(VCR22=0x%08x VCR23=0x%08x) -- geometry %ux%u stride %u is the "
+                    "CALLER'S, not the hardware's; scanout is NOT authoritative\n",
+                    vcr22, vcr23, w, h, stride);
+        }
+    }
+
     osd_en = (io_get(m, R_DISP_OSD_SIZE) & DISP_OSD_EN) != 0;
     /* CT952_OSD_FORCE: debug readback of the OSD buffer even when enable was set
      * via the DISP block (GDI_ActivateRegion) rather than R_DISP_OSD_SIZE bit28,
@@ -3902,7 +3943,11 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
                 int in_osd;
                 uint8_t idx;
                 if (osd_4bpp) {
-                    boff = (uint64_t)y * (w >> 1) + (x >> 1);
+                    /* row pitch is the HARDWARE stride (VCR23 Y-increment), not
+                     * w/2: assuming pitch==width/2 silently forces the plane to
+                     * be exactly as wide as the requested image, which made this
+                     * scanout agree with whatever geometry the caller passed. */
+                    boff = (uint64_t)y * stride + (x >> 1);
                     in_osd = osd_en && (osd_base + boff < osd_end);
                     idx = in_osd ? (uint8_t)((x & 1) ? (fb[boff] & 0x0F)
                                                      : (fb[boff] >> 4)) : 0;

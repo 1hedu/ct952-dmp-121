@@ -1,24 +1,20 @@
-/* Minimal on-screen banner AP -- NO MicroPython, NO keyboard. Isolates the OSD
- * display bring-up so it iterates in seconds. Reconfigures the OSD to the
- * firmware's documented 8bpp plane (DP700WD_HW_REFERENCE §8.4/10.16) and draws a
- * few lines of text, then spins. start_app.S calls pyapp_main() (this file) and
- * has already done the watchdog-off + early asm paint. */
+/* Minimal SD-boot-environment banner: INHERIT the AP loader's OSD setup instead
+ * of reconfiguring it. aploader.c leaves the OSD as a 4bpp (GDI_OSD_4B_MODE)
+ * 616x78 region at DS_OSDFRAME_ST_AP (0x40084000), palette loaded, other planes
+ * disabled -- and its "Loading" text is legible. So we just draw 4bpp text INTO
+ * that region (2 px/byte, big-endian nibbles, stride = 616/2 = 308), touching
+ * nothing else. To find a legible foreground index against the loader's palette,
+ * each line is drawn in a different palette index (1..9) with a label. */
 #include <stdint.h>
 
-#define OSD_FB_ADDR   0x4005F000u
-#define OSD_FB        ((volatile uint8_t *)OSD_FB_ADDR)
-#define GAM_OSD       ((volatile uint32_t *)0x80001C00u)
-#define REG_OSD_POS   (*(volatile uint32_t *)0x80001A50u)
-#define REG_OSD_SIZE  (*(volatile uint32_t *)0x80001A54u)
-#define REG_BRIGHT_CR (*(volatile uint32_t *)0x80001A60u)
-#define REG_VCR20     (*(volatile uint32_t *)0x80000D80u)
-#define REG_VCR21     (*(volatile uint32_t *)0x80000D84u)
-#define REG_CACHE     (*(volatile uint32_t *)0x80000014u)
-#define REG_SYSCFG1   (*(volatile uint32_t *)0x8000031Cu)
-#define OSD_W 480
-#define OSD_H 240
-#define YUV_BLACK 0x00108080u
-#define YUV_WHITE 0x00EB8080u
+#define APBASE   0x40084000u       /* DS_OSDFRAME_ST_AP (aploader.c) */
+#define APW      616
+#define APH      78
+#define STRIDE   (APW/2)           /* 4bpp: 308 bytes/row */
+#define REG_VCR20 (*(volatile uint32_t *)0x80000D80u)
+#define REG_CACHE (*(volatile uint32_t *)0x80000014u)
+#define REG_SYSCFG1 (*(volatile uint32_t *)0x8000031Cu)
+static volatile uint8_t *FB = (volatile uint8_t *)APBASE;
 
 static const uint8_t font8x8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
@@ -71,53 +67,46 @@ static const uint8_t font8x8[96][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
 };
 
-static uint8_t BG = 1, FG = 15;
-
-static void osd_flush(void) {
-    REG_CACHE &= ~0x00040000u;
-    REG_CACHE |= 0x00400000u;
-    for (volatile int i = 0; i < 256; i++) __asm__ __volatile__("nop");
+static void flush(void){
+    REG_CACHE &= ~0x00040000u; REG_CACHE |= 0x00400000u;
+    for(volatile int i=0;i<256;i++) __asm__ __volatile__("nop");
     REG_CACHE |= 0x00040000u;
 }
-static void glyph(int cx, int cy, uint8_t ch) {
-    if (ch < 0x20 || ch > 0x7F) ch = 0x20;
-    const uint8_t *g = font8x8[ch - 0x20];
-    for (int r = 0; r < 8; r++) {
-        volatile uint8_t *p = OSD_FB + (cy * 8 + r) * OSD_W + cx * 8;
-        uint8_t b = g[r];
-        for (int x = 0; x < 8; x++) p[x] = (b & (1u << x)) ? FG : BG;
+/* 4bpp pixel: even x -> high nibble, odd x -> low nibble (gdi.c _gdi_SetPixel) */
+static void px(int x,int y,uint8_t c){
+    if(x<0||x>=APW||y<0||y>=APH) return;
+    volatile uint8_t *p = FB + (uint32_t)y*STRIDE + (x>>1);
+    if(x&1) *p = (uint8_t)((*p&0xF0)|(c&0x0F));
+    else    *p = (uint8_t)((*p&0x0F)|((c&0x0F)<<4));
+}
+static void glyph(int cx,int cy,uint8_t ch,uint8_t fg){
+    if(ch<0x20||ch>0x7F) ch=0x20;
+    const uint8_t *g=font8x8[ch-0x20];
+    for(int r=0;r<8;r++){ uint8_t b=g[r]; for(int x=0;x<8;x++) if(b&(1u<<x)) px(cx*8+x,cy*8+r,fg); }
+}
+static void draw(int col,int row,const char *s,uint8_t fg){
+    for(int i=0;s[i];i++) glyph(col+i,row,(uint8_t)s[i],fg);
+}
+static char hexd(int v){ return (char)(v<10?'0'+v:'A'+v-10); }
+
+int pyapp_main(void){
+    REG_SYSCFG1 &= ~0x10000000u;      /* watchdog off */
+    REG_VCR20 = APBASE;
+    *(volatile uint32_t *)0x80001A54u |= 0x10000000u;  /* enable bit (emu render; loader sets it on HW) */
+    /* Draw the same label in palette indices 1..9, one per row, so whichever
+     * index is a legible colour on the loader's palette shows readable text.
+     * 616/8 = 77 cols, 78/8 = 9 rows. */
+    for(int idx=1; idx<=9; idx++){
+        char line[24];
+        int n=0;
+        line[n++]='i'; line[n++]='d'; line[n++]='x'; line[n++]=' ';
+        line[n++]=hexd(idx); line[n++]=':'; line[n++]=' ';
+        const char *t="CT952 4bpp banner ABCabc 0123";
+        for(int k=0;t[k];k++) line[n++]=t[k];
+        line[n]=0;
+        draw(0, idx-1, line, (uint8_t)idx);
     }
-}
-static void draw(int col, int row, const char *s) {
-    for (int i = 0; s[i]; i++) glyph(col + i, row, (uint8_t)s[i]);
-}
-
-int pyapp_main(void) {
-    REG_SYSCFG1 &= ~0x10000000u;          /* watchdog off (belt) */
-
-    /* OSD -> firmware's 8bpp plane at 0x4005F000, documented window */
-    REG_VCR20 = OSD_FB_ADDR;
-    REG_VCR21 = OSD_FB_ADDR;
-    REG_OSD_POS = 0x0017006Cu;
-    REG_OSD_SIZE = 0x10000000u | 0x00F002D0u;   /* enable | 720x240 */
-
-    /* palette (unlock RAM, YUV entries) */
-    REG_BRIGHT_CR |= 0x01000000u;
-    GAM_OSD[BG] = YUV_BLACK;
-    GAM_OSD[FG] = YUV_WHITE;
-
-    /* clear to opaque background */
-    for (int i = 0; i < OSD_W * OSD_H; i++) OSD_FB[i] = BG;
-
-    /* banner: a border row + a few text lines so legibility is obvious */
-    for (int c = 0; c < OSD_W / 8; c++) glyph(c, 0, '=');
-    draw(1, 2,  "CT952 BANNER TEST -- no python, no keyboard");
-    draw(1, 4,  "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789");
-    draw(1, 5,  "the quick brown fox jumps over the lazy dog");
-    draw(1, 7,  "if you can read this, the OSD config is CORRECT");
-    for (int c = 0; c < OSD_W / 8; c++) glyph(c, 9, '=');
-    osd_flush();
-
-    for (;;) { }
+    flush();
+    for(;;){}
     return 0;
 }

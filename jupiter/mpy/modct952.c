@@ -308,69 +308,66 @@ void ct952_console_write(const char *s, unsigned int len) {
     for (unsigned int i = 0; i < len; i++) osd_putc(s[i]);
     osd_flush();   /* push the glyphs from the D-cache to DRAM so the panel updates */
 }
+/* Generous clear extent (bytes) -- resolved in console_setup so both the clear
+ * and cls() wipe any leftover OSD content BELOW the visible area (the loader's
+ * "white line"), capped so it never runs into our code at 0x400c0000. */
+static uint32_t g_osd_clearbytes = OSD_W * OSD_H;
+
 /* palette + clear + enable the plane + turn the console on */
 static void console_setup(void) {
     ct952_watchdog_off();                         /* belt-and-suspenders: no reset */
 
-    /* Adopt the panel's REAL OSD geometry from REG_DISP_OSD_SIZE, which the AP
-     * loader programmed for THIS display (value = enable(bit28)|(h<<16)|w). We
-     * used to hardcode 480x240; if the panel is taller, a 240-row clear leaves
-     * the loader's screen visible below it. Validate to sane ranges, else keep
-     * the default. */
-    {
-        uint32_t sz = REG_OSD_SIZE;
-        int w = (int)(sz & 0x7FF);                /* OSD width  */
-        int h = (int)((sz >> 16) & 0x7FF);        /* OSD height */
-        if (w >= 64 && w <= 1024 && h >= 64 && h <= 768) {
-            g_osd_w = w; g_osd_h = h;
-        }
-        g_cols = g_osd_w / 8;
-        g_rows = g_osd_h / 8;
-    }
+    /* Framebuffer stride is the OSD plane width -- 480, the verified DS_OSDFRAME
+     * geometry (NOT REG_DISP_OSD_SIZE's display-window width, which is a scaled
+     * output size and garbles addressing if used as a stride). */
+    g_osd_w = OSD_W; g_osd_h = OSD_H;
+    g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;
 
     /* Resolve the LIVE OSD framebuffer: draw where the display DMA is actually
      * scanning (REG_MCU_VCR20), which the AP loader set to its "Loading" buffer.
-     * Writing to our own fixed 0x4005F000 leaves the panel showing the loader's
-     * buffer. If VCR20 isn't a sane DRAM address, fall back to DS_OSDFRAME_ST and
-     * point the channel at it ourselves. */
-    {
-        uint32_t base = REG_MCU_VCR20;
-        uint32_t bytes = (uint32_t)(g_osd_w * g_osd_h);
-        if (base < DRAM_BASE || base + bytes > DRAM_TOP) {
-            base = OSD_FB_ADDR;
-            REG_MCU_VCR20 = base;
-            REG_MCU_VCR21 = base;
-        }
-        g_osd_fb = (volatile uint8_t *)(uintptr_t)base;
-        /* Safety clamp: never let the framebuffer (base + w*h) run into our own
-         * code/data at 0x400c0000 (or past DRAM). Shrink the height if a bogus
-         * geometry read would overrun. */
-        {
-            uint32_t ceil = base < 0x400c0000u ? 0x400c0000u : DRAM_TOP;
-            int maxrows = (int)((ceil - base) / (uint32_t)g_osd_w);
-            if (g_osd_h > maxrows) g_osd_h = maxrows;
-            g_rows = g_osd_h / 8;
-        }
+     * If VCR20 isn't a sane DRAM address, fall back to DS_OSDFRAME_ST and point
+     * the channel at it ourselves. */
+    uint32_t base = REG_MCU_VCR20;
+    if (base < DRAM_BASE || base + (uint32_t)(g_osd_w * g_osd_h) > DRAM_TOP) {
+        base = OSD_FB_ADDR;
+        REG_MCU_VCR20 = base;
+        REG_MCU_VCR21 = base;
     }
-    /* OSD palette entries carry the mix_en attribute in bit24 (ctkav: the DISP
-     * blends the OSD onto the output only when set); without it the pixel is
-     * transparent and the text is invisible. Set bit24 on both entries. */
-    GAM_OSD[con_bg] = 0x01000000;                 /* background: opaque black */
-    GAM_OSD[con_fg] = 0x01FFFFFF;                 /* text: opaque white       */
-    for (int i = 0; i < g_osd_w * g_osd_h; i++) g_osd_fb[i] = con_bg;   /* FULL clear */
+    g_osd_fb = (volatile uint8_t *)(uintptr_t)base;
+
+    /* Clear GENEROUSLY: wipe well past the visible area so any leftover loader
+     * content below our text (the "white line 2/3 down") is blanked too. Capped
+     * so we never touch our own code at 0x400c0000 / run past DRAM. */
+    {
+        uint32_t ceil = base < 0x400c0000u ? 0x400c0000u : DRAM_TOP;
+        uint32_t avail = ceil - base;
+        g_osd_clearbytes = avail > 0x60000u ? 0x60000u : avail;   /* <= 384 KB */
+    }
+
+    /* OSD palette entries carry a mix_en attribute in bit24; the DISP blends the
+     * OSD onto the output only when it's set (else the pixel is transparent =
+     * invisible). Also use a NON-ZERO background index: palette index 0 is often
+     * the hardware transparent key, so an index-0 "black" background would show
+     * the video plane behind it (possibly the leftover line). Index 2 = opaque
+     * black; index 15 = opaque white. */
+    con_bg = 0x02; con_fg = 0x0F;
+    GAM_OSD[con_bg] = 0x01000000;                 /* opaque black */
+    GAM_OSD[con_fg] = 0x01FFFFFF;                 /* opaque white */
+    for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = con_bg;
     con_col = con_row = 0;
     con_on = 1;
-    osd_flush();                                  /* the cleared plane must reach DRAM */
+    REG_OSD_SIZE |= DISP_OSD_EN;                   /* keep loader geometry, ensure enabled */
+    osd_flush();
 
     /* Self-test banner drawn DIRECTLY (not via MicroPython's print path): if the
-     * panel already shows these lines, the console + geometry are correct and any
+     * panel already shows these lines, the console + display are correct and any
      * remaining problem is in the interpreter, not the display. */
     {
         static const char probe[] =
             "CT952 ON-SCREEN CONSOLE OK\n"
-            "geometry resolved from REG_DISP_OSD_SIZE\n"
+            "MicroPython on the CT952 frame\n"
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789\n"
-            "MicroPython REPL follows...\n";
+            "REPL follows...\n";
         for (const char *p = probe; *p; p++) osd_putc(*p);
         osd_flush();
     }
@@ -378,7 +375,7 @@ static void console_setup(void) {
 
 // cls() -- clear the screen and home the cursor.
 static mp_obj_t ct952_cls(void) {
-    for (int i = 0; i < g_osd_w * g_osd_h; i++) g_osd_fb[i] = con_bg;
+    for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = con_bg;
     con_col = con_row = 0;
     osd_flush();
     return mp_const_none;

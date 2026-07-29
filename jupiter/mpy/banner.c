@@ -1,17 +1,15 @@
-/* Stride-sweep banner: colors already work; only the row pitch is wrong. Draw
- * the same label at several candidate 4bpp strides, each in its own horizontal
- * band, so ONE photo reveals which stride is clean. Each band writes text
- * assuming stride S into a fixed screen-row range using THAT S, so the band whose
- * S matches the hardware's real pitch renders as clean readable text; the others
- * shear. Draws into the AP loader's inherited OSD buffer (0x40084000). */
+/* v3: back to the v2 structure that RENDERED (9 dense lines in the visible
+ * region), but at stride 360 (=720/2, from the dumped OSD_SIZE 720-wide window).
+ * If the 9 lines are now clean instead of sheared, 360 is the pitch. 4bpp into
+ * the loader's inherited region at 0x40084000. */
 #include <stdint.h>
 #define APBASE   0x40084000u
+#define STRIDE   360               /* bytes/row (4bpp, 720px window) */
 #define REG_VCR20 (*(volatile uint32_t *)0x80000D80u)
 #define REG_OSDSZ (*(volatile uint32_t *)0x80001A54u)
 #define REG_CACHE (*(volatile uint32_t *)0x80000014u)
 #define REG_SYSCFG1 (*(volatile uint32_t *)0x8000031Cu)
 static volatile uint8_t *FB=(volatile uint8_t*)APBASE;
-
 static const uint8_t font8x8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
     {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
@@ -65,43 +63,28 @@ static const uint8_t font8x8[96][8] = {
 
 static void flush(void){ REG_CACHE&=~0x00040000u; REG_CACHE|=0x00400000u;
     for(volatile int i=0;i<256;i++)__asm__ __volatile__("nop"); REG_CACHE|=0x00040000u; }
-/* write pixel (x,y) at 4bpp assuming byte-stride `st`; base byte-row `row0` */
-static void px(int x,int y,int st,int row0,uint8_t c){
-    uint32_t off=(uint32_t)(row0+y)*st + (x>>1);
-    if(off>=0x30000u) return;               /* keep inside 0x40084000..0x400b4000 */
+static void px(int x,int y,uint8_t c){
+    uint32_t off=(uint32_t)y*STRIDE+(x>>1);
+    if(off>=0x5A00u) return;   /* stay INSIDE the ~24KB 4bpp region (no fault) */
     volatile uint8_t *p=FB+off;
     if(x&1) *p=(uint8_t)((*p&0xF0)|(c&0x0F));
     else    *p=(uint8_t)((*p&0x0F)|((c&0x0F)<<4));
 }
-static void glyph(int cx,int cy,int st,int row0,uint8_t ch,uint8_t fg){
+static void glyph(int cx,int cy,uint8_t ch,uint8_t fg){
     if(ch<0x20||ch>0x7F)ch=0x20; const uint8_t *g=font8x8[ch-0x20];
-    for(int r=0;r<8;r++){uint8_t b=g[r];for(int x=0;x<8;x++)if(b&(1u<<x))px(cx*8+x,cy*8+r,st,row0,fg);}
+    for(int r=0;r<8;r++){uint8_t b=g[r];for(int x=0;x<8;x++)if(b&(1u<<x))px(cx*8+x,cy*8+r,fg);}
 }
-static void draw(int col,int cy,int st,int row0,const char *s,uint8_t fg){
-    for(int i=0;s[i];i++) glyph(col+i,cy,st,row0,s[i],fg);
-}
+static void draw(int col,int cy,const char *s,uint8_t fg){ for(int i=0;s[i];i++)glyph(col+i,cy,s[i],fg); }
 static char d1(int v){return (char)('0'+v);}
-
 int pyapp_main(void){
-    REG_SYSCFG1 &= ~0x10000000u;
-    REG_VCR20 = APBASE;
-    REG_OSDSZ |= 0x10000000u;               /* enable (emu; loader sets on HW) */
-    /* Candidate strides (bytes/row, 4bpp): 240=480px, 288=576, 308=616, 360=720,
-     * 416=832, 480=960. Each band is 12 rows tall in ITS OWN stride space,
-     * stacked by writing at row0 = band*12 lines * that stride is messy; instead
-     * give each band a fixed byte window and draw 2 text rows in it. */
-    static const int strides[6]={240,288,308,360,416,480};
-    for(int b=0;b<6;b++){
-        int st=strides[b];
-        int row0=b*16;                       /* 16 byte-rows per band start */
-        char lab[20]; int n=0;
-        lab[n++]='S'; lab[n++]='='; 
-        lab[n++]=d1(st/100); lab[n++]=d1((st/10)%10); lab[n++]=d1(st%10);
-        lab[n++]=' ';
-        const char *t="OSD stride test 0123";
-        for(int k=0;t[k];k++) lab[n++]=t[k];
-        lab[n]=0;
-        draw(0,0,st,row0,lab,15);            /* 1 text row per band, index 15 */
+    REG_SYSCFG1 &= ~0x10000000u; REG_VCR20 = APBASE; REG_OSDSZ |= 0x10000000u;
+    for(int r=0;r<6;r++){                 /* 6 lines * 8 * 360 = 17280 < region */
+        char line[40];int n=0;
+        line[n++]='S';line[n++]='=';line[n++]='3';line[n++]='6';line[n++]='0';line[n++]=' ';
+        line[n++]='r';line[n++]=d1(r);line[n++]=' ';
+        const char *t="CT952 stride360 ABCDEFG abcdefg 0123";
+        for(int k=0;t[k];k++)line[n++]=t[k]; line[n]=0;
+        draw(0,r,line,(uint8_t)(r+1));            /* index r+1 (1..9) */
     }
     flush();
     for(;;){}

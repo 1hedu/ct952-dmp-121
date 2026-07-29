@@ -1,38 +1,45 @@
-/* Geometry-PROOF readout of the real OSD stride.
+/* Vertical-mapping + stride-verification probe (stride now KNOWN = 308).
  *
- * Every pixel-addressed probe so far has been unreadable on the panel, because
- * the row-mapping is the very thing that is broken -- so any pattern drawn in
- * (x,y) is garbled by definition, and asking for fine detail from a photo was a
- * bad design. What the user CAN report reliably is colour and rough proportion.
+ * On-hardware result from the byte-space bucket readout: the bar landed in the
+ * QUARTER bucket, so REG_MCU_VCR23 >> 16 == 308 -- the scanout row stride is 308
+ * bytes, straight off the chip. That photo also proved the buffer is LINEAR
+ * (contiguous byte runs rendered as clean solid bands; a tiled or swizzled layout
+ * could not do that), and that the region's content is painted roughly TWICE
+ * vertically with black filling the remainder -- i.e. the leftover problem is the
+ * VERTICAL mapping, not the pitch. The OSD window is 240 lines
+ * (REG_DISP_OSD_SIZE = 0x00f002d0 -> 720x240) while our region is only 78.
  *
- * So this writes purely in BYTE space: contiguous byte ranges of the OSD buffer.
- * However the hardware maps memory to the screen, a contiguous run of buffer
- * bytes lands as a contiguous run of the raster, so a "fraction of the buffer"
- * reads back as "fraction of the visible area" no matter what the stride is.
+ * This probe measures both axes at once, with features big enough to survive a
+ * photo:
+ *   - LEFT half (x < 240): horizontal bands 6 rows tall, alternating white/yellow
+ *     -> counting bands gives the vertical scale and the duplication factor
+ *       (13 bands per copy == 1:1; 6-7 == squashed 2x; 26 == doubled).
+ *   - RIGHT half (x >= 240): solid yellow.
+ *   - The boundary at x=240 is a STRAIGHT VERTICAL EDGE iff the row stride is
+ *     right. Any slant/staircase in that edge is the stride error, directly
+ *     visible. This is the pixel-space confirmation of stride 308.
+ *   - Rows 0..2 are a solid white cap so the top of the region is identifiable.
  *
- * Encoding: bar length = (VCR23 >> 16) * 32 bytes, filled with index 2, rest of
- * the region index 1. So the fraction of the screen covered by colour-2 reports
- * the stride directly (region = 24024 bytes):
- *      stride   0 (unprogrammed) ->   0%  (no bar at all)
- *      stride 308               ->  41%
- *      stride 360               ->  48%
- *      stride 616               ->  82%
- * Distinguishing none / ~40% / ~half / ~80% by eye is easy, and it needs no
- * legible pixels. Reads VCR23 only; writes no display registers.
+ * Writes no display registers (reads VCR23 only, falls back to 308).
  */
 #include <stdint.h>
 
 #define APBASE      0x40084000u
-#define REGION      (308u * 78u)          /* 24024 bytes, the AP OSD region     */
+#define ROWS        78u
+#define VIS_W       480         /* the panel's visible width */
+#define SPLIT       240         /* left/right boundary -> vertical edge test */
+#define BAND        6           /* band height in rows */
+
 #define REG_VCR23   (*(volatile uint32_t *)0x80000D8Cu)
-#define REG_VCR22   (*(volatile uint32_t *)0x80000D88u)
 #define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
 #define REG_SYSCFG1 (*(volatile uint32_t *)0x8000031Cu)
 
-#define IDX_BAR  2      /* the "measure me" colour */
-#define IDX_BG   1      /* yellow, per the loader's live palette */
+#define IDX_A  2      /* white  */
+#define IDX_B  1      /* yellow */
 
 static volatile uint8_t *const FB = (volatile uint8_t *)APBASE;
+static uint32_t g_stride = 308;
+static uint32_t g_limit  = 308u * ROWS;
 
 static void flush(void){
     REG_CACHE &= ~0x00040000u; REG_CACHE |= 0x00400000u;
@@ -40,32 +47,33 @@ static void flush(void){
     REG_CACHE |= 0x00040000u;
 }
 
-/* fill a byte range with an index duplicated into both 4bpp nibbles, so the run
- * is one flat colour regardless of pixel phase */
-static void fill_bytes(uint32_t from, uint32_t to, uint8_t idx){
-    uint8_t b = (uint8_t)((idx << 4) | (idx & 0x0F));
-    if (to > REGION) to = REGION;
-    for (uint32_t i = from; i < to; i++) FB[i] = b;
+static void px(int x, int y, uint8_t c){
+    if (x < 0 || y < 0 || (uint32_t)y >= ROWS) return;
+    uint32_t off = (uint32_t)y * g_stride + ((uint32_t)x >> 1);
+    if (off >= g_limit) return;
+    volatile uint8_t *p = FB + off;
+    if (x & 1) *p = (uint8_t)((*p & 0xF0) | (c & 0x0F));
+    else       *p = (uint8_t)((*p & 0x0F) | ((c & 0x0F) << 4));
 }
 
 int pyapp_main(void){
-    uint32_t stride, bar;
+    uint32_t s;
+    REG_SYSCFG1 &= ~0x10000000u;              /* keep the watchdog dead */
 
-    REG_SYSCFG1 &= ~0x10000000u;           /* keep the watchdog dead */
+    s = REG_VCR23 >> 16;                      /* hardware stride; 308 expected */
+    if (s >= 64u && s <= 4096u) g_stride = s;
+    g_limit = g_stride * ROWS;
+    if (g_limit > 0x5DD8u) g_limit = 0x5DD8u;  /* stay inside the 24024B region */
 
-    stride = REG_VCR23 >> 16;              /* the hardware's own row increment */
-
-    /* Discrete buckets, not a proportional bar: 41% vs 48% is not separable by
-     * eye, but none/quarter/half/three-quarters/full is. Each candidate stride
-     * gets its own unmistakable bar length. */
-    if (stride == 0u)        bar = 0u;                  /* UNPROGRAMMED         */
-    else if (stride == 308u) bar = REGION / 4u;         /* quarter              */
-    else if (stride == 360u) bar = REGION / 2u;         /* half                 */
-    else if (stride == 616u) bar = (REGION / 4u) * 3u;  /* three quarters       */
-    else                     bar = REGION;              /* some OTHER value     */
-
-    fill_bytes(0, bar, IDX_BAR);           /* proportional bar */
-    fill_bytes(bar, REGION, IDX_BG);       /* remainder */
+    for (uint32_t y = 0; y < ROWS; y++) {
+        /* left: alternating 6-row bands; right: solid yellow. The x=SPLIT edge
+         * is the stride check; the band count is the vertical-mapping check. */
+        uint8_t band = ((y / BAND) & 1u) ? IDX_B : IDX_A;
+        for (int x = 0; x < SPLIT; x++)      px(x, (int)y, band);
+        for (int x = SPLIT; x < VIS_W; x++)  px(x, (int)y, IDX_B);
+    }
+    for (uint32_t y = 0; y < 3u; y++)         /* white cap = top of region */
+        for (int x = 0; x < VIS_W; x++) px(x, (int)y, IDX_A);
 
     flush();
     for (;;){}

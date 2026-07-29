@@ -6330,3 +6330,40 @@ circular and worthless.
 STILL OPEN: what the SEL>=0x20 stride doubling means physically (interlaced field
 scan vs OSD horizontal upscale, cf. REG_MCU_VCR25 "OSD upscalling"), and the
 two-field layout (two near-identical VCR setup blocks at 0xa5760/0xa5814).
+
+---
+
+### 10.19 CONFIRMED ON HARDWARE: OSD stride = 308, buffer is linear, banding is vertical
+
+First hard measurement off the real DP700WD (photo of the panel), using a
+byte-space bucket readout (the AP fills contiguous BYTE ranges of the region, so
+the pattern cannot be garbled by the very row-mapping under test, and reports
+`REG_MCU_VCR23 >> 16` as one of five unmistakable bar lengths):
+
+- **The bar landed in the QUARTER bucket => stride == 308 bytes.** This is the
+  hardware's own Y-increment read back from VCR23, not an inference. It confirms
+  the RE'd formula of 10.18 (`stride = W >> CM` = 616 >> 1 = 308) and confirms
+  `DS_OSDFRAME_ST_AP = 0x40084000` (dvd_dram_16m.h:246) is the right buffer.
+- **The OSD buffer is LINEAR.** Contiguous byte runs rendered as clean, solid,
+  full-width bands. A tiled/swizzled/bank-interleaved layout could not produce
+  that, so plain `off = y*stride + (x>>1)` addressing is correct.
+- **The residual "2 bands" is a VERTICAL mapping artifact, not a pitch error.**
+  The region's content appears ~twice with black filling the remainder. Cause:
+  `REG_DISP_OSD_SIZE = 0x00f002d0` = a **720x240** OSD window, while the AP region
+  is only 616x78 -- the scanout keeps fetching past the 24024-byte region for the
+  remaining ~162 lines. Interlace (PSCAN_EN clear, 10.18) plus the two VCR base
+  blocks are the likely duplication mechanism.
+- Corollary: earlier pixel-space probes at stride 308 looked "garbled" mostly
+  because 8px-tall text cannot survive the vertical duplication/squash, and the
+  early builds also clobbered the loader's DISP config by writing VCR20/OSD_SIZE.
+  Byte-space or large-feature drawing at stride 308 renders cleanly.
+
+**Practical rule for any AP drawing to the OSD:** read `stride = VCR23 >> 16`
+(don't assume), write pixels as `off = y*stride + (x>>1)` capped to the 24024-byte
+region, write NO display registers, and keep features tall (>= ~6 rows) until the
+vertical mapping is pinned down.
+
+NEXT: pin the vertical mapping -- probe with 6-row alternating bands (count of
+bands on screen gives the vertical scale/duplication factor) plus a hard
+left/right colour split, whose boundary is a straight vertical edge iff the
+stride is right (pixel-space confirmation of 308).

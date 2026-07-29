@@ -582,6 +582,22 @@ int main(int argc, char **argv)
         } else perror(flashout_path);
     }
 
+    if (getenv("CT952_DUMP_OSD")) {
+        int i;
+        fprintf(stderr, "[OSD-REGS] VCR20 base=0x%08x  VCR21=0x%08x  VCR22 wh=0x%08x  "
+                "VCR23 inc=0x%08x  VCR24=0x%08x\n",
+                machine_io_get(m, 0xD80), machine_io_get(m, 0xD84),
+                machine_io_get(m, 0xD88), machine_io_get(m, 0xD8C),
+                machine_io_get(m, 0xD90));
+        fprintf(stderr, "[OSD-REGS] OSD_POS(1A50)=0x%08x  OSD_SIZE(1A54)=0x%08x  "
+                "OSD_CR(1A58)=0x%08x  OSD_CR1(1A5C)=0x%08x\n",
+                machine_io_get(m, 0x1A50), machine_io_get(m, 0x1A54),
+                machine_io_get(m, 0x1A58), machine_io_get(m, 0x1A5C));
+        for (i = 0; i < 16; i++)
+            fprintf(stderr, "[OSD-REGS] GAM_OSD[%2d]=0x%08x\n",
+                    i, machine_io_get(m, 0x1C00 + (uint32_t)i * 4));
+    }
+
     if (fb_path) {
         int r = machine_disp_scanout(m, fb_addr, fb_w, fb_h, fb_stride, fb_path);
         if (r < 0)

@@ -274,32 +274,26 @@ static int g_glyphtab_ready;
 static int con_col, con_row, con_on;
 static uint8_t con_fg = 0x0F, con_bg = 0x00;
 
-/* The panel's OSD plane is 4bpp (16-color, GDI_OSD_4B_MODE): 2 pixels per byte,
- * big-endian nibble order (even x -> high nibble, odd x -> low nibble, per
- * gdi.c _gdi_SetPixel), row stride = width/2 bytes. Writing 8bpp (1 byte/pixel)
- * produced the scrambled vertical-stripe band on hardware. */
-#define OSD_STRIDE   (g_osd_w >> 1)               /* bytes per row (4bpp) */
-#define BG_FILL_BYTE ((uint8_t)((con_bg << 4) | (con_bg & 0x0F)))
-static void osd_setpix(int x, int y, uint8_t color) {
-    volatile uint8_t *p = g_osd_fb + (uint32_t)y * OSD_STRIDE + (x >> 1);
-    if (x & 1) *p = (uint8_t)((*p & 0xF0) | (color & 0x0F));         /* odd -> low  */
-    else       *p = (uint8_t)((*p & 0x0F) | ((color & 0x0F) << 4));  /* even -> high */
-}
+/* The firmware's standard OSD plane is 8bpp at DS_OSDFRAME_ST (0x4005F000),
+ * stride = width bytes, one byte per pixel = palette index (DP700WD_HW_REFERENCE
+ * §8.4/§10.16; _gdi_SetPixel 8B mode). We reconfigure the display to this plane
+ * rather than the AP loader's 4bpp band. */
+#define OSD_STRIDE   (g_osd_w)                     /* bytes per row (8bpp) */
+#define BG_FILL_BYTE (con_bg)
 static void osd_glyph(int cx, int cy, uint8_t ch) {
     if (ch < 0x20 || ch > 0x7F) ch = 0x20;
     const uint8_t *g = font8x8[ch - 0x20];
     for (int row = 0; row < 8; row++) {
-        int py = cy * 8 + row;
+        volatile uint8_t *p = g_osd_fb + (uint32_t)(cy * 8 + row) * OSD_STRIDE + cx * 8;
         uint8_t bits = g[row];                    /* LSB = leftmost pixel */
         for (int b = 0; b < 8; b++)
-            osd_setpix(cx * 8 + b, py, (bits & (1u << b)) ? con_fg : con_bg);
+            p[b] = (bits & (1u << b)) ? con_fg : con_bg;
     }
 }
 static void osd_scroll(void) {
-    int stride = OSD_STRIDE;
-    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * stride),
-            (size_t)(g_osd_h - 8) * stride);
-    memset((void *)(g_osd_fb + (g_osd_h - 8) * stride), BG_FILL_BYTE, 8 * stride);
+    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * OSD_STRIDE),
+            (size_t)(g_osd_h - 8) * OSD_STRIDE);
+    memset((void *)(g_osd_fb + (g_osd_h - 8) * OSD_STRIDE), BG_FILL_BYTE, 8 * OSD_STRIDE);
 }
 static void osd_putc(char c) {
     if (c == '\n')      { con_col = 0; con_row++; }
@@ -325,52 +319,45 @@ void ct952_console_write(const char *s, unsigned int len) {
  * "white line"), capped so it never runs into our code at 0x400c0000. */
 static uint32_t g_osd_clearbytes = OSD_W * OSD_H;
 
+/* Reconfigure the OSD to the firmware's STANDARD plane and draw there, instead
+ * of inheriting the AP loader's 4bpp 616x78 band. All values are source/doc
+ * verified (DP700WD_HW_REFERENCE §8.4/10.16): 8bpp plane at DS_OSDFRAME_ST
+ * (0x4005F000), stride = width (480), window OSD_SIZE=0x00f002d0 (720x240) at
+ * OSD_POS=0x0017006c, palette in BT.601 YUV gated by REG_DISP_BRIGHT_CR bit24,
+ * index 0 = transparent color key. */
+#define REG_DISP_OSD_POS_R   (*(volatile uint32_t *)0x80001A50u)
+#define REG_DISP_BRIGHT_CR   (*(volatile uint32_t *)0x80001A60u)
+#define YUV_BLACK            0x00108080u          /* Y=16  U=V=128 */
+#define YUV_WHITE            0x00EB8080u          /* Y=235 U=V=128 */
+
 /* palette + clear + enable the plane + turn the console on */
 static void console_setup(void) {
     ct952_watchdog_off();                         /* belt-and-suspenders: no reset */
 
-    /* Adopt the AP loader's OSD region geometry, which our AP inherits verbatim
-     * (aploader.c AP_Loader: wWidth=616, wHeight=78, bColorMode=GDI_OSD_4B_MODE,
-     * base=DS_OSDFRAME_ST_AP). It's a WIDE, SHORT 4bpp band -- the "Loading"
-     * banner. Stride = wWidth/2 = 308 bytes (4bpp). Using 480 gave the wrong
-     * stride and scrambled the text into the band you saw. */
-    g_osd_w = 616; g_osd_h = 78;
-    g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;   /* 77 cols x 9 rows */
+    /* Draw to the firmware's OSD plane: 8bpp, 480-wide, at DS_OSDFRAME_ST. */
+    g_osd_w = OSD_W; g_osd_h = OSD_H;              /* 480 x 240, stride 480 */
+    g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;
+    g_osd_fb = OSD_FB;                             /* 0x4005F000 */
 
-    /* Resolve the LIVE OSD framebuffer: draw where the display DMA is actually
-     * scanning (REG_MCU_VCR20), which the AP loader set to its "Loading" buffer.
-     * If VCR20 isn't a sane DRAM address, fall back to DS_OSDFRAME_ST and point
-     * the channel at it ourselves. */
-    uint32_t base = REG_MCU_VCR20;
-    if (base < DRAM_BASE || base + (uint32_t)(g_osd_w * g_osd_h) > DRAM_TOP) {
-        base = OSD_FB_ADDR;
-        REG_MCU_VCR20 = base;
-        REG_MCU_VCR21 = base;
-    }
-    g_osd_fb = (volatile uint8_t *)(uintptr_t)base;
+    /* Point the OSD read channel at our plane and program the window the firmware
+     * uses (the emulator/hardware scans the OSD from REG_MCU_VCR20). */
+    REG_MCU_VCR20 = OSD_FB_ADDR;
+    REG_MCU_VCR21 = OSD_FB_ADDR;
+    REG_DISP_OSD_POS_R = 0x0017006Cu;             /* documented OSD window position */
+    REG_OSD_SIZE = DISP_OSD_EN | 0x00F002D0u;     /* enable | 720x240 window */
 
-    /* Clear GENEROUSLY: wipe well past the visible area so any leftover loader
-     * content below our text (the "white line 2/3 down") is blanked too. Capped
-     * so we never touch our own code at 0x400c0000 / run past DRAM. */
-    {
-        uint32_t ceil = base < 0x400c0000u ? 0x400c0000u : DRAM_TOP;
-        uint32_t avail = ceil - base;
-        g_osd_clearbytes = avail > 0x60000u ? 0x60000u : avail;   /* <= 384 KB */
-    }
+    /* Palette: unlock gamma/palette RAM (BRIGHT_CR bit24), then load YUV entries.
+     * Index 0 is the transparent key -- use a non-zero background index. */
+    REG_DISP_BRIGHT_CR |= 0x01000000u;
+    con_bg = 0x01; con_fg = 0x0F;
+    GAM_OSD[con_bg] = YUV_BLACK;
+    GAM_OSD[con_fg] = YUV_WHITE;
 
-    /* OSD palette entries carry a mix_en attribute in bit24; the DISP blends the
-     * OSD onto the output only when it's set (else the pixel is transparent =
-     * invisible). Also use a NON-ZERO background index: palette index 0 is often
-     * the hardware transparent key, so an index-0 "black" background would show
-     * the video plane behind it (possibly the leftover line). Index 2 = opaque
-     * black; index 15 = opaque white. */
-    con_bg = 0x02; con_fg = 0x0F;
-    GAM_OSD[con_bg] = 0x01000000;                 /* opaque black */
-    GAM_OSD[con_fg] = 0x01FFFFFF;                 /* opaque white */
+    /* Clear the whole plane (480*240) to the opaque background. */
+    g_osd_clearbytes = (uint32_t)(g_osd_w * g_osd_h);
     for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = BG_FILL_BYTE;
     con_col = con_row = 0;
     con_on = 1;
-    REG_OSD_SIZE |= DISP_OSD_EN;                   /* keep loader geometry, ensure enabled */
     osd_flush();
 
     /* Self-test banner drawn DIRECTLY (not via MicroPython's print path): if the

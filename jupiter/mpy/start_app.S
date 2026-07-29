@@ -69,51 +69,39 @@ _app_init:
         st      %g2, [%g1]
 
         /* ---- early screen paint: diagnostic + validates the OSD path ----------
-         * Before the C runtime even starts, fill the LIVE OSD buffer (the address
-         * the display DMA reads, REG_MCU_VCR20) with palette index 1, set that
-         * entry to OPAQUE white (mix_en bit24 | white -- the firmware always sets
-         * bit24; our earlier 0x00FFFFFF had it clear, so the OSD pixel was never
-         * mixed onto the output = invisible), enable the plane, point the OSD DMA
-         * at the buffer, and flush the D-cache. If the panel turns solid white,
-         * our code runs and the OSD path is correct; the C console then clears it
-         * and draws text. Uses only %g regs (no stack yet). */
-        set     0x80000D80, %g1         /* REG_MCU_VCR20: OSD read base */
-        ld      [%g1], %g2              /* g2 = live OSD buffer */
-        set     0x40000000, %g3
-        cmp     %g2, %g3
-        blu     10f                     /* < 0x40000000 -> invalid */
-        nop
-        set     0x401d0000, %g3
-        cmp     %g2, %g3
-        blu     11f                     /* 0x40000000 <= base < 0x401d0000 -> ok */
-        nop
-10:     set     0x40084000, %g2         /* fallback: DS_OSDFRAME_ST_AP */
-11:
-        set     0x80001C00, %g1         /* GAM_OSD palette RAM */
-        set     0x01000000, %g3
-        st      %g3, [%g1]              /* [0] = mix_en | black */
-        set     0x01FFFFFF, %g3
-        st      %g3, [%g1 + 4]          /* [1] = mix_en | white */
-        set     0x11111111, %g3         /* index-1 in BOTH nibbles (4bpp solid) */
+         * Reconfigure the display to the FIRMWARE'S standard OSD plane (8bpp at
+         * DS_OSDFRAME_ST 0x4005F000, stride 480, window 720x240 @ (108,23), YUV
+         * palette gated by BRIGHT_CR bit24) and fill it solid white (index 1),
+         * BEFORE the C runtime. If the panel turns solid white, our code runs and
+         * this documented OSD config is right; the C console then clears it and
+         * draws text. Uses only %g regs (no stack yet). */
+        set     0x4005F000, %g2         /* g2 = DS_OSDFRAME_ST (the firmware OSD plane) */
+        set     0x80001A60, %g1         /* REG_DISP_BRIGHT_CR: unlock palette RAM */
+        ld      [%g1], %g3
+        sethi   %hi(0x01000000), %g4
+        or      %g3, %g4, %g3
+        st      %g3, [%g1]
+        set     0x80001C00, %g1         /* GAM_OSD palette RAM (BT.601 YUV) */
+        set     0x00108080, %g3
+        st      %g3, [%g1]              /* [0] = YUV black (index 0 is transparent-key anyway) */
+        set     0x00EB8080, %g3
+        st      %g3, [%g1 + 4]          /* [1] = YUV white */
+        set     0x01010101, %g3         /* index-1 bytes (8bpp solid) */
         mov     %g2, %g4
-        set     49152, %g5              /* fill 192 KB (covers up to ~480x409); stays
-                                         * below both the AP body and our code even
-                                         * when base is near the validity bound */
+        set     28800, %g5              /* 480*240/4 words = full plane */
 12:     st      %g3, [%g4]
         subcc   %g5, 1, %g5
         bne     12b
         add     %g4, 4, %g4
-        /* Ensure the OSD plane is enabled but KEEP the loader's geometry
-         * (REG_DISP_OSD_SIZE encodes this panel's real w/h -- do not clobber it,
-         * console_setup reads it back). Just OR in the enable bit (bit28). */
-        set     0x80001A54, %g1         /* REG_DISP_OSD_SIZE */
-        ld      [%g1], %g3
-        sethi   %hi(0x10000000), %g4    /* DISP_OSD_EN (bit28) */
-        or      %g3, %g4, %g3
+        /* OSD window: position (108,23), enable | 720x240 */
+        set     0x80001A50, %g1         /* REG_DISP_OSD_POS */
+        set     0x0017006C, %g3
         st      %g3, [%g1]
+        set     0x10F002D0, %g3         /* DISP_OSD_EN | (240<<16) | 720 */
+        st      %g3, [%g1 + 4]          /* REG_DISP_OSD_SIZE (0x80001A54) */
         set     0x80000D80, %g1
-        st      %g2, [%g1]              /* VCR20 = base */
-        st      %g2, [%g1 + 4]          /* VCR21 = base */
+        st      %g2, [%g1]              /* VCR20 = 0x4005F000 */
+        st      %g2, [%g1 + 4]          /* VCR21 = 0x4005F000 */
         set     0x80000014, %g1         /* REG_PLAT_CACHE_CTRL */
         ld      [%g1], %g3
         set     0x00040000, %g4

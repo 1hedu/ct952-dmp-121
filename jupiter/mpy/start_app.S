@@ -94,7 +94,7 @@ _app_init:
         st      %g3, [%g1]              /* [0] = mix_en | black */
         set     0x01FFFFFF, %g3
         st      %g3, [%g1 + 4]          /* [1] = mix_en | white */
-        set     0x01010101, %g3         /* index-1 words */
+        set     0x11111111, %g3         /* index-1 in BOTH nibbles (4bpp solid) */
         mov     %g2, %g4
         set     49152, %g5              /* fill 192 KB (covers up to ~480x409); stays
                                          * below both the AP body and our code even

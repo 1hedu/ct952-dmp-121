@@ -274,20 +274,32 @@ static int g_glyphtab_ready;
 static int con_col, con_row, con_on;
 static uint8_t con_fg = 0x0F, con_bg = 0x00;
 
+/* The panel's OSD plane is 4bpp (16-color, GDI_OSD_4B_MODE): 2 pixels per byte,
+ * big-endian nibble order (even x -> high nibble, odd x -> low nibble, per
+ * gdi.c _gdi_SetPixel), row stride = width/2 bytes. Writing 8bpp (1 byte/pixel)
+ * produced the scrambled vertical-stripe band on hardware. */
+#define OSD_STRIDE   (g_osd_w >> 1)               /* bytes per row (4bpp) */
+#define BG_FILL_BYTE ((uint8_t)((con_bg << 4) | (con_bg & 0x0F)))
+static void osd_setpix(int x, int y, uint8_t color) {
+    volatile uint8_t *p = g_osd_fb + (uint32_t)y * OSD_STRIDE + (x >> 1);
+    if (x & 1) *p = (uint8_t)((*p & 0xF0) | (color & 0x0F));         /* odd -> low  */
+    else       *p = (uint8_t)((*p & 0x0F) | ((color & 0x0F) << 4));  /* even -> high */
+}
 static void osd_glyph(int cx, int cy, uint8_t ch) {
     if (ch < 0x20 || ch > 0x7F) ch = 0x20;
     const uint8_t *g = font8x8[ch - 0x20];
     for (int row = 0; row < 8; row++) {
-        volatile uint8_t *p = g_osd_fb + (cy * 8 + row) * g_osd_w + cx * 8;
+        int py = cy * 8 + row;
         uint8_t bits = g[row];                    /* LSB = leftmost pixel */
         for (int b = 0; b < 8; b++)
-            p[b] = (bits & (1u << b)) ? con_fg : con_bg;
+            osd_setpix(cx * 8 + b, py, (bits & (1u << b)) ? con_fg : con_bg);
     }
 }
 static void osd_scroll(void) {
-    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * g_osd_w),
-            (size_t)(g_osd_h - 8) * g_osd_w);
-    memset((void *)(g_osd_fb + (g_osd_h - 8) * g_osd_w), con_bg, 8 * g_osd_w);
+    int stride = OSD_STRIDE;
+    memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * stride),
+            (size_t)(g_osd_h - 8) * stride);
+    memset((void *)(g_osd_fb + (g_osd_h - 8) * stride), BG_FILL_BYTE, 8 * stride);
 }
 static void osd_putc(char c) {
     if (c == '\n')      { con_col = 0; con_row++; }
@@ -353,7 +365,7 @@ static void console_setup(void) {
     con_bg = 0x02; con_fg = 0x0F;
     GAM_OSD[con_bg] = 0x01000000;                 /* opaque black */
     GAM_OSD[con_fg] = 0x01FFFFFF;                 /* opaque white */
-    for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = con_bg;
+    for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = BG_FILL_BYTE;
     con_col = con_row = 0;
     con_on = 1;
     REG_OSD_SIZE |= DISP_OSD_EN;                   /* keep loader geometry, ensure enabled */
@@ -375,7 +387,7 @@ static void console_setup(void) {
 
 // cls() -- clear the screen and home the cursor.
 static mp_obj_t ct952_cls(void) {
-    for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = con_bg;
+    for (uint32_t i = 0; i < g_osd_clearbytes; i++) g_osd_fb[i] = BG_FILL_BYTE;
     con_col = con_row = 0;
     osd_flush();
     return mp_const_none;

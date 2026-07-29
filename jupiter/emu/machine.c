@@ -3885,13 +3885,28 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
          * drawn UI (menu/cursor/icons) is visible in isolation for debugging. */
         int osd_only = getenv("CT952_OSD_ONLY") != NULL;
         if (osd_only) have_video = 0;
+        /* The real CT952A OSD plane is 4bpp (16-color, GDI_OSD_4B_MODE): 2 pixels
+         * per byte, big-endian nibbles (even x -> high), stride = w/2 bytes. The
+         * model defaulted to 8bpp, so an 8bpp client "worked" here but scrambled
+         * on hardware. CT952_OSD_4BPP selects the faithful 4bpp decode. */
+        int osd_4bpp = getenv("CT952_OSD_4BPP") != NULL;
         uint32_t vw = m->jpeg_w > 0 ? (uint32_t)m->jpeg_w : 640u;
         uint32_t vh = m->jpeg_h > 0 ? (uint32_t)m->jpeg_h : 360u;
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++) {
-                uint64_t lin = (uint64_t)y * stride + x;
-                int in_osd = osd_en && (osd_base + lin < osd_end);
-                uint8_t idx = in_osd ? fb[lin] : 0;
+                uint64_t lin, boff;
+                int in_osd;
+                uint8_t idx;
+                if (osd_4bpp) {
+                    boff = (uint64_t)y * (w >> 1) + (x >> 1);
+                    in_osd = osd_en && (osd_base + boff < osd_end);
+                    idx = in_osd ? (uint8_t)((x & 1) ? (fb[boff] & 0x0F)
+                                                     : (fb[boff] >> 4)) : 0;
+                } else {
+                    lin = (uint64_t)y * stride + x;
+                    in_osd = osd_en && (osd_base + lin < osd_end);
+                    idx = in_osd ? fb[lin] : 0;
+                }
                 uint32_t c;
                 if (idx == 0 && osd_only) {
                     c = 0;   /* OSD-only debug view: transparent -> black */

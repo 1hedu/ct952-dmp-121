@@ -6169,3 +6169,33 @@ match at 20M instrs). So the complete update path -- compressed section-table AP
 ROMLD decompress -> flasher app from DRAM -> firmware flash driver -> gate-level controller
 -> flash -> bootable image -- is verified end-to-end for a full firmware image built from
 our own binary. (Needed a 600M single-step budget for the 1.4 MB decompress + reflash.)
+
+### 12.95 MicroPython on the frame as a NON-DESTRUCTIVE run-AP (the on-device debugger)
+
+The AP loader loads a UPG952A.AP's sections into DRAM and jumps to the ProgEntry
+section -- exactly how the OEM apps launch. So MicroPython can BE the AP: no reflash,
+no brick risk, and a reboot restores stock firmware. `ctkap.py mkrunap out.AP
+<payload.bin> [--lma 0x40500000]` wraps the embedded MicroPython app (jupiter/mpy
+APP build, entry _app_start at offset 0 -- installs its own trap table/stack/PSR)
+as one Load|ProgEntry|ZIP section 'MPY '. The 0x99b48 (629 KB) payload UZIPs to
+0x1a54d -> a 0x1aa60 (109 KB) VALID AP.
+
+Verified end-to-end through the REAL loader (`--apload`, feeding the REPL over UART):
+the loader decompressed the MPY section to 0x40500000 and jumped in; MicroPython
+booted ("[pyapp] MicroPython launched ... the firmware is live: ct952.peek32/poke32/
+call"), and the fed line executed:
+
+    >>> print('PY-ON-FRAME', 6*7)
+    PY-ON-FRAME 42
+    >>>
+
+So a live, interactive MicroPython REPL with ct952.peek32/poke32/call runs on the
+device from a USB/SD UPG952A.AP -- the on-device debugger, with nothing written to
+flash. On hardware, MicroPython reads/writes UART1 (and the modeled USB HID keyboard);
+the firmware's DRAM state stays intact and inspectable from Python.
+
+**How to use it on the real frame:**
+1. `python3 jupiter/tools/ctkap.py mkrunap UPG952A.AP jupiter/mpy/build-app/firmware.bin`
+2. `python3 jupiter/tools/ctkap.py apinfo UPG952A.AP`   (every field OK)
+3. copy UPG952A.AP to the ROOT of a FAT USB stick / SD card
+4. trigger the player's update mode -> MicroPython REPL over UART1 (no flash touched)

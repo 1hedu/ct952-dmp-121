@@ -79,13 +79,13 @@ static void draw(uint32_t base,int col,int cy,int st,const char *s,uint8_t fg){
 }
 int pyapp_main(void){
     REG_SYSCFG1 &= ~0x10000000u; REG_VCR20=APBASE; REG_OSDSZ|=0x10000000u;
-    static const int st[5]={384,416,448,480,512};
+    static const int st[5]={352,356,360,364,368};
     static const char *lab[5]={
-        "S=384 CT952 stride ABCDEFG abc 0123",
-        "S=416 CT952 stride ABCDEFG abc 0123",
-        "S=448 CT952 stride ABCDEFG abc 0123",
-        "S=480 CT952 stride ABCDEFG abc 0123",
-        "S=512 CT952 stride ABCDEFG abc 0123"};
+        "S=352 CT952 stride ABCDEFG abc 0123",
+        "S=356 CT952 stride ABCDEFG abc 0123",
+        "S=360 CT952 stride ABCDEFG abc 0123",
+        "S=364 CT952 stride ABCDEFG abc 0123",
+        "S=368 CT952 stride ABCDEFG abc 0123"};
     for(int i=0;i<5;i++) draw((uint32_t)i*3600u, 0, 0, st[i], lab[i], (uint8_t)(i+1));
     flush();
     for(;;){}

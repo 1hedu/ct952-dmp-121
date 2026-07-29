@@ -118,22 +118,26 @@ static void text(int x0, int y0, const char *str, uint8_t fg, int s){
     for (int i = 0; str[i]; i++) glyph(x0 + i*8*s, y0, (uint8_t)str[i], fg, s);
 }
 
-/* --- read the frame's own display config and PRINT it ----------------------
- * Now that text renders legibly (pitch 292), the panel itself is the readout
- * channel: no UART, no guessing. This dumps the registers that decide the
- * vertical mapping, so the "repeat" can be diagnosed from actual values instead
- * of inferred from photo proportions. Reads only -- writes no display register. */
-#define R(a) (*(volatile uint32_t *)(uintptr_t)(a))
-
-static void hex8(int x, int y, const char *lbl, uint32_t v, uint8_t fg){
-    char b[16]; int i;
-    b[0]=lbl[0]; b[1]=lbl[1]; b[2]='=';
-    for (i = 0; i < 8; i++) {
-        uint32_t nib = (v >> (28 - 4*i)) & 0xFu;
-        b[3+i] = (char)(nib < 10 ? '0' + nib : 'A' + (nib - 10));
-    }
-    b[11] = 0;
-    text(x, y, b, fg, 2);
+/* --- ROW-INDEX RULER: let the panel report its own vertical mapping ---------
+ * The register dump killed both repeat theories: PSCAN_EN is SET (progressive,
+ * not interlaced) and VCR21 == VCR20 (no dual-field split). The window reads
+ * 616x78 @ (102,28), and the registers claim stride 308 while the panel only
+ * renders correctly at pitch 292. So the mechanism is unknown and further theory
+ * is not worth another flash.
+ *
+ * Instead, label the buffer: every 8th row prints its own row NUMBER, and each
+ * 8-row group gets an alternating colour tick. A photo then states outright
+ *   - which buffer rows appear, and where,
+ *   - how many panel lines each buffer row occupies (vertical scale),
+ *   - the repeat period IN BUFFER ROWS (do the numbers restart at 0? at 84?),
+ * with no inference from proportions. */
+static void num3(int x, int y, uint32_t v, uint8_t fg, int s){
+    char b[4]; int n = 0;
+    if (v >= 100u) b[n++] = (char)('0' + (v / 100u) % 10u);
+    if (v >= 10u)  b[n++] = (char)('0' + (v / 10u) % 10u);
+    b[n++] = (char)('0' + v % 10u);
+    b[n] = 0;
+    text(x, y, b, fg, s);
 }
 
 int pyapp_main(void){
@@ -141,18 +145,14 @@ int pyapp_main(void){
 
     for (uint32_t i = 0; i < REGION; i++) FB[i] = 0;   /* transparent */
 
-    /* 84 lines available (region 24576 B / pitch 292). 2x text = 16px rows. */
-    hex8(4,   1, "20", R(0x80000D80), C_HI);   /* OSD base, field 0      */
-    hex8(200, 1, "21", R(0x80000D84), C_HI);   /* OSD base, field 1      */
-    hex8(4,  18, "22", R(0x80000D88), C_TXT);  /* (height<<16)|width     */
-    hex8(200,18, "23", R(0x80000D8C), C_TXT);  /* (Yinc<<16)|Xinc        */
-    hex8(4,  35, "SZ", R(0x80001A54), C_TXT);  /* OSD window size        */
-    hex8(200,35, "PO", R(0x80001A50), C_TXT);  /* OSD window position    */
-    hex8(4,  52, "SW", R(0x80001A3C), C_HI);   /* SYNC_WH: bit28 = PSCAN */
-    hex8(200,52, "NL", R(0x80001A64), C_HI);   /* N_LINE_REPEAT          */
-    hex8(4,  68, "TG", R(0x80001A38), C_TXT);  /* TGEN totals            */
-    hex8(200,68, "CR", R(0x80001A58), C_TXT);  /* OSD control            */
-
+    for (uint32_t y = 0; y < ROWS; y += 8u) {
+        uint8_t col = ((y / 8u) & 1u) ? C_TXT : C_HI;   /* alternating groups */
+        num3(2, (int)y, y, col, 1);                     /* the row's own index */
+        /* tick bar so group boundaries are unmistakable even if digits blur */
+        for (int x = 40; x < 40 + 60; x++) px(x, (int)y, col);
+        /* a long reference rule at the right, same colour, to gauge scale */
+        for (int x = 300; x < 460; x++) px(x, (int)y, col);
+    }
     flush();
     for (;;){}
     return 0;

@@ -6537,3 +6537,44 @@ PRINT them in hex on the screen. That closes the loop that made this whole displ
 bring-up so slow (no UART, no JTAG, emulator blind on the display axis). The
 current banner does exactly that for VCR20/21/22/23, OSD_SIZE, OSD_POS, SYNC_WH,
 N_LINE_REPEAT, TGEN and OSD_CR.
+
+### 10.22 REAL display register values, read off the frame (both repeat theories dead)
+
+The AP printed the live registers on the panel. Actual DP700WD values in AP mode:
+
+| reg | value | decode |
+|---|---|---|
+| VCR20 (0xD80) | `40084000` | OSD base, field 0 |
+| VCR21 (0xD84) | `40084000` | OSD base, field 1 -- **identical to VCR20** |
+| VCR22 (0xD88) | `004E004D` | height 78 lines, width 77 units (77*4 = 308 B/line) |
+| VCR23 (0xD8C) | `01340004` | Y increment 308, X increment 4 |
+| OSD_SIZE (0x1A54) | `104E0268` | enable=1, height **78**, width **616 px** |
+| OSD_POS (0x1A50) | `001C0066` | x=102, y=28 |
+| SYNC_WH (0x1A3C) | `1014000A` | **PSCAN_EN SET => PROGRESSIVE** |
+| N_LINE_REPEAT (0x1A64) | `02000000` | |
+| TGEN (0x1A38) | `120D035A` | Vtotal 525, Htotal 858 |
+| OSD_CR (0x1A58) | `0005001A` | |
+
+**Both earlier repeat hypotheses are FALSIFIED:**
+- Not interlace: PSCAN_EN (bit 28) is **set**, so the output is progressive. (Note
+  the emulator showed `0014000A` -- bit clear -- another emulator/hardware
+  divergence.)
+- Not a dual-field split: VCR21 == VCR20, one base for both.
+- The window is **616x78**, not the 720x240 the emulator reported, so "window much
+  taller than the region" is also wrong.
+
+**The pitch conflict is now confirmed against real silicon**, not inferred: every
+register says the line stride is 308 bytes over 78 lines, yet text is only legible
+when drawn at pitch **292**. So the DMA's real line advance is NOT `VCR23 >> 16`.
+Something between the OSD read channel and the panel changes the effective advance
+(candidates not yet checked: REG_DISP_H_REQ 0x1A08 "times to access DRAM per
+line", REG_DISP_REDUNDANT 0x1A18 "redundant for 1st DRAM access", the H/V scaling
+registers 0x1A1C/0x1A20/0x1A24, and VCR25 "OSD upscaling"). 292 stays an empirical
+constant until this is explained.
+
+Next probe: a ROW-INDEX RULER. Every 8th buffer row prints its own row number with
+an alternating-colour tick. A photo then states the vertical mapping directly --
+which rows appear where, how many panel lines per buffer row, and the repeat period
+in BUFFER ROWS (do the numbers restart at 0, or continue past 84?) -- with no
+proportional inference. This is the same "make the panel report facts, not
+impressions" method that finally settled the pitch.

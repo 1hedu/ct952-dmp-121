@@ -6247,3 +6247,46 @@ the *build lineage* is DVD909; the addresses check out against the actual bytes)
   makes the emu agree with whatever stride/base you pass it. Real-display bring-up
   must be judged on the frame, or by first teaching the emu to run the loader's DISP
   setup.
+
+---
+
+### 10.18 Faithful DISP model -- RE notes (in progress)
+
+Building an emulator OSD scanout that reads geometry from the real registers
+instead of hand-fed --fb-addr/--fb-wh. Findings, all verified by disassembling
+dp700wd.bin directly (NOT via DVD909.sym -- see the warning below):
+
+- **DVD909.sym is MISALIGNED with dp700wd.bin. Do not trust its addresses.**
+  Proof: the sym puts DISP_OSDSet@0x7e594 / DISP_DisplayCtrl@0x7ea18 /
+  DISP_SetPalette@0x7ebf0, but the code THERE writes the VLD/MC video-decode
+  block (0x80002xxx: 0x2450=REG_MC_BASE+0x340, 0x21c0=REG_VLD_MBINT_CTL,
+  0x2200), not the DISP block. The **real** DISP OSD code is at file offset
+  ~0xa3000-0xa5c00 (writes OSD_CR 0x80001a58 @0xa4ca4/0xa5b1c; VCR23 @0xa57bc/
+  0xa5888). Earlier "GDI region code at 0x76ec" was a false-positive match.
+  CONSEQUENCE: the whole "call firmware GDI at sym addresses" detour was calling
+  the WRONG functions -- that is why GDI_FillRect drew nothing and DISP_OSDSet
+  never programmed an OSD register. Any future firmware-call work must locate
+  functions by register footprint, not by the symbol map.
+
+- **The OSD read channel is VCR20-23** (REG_MCU @ 0x80000d80..d8c):
+  VCR20=0xd80 base, VCR21=0xd84 base(2nd), VCR22=0xd88 (width<<16 | height),
+  VCR23=0xd8c increment/**stride**. The real setup code (~0xa5760 and ~0xa5814,
+  two near-identical blocks -> two fields/planes) computes W/H and increment
+  from DRAM display-config globals at 0x40040e78 and 0x40040eb4, then
+  `st -> VCR22` and `st (val<<shift)+4 -> VCR23`. Stride is NOT wWidth>>colormode
+  (that is only the GDI software write pitch); the SCANOUT stride is VCR23,
+  computed from the display config -- still being decoded.
+
+- **Display timing is INTERLACED NTSC at boot**: TGEN(0x1A38)=0x120d035a
+  (Vtotal=525, Htotal=858), SYNC_WH(0x1A3C) PSCAN_EN(bit28) CLEAR = interlaced.
+  Two fields shown as two spatial bands is the leading explanation for the
+  on-hardware "2 bands". GDI_REGION_INFO.dwTAddr is the "top field" buffer;
+  a bottom-field buffer/stride is the second VCR block.
+
+- Emulator instrumentation: CT952_DUMP_OSD now dumps the OSD channel
+  (0x2440-0x2460), OSD window/CR, and scan/scale/interlace regs, in both the
+  normal and --apload paths. CT952_OSD_FORCE ungates the debug scanout readback.
+
+NEXT: finish decoding the VCR22/VCR23 (stride) formula and the two-field layout,
+then rewrite machine_disp_scanout to read VCR20-23 + PSCAN_EN and composite
+(4bpp/8bpp, interlaced fields) instead of taking geometry from the command line.

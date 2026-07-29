@@ -1,39 +1,36 @@
-/* On-screen banner -- display bring-up milestone 1 (no MicroPython, no keyboard).
+/* On-screen structure probe -- resolves the vertical "2 bands" mapping.
  *
- * The SD-boot AP loader (aploader.c STEP2) reconfigures OSD region 0 to a
- * 616x78, 4bpp (GDI_OSD_4B_MODE) plane at DS_OSDFRAME_ST_AP = 0x40084000, then
- * jumps here. We INHERIT that exact environment:
- *   - stride = wWidth >> bColorMode = 616 >> 1 = 308 bytes/row  (gdi.c _gdi_SetPixel)
- *   - 2 px/byte, big-endian nibbles: even x = high nibble, odd x = low nibble
- *   - region size = 308 * 78 = 24024 bytes (0x5DD8)
- * The GDI writes the loader's own "Loading" text into this plane at stride 308,
- * and the scanout reads it back at 308 -- so 308 is authoritative, not a guess.
+ * Stride 308 is confirmed correct (no more vertical stripes / shear). What
+ * remains is how the 616x78 4bpp region at 0x40084000 maps VERTICALLY onto the
+ * panel -- the user sees "2 bands", so the region is being duplicated, split
+ * (dual-scan), scaled, or the OSD window is taller than the region.
  *
- * We set our own YUV palette (BT.601, 0x00YYUUVV, unlocked via BRIGHT_CR bit24),
- * paint an opaque blue box over the whole region, and draw white text. If the
- * panel shows a blue banner with legible white text, on-screen render works and
- * the stride is correct -- the foundation the REPL console will build on. */
+ * This draws an unambiguous frame so a single photo reveals the mapping:
+ *   - a solid yellow background over the whole region (index 1, loader palette)
+ *   - a 2px border around the exact region edges (index 2)
+ *   - a big X (both diagonals, index 3) spanning corner to corner
+ *   - full-width ruler lines with row numbers at y=0,20,40,60,77
+ *   - corner labels TL/TR/BL/BR (kept within the panel's visible 480px)
+ * One straight X + one rectangle => region shown once (correct). Two X's or a
+ * broken/mirrored X => duplication/split, and the ruler numbers quantify it.
+ *
+ * NOTE: we do NOT program the palette. On real silicon the OSD palette RAM is
+ * written only through the DISP blob's REG_VLD_SHO32 handshake (gdi.c
+ * GDI_LoadPalette->DISP_SetPalette); a bare GAM_OSD store is ignored. So we use
+ * the loader's live palette: index 1=yellow, 2/3 = black/white (empirical). */
 #include <stdint.h>
 
 #define APBASE      0x40084000u
 #define OSD_W       616
 #define OSD_H       78
-#define STRIDE      308               /* OSD_W >> 1 (4bpp)                     */
-#define REGION_END  (STRIDE*OSD_H)    /* 24024 = 0x5DD8; never write past this */
+#define STRIDE      308
+#define REGION_END  (STRIDE*OSD_H)        /* 0x5DD8 -- never write past this    */
 
-#define REG_VCR20   (*(volatile uint32_t *)0x80000D80u)  /* OSD scanout base   */
+#define REG_VCR20   (*(volatile uint32_t *)0x80000D80u)
 #define REG_VCR21   (*(volatile uint32_t *)0x80000D84u)
 #define REG_OSDSZ   (*(volatile uint32_t *)0x80001A54u)  /* bit28 = OSD enable */
-#define REG_BRIGHT  (*(volatile uint32_t *)0x80001A60u)  /* bit24 unlocks pal  */
-#define GAM_OSD     ((volatile uint32_t *)0x80001C00u)   /* palette RAM        */
 #define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
 #define REG_SYSCFG1 (*(volatile uint32_t *)0x8000031Cu)
-
-/* palette indices */
-#define C_KEY   0   /* transparent color key (DISP_OSD_T_EN)                    */
-#define C_BG    1   /* opaque blue background box                              */
-#define C_TXT   2   /* white text                                             */
-#define C_HI    3   /* yellow highlight                                        */
 
 static volatile uint8_t *const FB = (volatile uint8_t *)APBASE;
 
@@ -88,13 +85,17 @@ static const uint8_t font8x8[96][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
 };
 
+/* palette indices in the loader's live palette (empirical) */
+#define C_BG    1   /* yellow  */
+#define C_A     2   /* black or white */
+#define C_B     3   /* the other of black/white */
+
 static void flush(void){
     REG_CACHE &= ~0x00040000u; REG_CACHE |= 0x00400000u;
     for (volatile int i = 0; i < 256; i++) __asm__ __volatile__("nop");
     REG_CACHE |= 0x00040000u;
 }
 
-/* one 4bpp pixel; big-endian nibbles, hard-clamped inside the 616x78 region */
 static void px(int x, int y, uint8_t c){
     if ((unsigned)x >= OSD_W || (unsigned)y >= OSD_H) return;
     uint32_t off = (uint32_t)y * STRIDE + (x >> 1);
@@ -109,6 +110,9 @@ static void fill(uint8_t c){
         for (int x = 0; x < OSD_W; x++) px(x, y, c);
 }
 
+static void hline(int y, int x0, int x1, uint8_t c){ for (int x=x0;x<=x1;x++) px(x,y,c); }
+static void vline(int x, int y0, int y1, uint8_t c){ for (int y=y0;y<=y1;y++) px(x,y,c); }
+
 static void glyph(int px0, int py0, uint8_t ch, uint8_t fg){
     if (ch < 0x20 || ch > 0x7F) ch = 0x20;
     const uint8_t *g = font8x8[ch - 0x20];
@@ -117,38 +121,44 @@ static void glyph(int px0, int py0, uint8_t ch, uint8_t fg){
         for (int x = 0; x < 8; x++) if (b & (1u << x)) px(px0 + x, py0 + r, fg);
     }
 }
-
-/* text at pixel (px0,py0) so lines can be placed precisely inside 78 rows */
 static void text(int px0, int py0, const char *s, uint8_t fg){
     for (int i = 0; s[i]; i++) glyph(px0 + i*8, py0, (uint8_t)s[i], fg);
 }
 
-static void set_pal(int idx, uint32_t yuv){ GAM_OSD[idx] = yuv; }
-
 int pyapp_main(void){
-    REG_SYSCFG1 &= ~0x10000000u;              /* keep watchdog dead            */
-
-    /* palette: unlock RAM, then define our indices (BT.601 0x00YYUUVV) */
-    REG_BRIGHT |= 0x01000000u;
-    set_pal(C_KEY, 0x00108080u);              /* black (also the transparent key)*/
-    set_pal(C_BG,  0x002951EFu);              /* blue                          */
-    set_pal(C_TXT, 0x00EB8080u);              /* white                         */
-    set_pal(C_HI,  0x00E20095u);              /* yellow                        */
-
-    /* point scanout at our region and enable the OSD plane */
+    REG_SYSCFG1 &= ~0x10000000u;
     REG_VCR20 = APBASE;
     REG_VCR21 = APBASE;
     REG_OSDSZ |= 0x10000000u;
 
-    /* opaque blue box + white banner text (78 rows -> up to 9 lines of 8px) */
-    fill(C_BG);
-    text(8,  2,  "CT952A  ON-SCREEN  BANNER", C_HI);
-    text(8,  14, "4bpp OSD 616x78 @ 0x40084000  stride=308", C_TXT);
-    text(8,  26, "if you can read this, render + stride are", C_TXT);
-    text(8,  36, "correct -- on-panel output WORKS.", C_TXT);
-    text(8,  50, "next: MicroPython REPL -> this OSD console", C_TXT);
-    flush();
+    fill(C_BG);                               /* solid yellow field            */
 
+    /* full-height vertical lines: any slant => stride wrong, and the total
+     * horizontal drift over 78 rows measures the byte error exactly. These are
+     * the primary stride gauge (a solid fill hides stride errors; lines don't). */
+    vline(154, 0, OSD_H-1, C_B);
+    vline(308, 0, OSD_H-1, C_B);
+    vline(462, 0, OSD_H-1, C_B);
+
+    /* 2px border on the exact region edges */
+    hline(0, 0, OSD_W-1, C_A); hline(1, 0, OSD_W-1, C_A);
+    hline(OSD_H-2, 0, OSD_W-1, C_A); hline(OSD_H-1, 0, OSD_W-1, C_A);
+    vline(0, 0, OSD_H-1, C_A); vline(1, 0, OSD_H-1, C_A);
+    vline(OSD_W-2, 0, OSD_H-1, C_A); vline(OSD_W-1, 0, OSD_H-1, C_A);
+
+    /* full-width ruler lines with row numbers (dark index) */
+    hline(20, 0, OSD_W-1, C_A); text(4, 12, "20", C_A);
+    hline(40, 0, OSD_W-1, C_A); text(4, 32, "40", C_A);
+    hline(60, 0, OSD_W-1, C_A); text(4, 52, "60", C_A);
+
+    /* corner labels (kept within visible 480px; TR/BR at x=400) */
+    text(6,   4,  "TL", C_B);
+    text(400, 4,  "TR", C_B);
+    text(6,   66, "BL", C_B);
+    text(400, 66, "BR", C_B);
+    text(180, 34, "CT952A 616x78 4bpp s=308", C_B);
+
+    flush();
     for (;;){}
     return 0;
 }

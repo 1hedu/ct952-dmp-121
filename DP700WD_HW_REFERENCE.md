@@ -6578,3 +6578,50 @@ which rows appear where, how many panel lines per buffer row, and the repeat per
 in BUFFER ROWS (do the numbers restart at 0, or continue past 84?) -- with no
 proportional inference. This is the same "make the panel report facts, not
 impressions" method that finally settled the pitch.
+
+### 10.23 The repeat SOLVED: the 78-line window is painted twice, 157 lines apart
+
+The row-index ruler settled it with one photo. Observed on the frame: the top band
+showed row labels 0..72 and the bottom band **restarted at 0**, reaching ~48 before
+the panel's last line.
+
+Decoding that:
+- Top band shows rows 0..77 -- **exactly the 78-line OSD window** (OSD_SIZE height
+  = 78). The label at row 80 is outside the window, which is why it never appears.
+  So the usable height is **78 rows, not the region's 84** (24576/292).
+- The bottom band restarting at 0 means the SAME window is painted a second time.
+  With the loader's `OSD_POS y = 28`: copy 1 = panel lines 28..105, copy 2 starts at
+  233 - 48 = 185, so the **repeat period is 157 panel lines**. Copy 2's visible part
+  (185..233) is exactly the observed "bottom band 0..48".
+
+**Fix: raise OSD_POS y so copy 2 falls past the panel's last line (233).** Both
+copies derive from the same window and move together, so `y = 95` puts copy 1 at
+95..172 (fully visible) and copy 2 at 252 (off-screen), with ~18 lines of margin
+against error in the measured period. Write:
+
+```
+    REG_DISP_OSD_POS (0x80001A50) = (95 << 16) | 102      /* keep loader's x=102 */
+```
+
+This is the ONLY display register worth writing from an AP, and it is the narrowest
+possible change: position only -- no base, stride, size or timing -- and trivially
+reversible (the loader's value is 0x001C0066). Everything else must still be left
+alone.
+
+Mechanism of the duplication itself remains unexplained (not interlace, not
+dual-field, not an oversized window -- all ruled out in 10.22); 157 lines is
+suspiciously close to Vtotal/2 - 105 and may be a panel-driver artifact of the
+525-line NTSC timing feeding a 234-line progressive panel. Not needed for a usable
+display, so recorded and left open.
+
+**Consolidated, hardware-verified recipe for drawing from a bare-metal AP:**
+```
+    base   = 0x40084000     /* DS_OSDFRAME_ST_AP (2MB part)                    */
+    pitch  = 292            /* MEASURED; registers claim 308 -- see 10.22      */
+    rows   = 78             /* the OSD window height, not the region capacity  */
+    4bpp, big-endian nibbles; off = y*292 + (x>>1); clamp to 24576 bytes
+    palette (loader's): 0 = transparent key, 1 = yellow, 2 = white
+    visible width 480 px
+    write OSD_POS = (95<<16)|102 to drop the duplicate off-screen; touch no other
+    display register
+```

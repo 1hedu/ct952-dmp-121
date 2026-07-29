@@ -25,7 +25,10 @@
 #define APBASE   0x40084000u
 #define PITCH    292u                 /* MEASURED on hardware */
 #define REGION   24576u            /* DS_OSDFRAME_END_AP-ST_AP = 0x6000 */
-#define ROWS     (REGION / PITCH)     /* 84 lines */
+/* Usable height is the OSD WINDOW height (OSD_SIZE height field = 78), not the
+ * region capacity (24576/292 = 84): the hardware displays only 78 lines, proven by
+ * the row-ruler photo (labels 0..72 visible, 80 outside the window). */
+#define ROWS     78u
 #define VIS_W    480                  /* panel's visible width */
 
 #define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
@@ -118,42 +121,40 @@ static void text(int x0, int y0, const char *str, uint8_t fg, int s){
     for (int i = 0; str[i]; i++) glyph(x0 + i*8*s, y0, (uint8_t)str[i], fg, s);
 }
 
-/* --- ROW-INDEX RULER: let the panel report its own vertical mapping ---------
- * The register dump killed both repeat theories: PSCAN_EN is SET (progressive,
- * not interlaced) and VCR21 == VCR20 (no dual-field split). The window reads
- * 616x78 @ (102,28), and the registers claim stride 308 while the panel only
- * renders correctly at pitch 292. So the mechanism is unknown and further theory
- * is not worth another flash.
+/* --- final banner: single copy, repeat pushed off-screen --------------------
+ * The row-index ruler settled the repeat. The 78-line OSD window is painted TWICE
+ * on the panel, 157 lines apart: with the loader's OSD_POS y=28, copy 1 lands on
+ * panel lines 28..105 and copy 2 on 185..262, of which 185..233 is visible (which
+ * is exactly the "bottom band 0..48" that was observed). The duplicate is NOT
+ * interlace (PSCAN_EN is set), NOT a dual-field split (VCR21 == VCR20), and NOT a
+ * too-tall window (the window is 616x78) -- all three were checked and ruled out
+ * by reading the live registers (10.22).
  *
- * Instead, label the buffer: every 8th row prints its own row NUMBER, and each
- * 8-row group gets an alternating colour tick. A photo then states outright
- *   - which buffer rows appear, and where,
- *   - how many panel lines each buffer row occupies (vertical scale),
- *   - the repeat period IN BUFFER ROWS (do the numbers restart at 0? at 84?),
- * with no inference from proportions. */
-static void num3(int x, int y, uint32_t v, uint8_t fg, int s){
-    char b[4]; int n = 0;
-    if (v >= 100u) b[n++] = (char)('0' + (v / 100u) % 10u);
-    if (v >= 10u)  b[n++] = (char)('0' + (v / 10u) % 10u);
-    b[n++] = (char)('0' + v % 10u);
-    b[n] = 0;
-    text(x, y, b, fg, s);
-}
+ * Both copies derive from the same window and so move together with OSD_POS.
+ * Raising y by enough puts copy 2 past the panel's last line (233) while copy 1
+ * stays fully on screen: y=95 -> copy1 95..172, copy2 at 252 (off-screen), with
+ * ~18 lines of margin against error in the measured 157-line period.
+ *
+ * This is the ONE display register we write, and it is the narrowest possible
+ * change: position only, no base/stride/size/timing, and trivially reversible
+ * (the loader's value is 0x001C0066). */
+#define REG_OSD_POS (*(volatile uint32_t *)0x80001A50u)
 
 int pyapp_main(void){
     REG_SYSCFG1 &= ~0x10000000u;               /* keep the watchdog dead */
 
     for (uint32_t i = 0; i < REGION; i++) FB[i] = 0;   /* transparent */
 
-    for (uint32_t y = 0; y < ROWS; y += 8u) {
-        uint8_t col = ((y / 8u) & 1u) ? C_TXT : C_HI;   /* alternating groups */
-        num3(2, (int)y, y, col, 1);                     /* the row's own index */
-        /* tick bar so group boundaries are unmistakable even if digits blur */
-        for (int x = 40; x < 40 + 60; x++) px(x, (int)y, col);
-        /* a long reference rule at the right, same colour, to gauge scale */
-        for (int x = 300; x < 460; x++) px(x, (int)y, col);
-    }
+    /* 78 usable lines: 3x title (24px) + three 2x lines (16px each). */
+    text(8,  0,  "CT952A LIVE", C_HI,  3);
+    text(8,  26, "PITCH 292  WINDOW 616X78", C_TXT, 2);
+    text(8,  44, "SINGLE COPY - REPEAT FIXED", C_TXT, 2);
+    text(8,  60, "NEXT: MICROPYTHON REPL", C_HI,  2);
     flush();
+
+    /* move the window down so the duplicate falls off the bottom edge */
+    REG_OSD_POS = (95u << 16) | 102u;          /* y=95, keep the loader's x=102 */
+
     for (;;){}
     return 0;
 }

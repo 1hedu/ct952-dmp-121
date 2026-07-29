@@ -1,69 +1,56 @@
-/* Bring-up via the firmware's OWN GDI, called from the bare-metal AP.
+/* Measurement grid -- designed to be MEASURED off a photo, not described.
  *
- * Manual pixel-poking into 0x40084000 keeps rendering garbled, so stop guessing
- * the pixel format and call the firmware's renderer -- the exact code that draws
- * the loader's own text, so it uses the real stride/geometry by construction.
- *
- * gdi.c is compiled with GDI_WITHOUT_OS + GDI_STANDALONE_LIBRARY (gdi.c:25-26):
- * no mutexes, no OS, no OSD-module calls in the draw path -- safe to call bare
- * metal. Addresses are XIP offsets from the firmware symbol map, verified by
- * disassembling dp700wd.bin (chip = CT952A; the map is DVD909-toolchain lineage,
- * but the bytes at these offsets are the matching GDI functions).
- *
- * We replicate aploader.c STEP2 (lines 116-123) exactly: configure region 0 as
- * 616x78 4bpp @ 0x40084000, GDI_InitialRegion (programs the DISP block via
- * DISP_OSDSet), clear, activate -- then GDI_FillRect two rectangles. If the panel
- * shows two crisp, correctly-placed rectangles (not sheared), the firmware-call
- * path works and the region config is sound; text via GDI_DrawString is next.
+ * We keep failing the blind loop because a pixel-exact problem (stride + the
+ * vertical "2 bands") can't be resolved from words. This draws the simplest
+ * high-contrast pattern whose distortion encodes the answer:
+ *   - solid yellow field (index 1, the loader's live palette)
+ *   - 3 thick HORIZONTAL bars (index 2) at rows 8, 36, 64  -> their spacing and
+ *     count on-screen shows the vertical mapping: 3 bars once = 1:1; 6 bars or a
+ *     split = the "2 bands" (duplication / interlace / line-repeat), and where
+ *     they land quantifies it.
+ *   - 3 thick VERTICAL bars (index 3) at cols 100, 300, 500 -> if the row stride
+ *     is right they are vertical; any slant is the stride error, measurable from
+ *     the top-to-bottom horizontal drift.
+ * No text, no display-register writes (those either clobber the loader's config
+ * or, via GDI, blanked the panel). Just pixels into the loader's region at the
+ * best-known stride, for a photo.
  */
 #include <stdint.h>
 
-typedef uint16_t WORD;
-typedef uint8_t  BYTE;
-typedef uint32_t DWORD;
-
-/* firmware struct layouts (gdi.h / comdef.h), same m32 BE ABI */
-typedef struct { DWORD wWidth, wHeight; BYTE bColorMode; DWORD dwTAddr; } GDI_REGION_INFO;
-typedef struct { WORD wLeft, wTop, wRight, wBottom; } URECT;
-typedef struct { URECT rect; BYTE bColor; BYTE *bShadePtr; } PARM_RECT;
-
-/* firmware GDI entry points (XIP, verified vs dp700wd.bin) */
-#define GDI_ConfigRegionInfo ((void (*)(BYTE, GDI_REGION_INFO *))0x00007798u)
-#define GDI_InitialRegion    ((void (*)(BYTE))0x00007818u)
-#define GDI_ClearRegion      ((void (*)(BYTE))0x000078b4u)
-#define GDI_ActivateRegion   ((void (*)(BYTE))0x00007904u)
-#define GDI_FillRect         ((void (*)(BYTE, PARM_RECT *))0x00007cdcu)
+#define APBASE      0x40084000u
+#define OSD_W       616
+#define OSD_H       78
+#define STRIDE      308
+#define REGION_END  (STRIDE*OSD_H)
 
 #define REG_CACHE (*(volatile uint32_t *)0x80000014u)
+
+#define C_BG  1   /* yellow  */
+#define C_H   2   /* horizontal bars */
+#define C_V   3   /* vertical bars   */
+
+static volatile uint8_t *const FB = (volatile uint8_t *)APBASE;
 
 static void flush(void){
     REG_CACHE &= ~0x00040000u; REG_CACHE |= 0x00400000u;
     for (volatile int i = 0; i < 256; i++) __asm__ __volatile__("nop");
     REG_CACHE |= 0x00040000u;
 }
-
-static void fillrect(BYTE l, BYTE t, WORD r, BYTE b, BYTE color){
-    PARM_RECT p;
-    p.rect.wLeft = l; p.rect.wTop = t; p.rect.wRight = r; p.rect.wBottom = b;
-    p.bColor = color; p.bShadePtr = 0;
-    GDI_FillRect(0, &p);
+static void px(int x, int y, uint8_t c){
+    if ((unsigned)x >= OSD_W || (unsigned)y >= OSD_H) return;
+    uint32_t off = (uint32_t)y * STRIDE + (x >> 1);
+    if (off >= REGION_END) return;
+    volatile uint8_t *p = FB + off;
+    if (x & 1) *p = (uint8_t)((*p & 0xF0) | (c & 0x0F));
+    else       *p = (uint8_t)((*p & 0x0F) | ((c & 0x0F) << 4));
 }
+static void hbar(int y0, int h, uint8_t c){ for (int y=y0;y<y0+h;y++) for (int x=0;x<OSD_W;x++) px(x,y,c); }
+static void vbar(int x0, int w, uint8_t c){ for (int x=x0;x<x0+w;x++) for (int y=0;y<OSD_H;y++) px(x,y,c); }
 
 int pyapp_main(void){
-    GDI_REGION_INFO info;
-    info.wWidth = 616; info.wHeight = 78; info.bColorMode = 1; /* GDI_OSD_4B_MODE */
-    info.dwTAddr = 0x40084000u;                                /* DS_OSDFRAME_ST_AP */
-
-    GDI_ConfigRegionInfo(0, &info);
-    GDI_InitialRegion(0);
-    GDI_ClearRegion(0);
-    GDI_ActivateRegion(0);
-
-    /* outer rectangle (index 2) with an inner rectangle (index 1) inside it --
-     * both drawn by the firmware's own _gdi_FillRect at the real stride */
-    fillrect(8,  6, 300, 50, 2);
-    fillrect(40, 18, 120, 38, 1);
-
+    for (int y=0;y<OSD_H;y++) for (int x=0;x<OSD_W;x++) px(x,y,C_BG);  /* yellow field */
+    hbar(8, 4, C_H); hbar(36, 4, C_H); hbar(64, 4, C_H);              /* 3 h-bars */
+    vbar(100, 6, C_V); vbar(300, 6, C_V); vbar(500, 6, C_V);          /* 3 v-bars */
     flush();
     for (;;){}
     return 0;

@@ -3853,6 +3853,10 @@ int machine_disp_scanout(machine_t *m, uint32_t osd_base,
     }
 
     osd_en = (io_get(m, R_DISP_OSD_SIZE) & DISP_OSD_EN) != 0;
+    /* CT952_OSD_FORCE: debug readback of the OSD buffer even when enable was set
+     * via the DISP block (GDI_ActivateRegion) rather than R_DISP_OSD_SIZE bit28,
+     * which this emulator does not model. Reads real DRAM; fakes no display path. */
+    if (getenv("CT952_OSD_FORCE")) osd_en = 1;
 
     if (osd_base < 0x40000000u) return -1;
     span = (uint64_t)(h ? h - 1 : 0) * stride + w;

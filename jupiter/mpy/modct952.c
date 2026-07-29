@@ -329,11 +329,13 @@ static uint32_t g_osd_clearbytes = OSD_W * OSD_H;
 static void console_setup(void) {
     ct952_watchdog_off();                         /* belt-and-suspenders: no reset */
 
-    /* Framebuffer stride is the OSD plane width -- 480, the verified DS_OSDFRAME
-     * geometry (NOT REG_DISP_OSD_SIZE's display-window width, which is a scaled
-     * output size and garbles addressing if used as a stride). */
-    g_osd_w = OSD_W; g_osd_h = OSD_H;
-    g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;
+    /* Adopt the AP loader's OSD region geometry, which our AP inherits verbatim
+     * (aploader.c AP_Loader: wWidth=616, wHeight=78, bColorMode=GDI_OSD_4B_MODE,
+     * base=DS_OSDFRAME_ST_AP). It's a WIDE, SHORT 4bpp band -- the "Loading"
+     * banner. Stride = wWidth/2 = 308 bytes (4bpp). Using 480 gave the wrong
+     * stride and scrambled the text into the band you saw. */
+    g_osd_w = 616; g_osd_h = 78;
+    g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;   /* 77 cols x 9 rows */
 
     /* Resolve the LIVE OSD framebuffer: draw where the display DMA is actually
      * scanning (REG_MCU_VCR20), which the AP loader set to its "Loading" buffer.

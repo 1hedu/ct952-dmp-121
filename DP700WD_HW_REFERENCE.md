@@ -6388,3 +6388,38 @@ draws appears ON TOP of that. Consequences for earlier notes in this document:
   TWICE inside the taller (240-line) OSD window, each copy followed by undrawn
   lines showing the black default. 240/2 = 120 lines per copy ~= 78 drawn + 42
   undrawn, which matches the observed content:black ratio.
+
+**RETRACTION of 10.19's "stride = 308 CONFIRMED".** That conclusion was WRONG and
+must not be relied on. The byte-space bucket readout did show `VCR23>>16 == 308`,
+but a follow-up probe that drew in (x,y) at pitch 308 -- with a hard left/right
+colour split whose boundary must be a straight vertical edge -- came back
+**DIAGONAL** on hardware ("black lines cutting up the two yellow bands
+diagonally, nothing was straight"). A diagonal edge means each successive display
+line starts at a different x, i.e. the hardware's line pitch is NOT the 308 I drew
+with.
+
+What this proves methodologically: **a uniform/solid byte-range fill cannot
+validate a pitch** (every row looks identical at any pitch), so the clean bands in
+10.19 were never evidence for 308. Only pixel-space features can test pitch. The
+same trap invalidated the emulator checks earlier (§10.18).
+
+So `REG_MCU_VCR23 >> 16` is NOT the scanout line pitch, or not it alone. Leading
+hypothesis: the pitch follows the OSD *window* width, `REG_DISP_OSD_SIZE =
+0x00f002d0` -> 720 px, which at 4bpp is **360 bytes per display line**, not the
+region's 308. This also fits the owner's early observation that 360 looked "more
+aligned" than 308.
+
+What DOES still stand from 10.19: the buffer is linear and memory order maps
+monotonically to raster order (byte ranges render as contiguous screen areas), and
+the region's content is painted ~twice inside the taller 240-line OSD window.
+
+Resolution in flight: a one-shot 8-candidate pitch finder. The region is split
+into 8 byte zones; zone k gets a column of white marks spaced every P[k] BYTES,
+phase-aligned so that if P[k] is the true pitch the column sits at x=120 (well
+inside the visible 480 px). Marks spaced by exactly the true pitch land on
+consecutive lines at the same column -> one zone shows a STRAIGHT VERTICAL line
+and identifies the pitch in a single flash. Candidates: 308, 320, 336, 344, 352,
+360, 368, 384. Verified in the emulator against synthetic true pitches 308/344/
+360/384 -- in each case exactly the matching zone renders a straight column at
+x=120. (Note: zone boundaries do not align to row boundaries, so a single
+boundary row can carry a neighbouring zone's mark; ignore one stray.)

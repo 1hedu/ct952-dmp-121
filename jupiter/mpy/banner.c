@@ -1,45 +1,47 @@
-/* Vertical-mapping + stride-verification probe (stride now KNOWN = 308).
+/* ONE-SHOT stride finder: test 8 candidate row pitches simultaneously.
  *
- * On-hardware result from the byte-space bucket readout: the bar landed in the
- * QUARTER bucket, so REG_MCU_VCR23 >> 16 == 308 -- the scanout row stride is 308
- * bytes, straight off the chip. That photo also proved the buffer is LINEAR
- * (contiguous byte runs rendered as clean solid bands; a tiled or swizzled layout
- * could not do that), and that the region's content is painted roughly TWICE
- * vertically with black filling the remainder -- i.e. the leftover problem is the
- * VERTICAL mapping, not the pitch. The OSD window is 240 lines
- * (REG_DISP_OSD_SIZE = 0x00f002d0 -> 720x240) while our region is only 78.
+ * Where we are: byte-space fills render as clean solid bands (so the buffer is
+ * linear and memory order maps monotonically to raster order), but drawing in
+ * (x,y) with pitch 308 produced DIAGONAL edges -- so the hardware's line pitch is
+ * NOT 308, even though REG_MCU_VCR23>>16 reads 308. A uniform fill cannot reveal a
+ * pitch error, which is why the earlier byte-space probe looked fine. Leading
+ * suspect: the OSD window is 720px wide (REG_DISP_OSD_SIZE=0x00f002d0), which at
+ * 4bpp is 360 bytes per display line, not the region's 308.
  *
- * This probe measures both axes at once, with features big enough to survive a
- * photo:
- *   - LEFT half (x < 240): horizontal bands 6 rows tall, alternating white/yellow
- *     -> counting bands gives the vertical scale and the duplication factor
- *       (13 bands per copy == 1:1; 6-7 == squashed 2x; 26 == doubled).
- *   - RIGHT half (x >= 240): solid yellow.
- *   - The boundary at x=240 is a STRAIGHT VERTICAL EDGE iff the row stride is
- *     right. Any slant/staircase in that edge is the stride error, directly
- *     visible. This is the pixel-space confirmation of stride 308.
- *   - Rows 0..2 are a solid white cap so the top of the region is identifiable.
+ * Rather than binary-search one candidate per flash, this tests 8 at once. The
+ * region is split into 8 equal byte zones (3003 B each). Zone k gets a column of
+ * short white marks placed every P[k] BYTES. Because memory order maps
+ * monotonically to raster order, marks spaced by exactly the true pitch land on
+ * consecutive display lines at the SAME column -> a clean straight vertical line.
+ * Any other spacing staggers them into a diagonal or scatter.
  *
- * Writes no display registers (reads VCR23 only, falls back to 308).
+ * Each zone is preceded by a thin full-width yellow separator so the zones can be
+ * counted from the top. The single question to answer is an ordinal:
+ *   "counting zones from the top, which one's white marks form a STRAIGHT
+ *    VERTICAL line?"  -> that zone's P[k] is the true stride.
+ *
+ * Everything is addressed in BYTE space (no assumed pitch anywhere), so the probe
+ * itself cannot be distorted by the unknown it is measuring. Writes no display
+ * registers.
  */
 #include <stdint.h>
 
-#define APBASE      0x40084000u
-#define ROWS        78u
-#define VIS_W       480         /* the panel's visible width */
-#define SPLIT       240         /* left/right boundary -> vertical edge test */
-#define BAND        6           /* band height in rows */
+#define APBASE   0x40084000u
+#define REGION   24024u                 /* 308*78, the AP OSD region in bytes   */
+#define NZONE    8u
+#define ZONE     (REGION / NZONE)       /* 3003 bytes per zone                  */
 
-#define REG_VCR23   (*(volatile uint32_t *)0x80000D8Cu)
 #define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
 #define REG_SYSCFG1 (*(volatile uint32_t *)0x8000031Cu)
 
-#define IDX_A  2      /* white  */
-#define IDX_B  1      /* yellow */
+#define IDX_MARK 2      /* white  */
+#define IDX_SEP  1      /* yellow */
+
+/* candidate row pitches in bytes, low -> high, one per zone (top -> bottom).
+ * 308 = region width at 4bpp; 360 = 720px window at 4bpp; the rest bracket them. */
+static const uint16_t P[NZONE] = { 308, 320, 336, 344, 352, 360, 368, 384 };
 
 static volatile uint8_t *const FB = (volatile uint8_t *)APBASE;
-static uint32_t g_stride = 308;
-static uint32_t g_limit  = 308u * ROWS;
 
 static void flush(void){
     REG_CACHE &= ~0x00040000u; REG_CACHE |= 0x00400000u;
@@ -47,33 +49,35 @@ static void flush(void){
     REG_CACHE |= 0x00040000u;
 }
 
-static void px(int x, int y, uint8_t c){
-    if (x < 0 || y < 0 || (uint32_t)y >= ROWS) return;
-    uint32_t off = (uint32_t)y * g_stride + ((uint32_t)x >> 1);
-    if (off >= g_limit) return;
-    volatile uint8_t *p = FB + off;
-    if (x & 1) *p = (uint8_t)((*p & 0xF0) | (c & 0x0F));
-    else       *p = (uint8_t)((*p & 0x0F) | ((c & 0x0F) << 4));
+static void fill_bytes(uint32_t from, uint32_t n, uint8_t idx){
+    uint8_t b = (uint8_t)((idx << 4) | (idx & 0x0F));
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t o = from + i;
+        if (o >= REGION) return;
+        FB[o] = b;
+    }
 }
 
 int pyapp_main(void){
-    uint32_t s;
-    REG_SYSCFG1 &= ~0x10000000u;              /* keep the watchdog dead */
+    REG_SYSCFG1 &= ~0x10000000u;            /* keep the watchdog dead */
 
-    s = REG_VCR23 >> 16;                      /* hardware stride; 308 expected */
-    if (s >= 64u && s <= 4096u) g_stride = s;
-    g_limit = g_stride * ROWS;
-    if (g_limit > 0x5DD8u) g_limit = 0x5DD8u;  /* stay inside the 24024B region */
+    fill_bytes(0, REGION, 0);               /* clear region to transparent */
 
-    for (uint32_t y = 0; y < ROWS; y++) {
-        /* left: alternating 6-row bands; right: solid yellow. The x=SPLIT edge
-         * is the stride check; the band count is the vertical-mapping check. */
-        uint8_t band = ((y / BAND) & 1u) ? IDX_B : IDX_A;
-        for (int x = 0; x < SPLIT; x++)      px(x, (int)y, band);
-        for (int x = SPLIT; x < VIS_W; x++)  px(x, (int)y, IDX_B);
+    for (uint32_t k = 0; k < NZONE; k++) {
+        uint32_t z = k * ZONE;
+        uint32_t start = z + 300u, rem, delta;
+        fill_bytes(z, 300u, IDX_SEP);       /* thin yellow separator, ~1 line */
+        /* Phase-align the column to byte 60 of a row *under this candidate*, so
+         * that IF P[k] is the true pitch the marks sit at x=120 -- comfortably
+         * inside the panel's visible 480px (240 bytes). Without this the column
+         * for some candidates lands past the visible edge and the straight line
+         * would be invisible even when the candidate is right. */
+        rem   = start % P[k];
+        delta = (60u + P[k] - rem) % P[k];
+        start += delta;
+        for (uint32_t off = start; off < z + ZONE; off += P[k])
+            fill_bytes(off, 8u, IDX_MARK);  /* 8 bytes = 16 px wide mark */
     }
-    for (uint32_t y = 0; y < 3u; y++)         /* white cap = top of region */
-        for (int x = 0; x < VIS_W; x++) px(x, (int)y, IDX_A);
 
     flush();
     for (;;){}

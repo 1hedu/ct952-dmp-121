@@ -1,89 +1,106 @@
-/* ONE-SHOT stride finder: test 8 candidate row pitches simultaneously.
+/* SELF-IDENTIFYING pitch confirmation: draw the candidate pitch, as large digits,
+ * USING that candidate as the row pitch -- in three stacked zones.
  *
- * Where we are: byte-space fills render as clean solid bands (so the buffer is
- * linear and memory order maps monotonically to raster order), but drawing in
- * (x,y) with pitch 308 produced DIAGONAL edges -- so the hardware's line pitch is
- * NOT 308, even though REG_MCU_VCR23>>16 reads 308. A uniform fill cannot reveal a
- * pitch error, which is why the earlier byte-space probe looked fine. Leading
- * suspect: the OSD window is 720px wide (REG_DISP_OSD_SIZE=0x00f002d0), which at
- * 4bpp is 360 bytes per display line, not the region's 308.
+ * Whichever number is LEGIBLE is the true pitch: the digits only come out
+ * readable when the pitch used to address them matches the hardware's line pitch;
+ * a wrong pitch shears them into diagonal hash. So the readout names its own
+ * answer, with no measuring, counting, or ordinal-reporting required.
  *
- * Rather than binary-search one candidate per flash, this tests 8 at once. The
- * region is split into 8 equal byte zones (3003 B each). Zone k gets a column of
- * short white marks placed every P[k] BYTES. Because memory order maps
- * monotonically to raster order, marks spaced by exactly the true pitch land on
- * consecutive display lines at the SAME column -> a clean straight vertical line.
- * Any other spacing staggers them into a diagonal or scatter.
+ * How we got here (all on-hardware):
+ *   - sweep 308..384: no zone lined up  -> true pitch is BELOW 308, killing both
+ *     the 308 (region-width) and 360 (720px-window) hypotheses.
+ *   - region height measurement: 24024 B over ~83 panel lines -> pitch ~= 290.
+ *   - sweep 276..304 with fat 48px marks: the SOLID vertical bar landed in zone 5
+ *     -> pitch = 292. Consistent with ~290, and a multiple of 4 as expected since
+ *     VCR23's low half (the X increment) is 4.
+ * So 292 is the answer unless this test says otherwise; 288 and 296 are its
+ * neighbours and are included as the control.
  *
- * Each zone is preceded by a thin full-width yellow separator so the zones can be
- * counted from the top. The single question to answer is an ordinal:
- *   "counting zones from the top, which one's white marks form a STRAIGHT
- *    VERTICAL line?"  -> that zone's P[k] is the true stride.
- *
- * Everything is addressed in BYTE space (no assumed pitch anywhere), so the probe
- * itself cannot be distorted by the unknown it is measuring. Writes no display
- * registers.
+ * Digits are drawn at 3x scale (24 px tall) so they survive a phone photo.
+ * Each zone's base is rounded UP to a multiple of its own candidate pitch, so its
+ * rows start at a real line boundary. Writes no display registers.
  */
 #include <stdint.h>
 
 #define APBASE   0x40084000u
-#define REGION   24024u                 /* 308*78, the AP OSD region in bytes   */
-#define NZONE    8u
-#define ZONE     (REGION / NZONE)       /* 3003 bytes per zone                  */
+#define REGION   24024u
+#define NZONE    3u
+#define ZONE     (REGION / NZONE)        /* 8008 bytes per zone */
+#define SCALE    3
 
 #define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
 #define REG_SYSCFG1 (*(volatile uint32_t *)0x8000031Cu)
 
-#define IDX_MARK 2      /* white  */
+#define IDX_TXT  2      /* white  */
 #define IDX_SEP  1      /* yellow */
 
-/* candidate row pitches in bytes, low -> high, one per zone (top -> bottom).
- * 308 = region width at 4bpp; 360 = 720px window at 4bpp; the rest bracket them. */
-/* Pass 2. Pass 1 swept 308..384 and NO zone lined up, and the photo's content
- * height (24024 B rendered over ~83 panel lines) implies a pitch near 290 -- i.e.
- * the whole first sweep sat ABOVE the true value. This sweep brackets 290 in
- * 4-byte steps. Marks are also 24 B (48 px) wide now, so a correct candidate
- * renders as a SOLID VERTICAL BAR (consecutive marks abut) while a wrong one
- * breaks into a staircase -- far easier to judge than aligned thin dashes. */
-static const uint16_t P[NZONE] = { 276, 280, 284, 288, 292, 296, 300, 304 };
+static const uint16_t CAND[NZONE] = { 288, 292, 296 };
+
+/* 8x8 digits 0-9, bit 0 = leftmost pixel */
+static const uint8_t D[10][8] = {
+    {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},
+    {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
+    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
+    {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
+    {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
+};
 
 static volatile uint8_t *const FB = (volatile uint8_t *)APBASE;
 
 static void flush(void){
     REG_CACHE &= ~0x00040000u; REG_CACHE |= 0x00400000u;
     for (volatile int i = 0; i < 256; i++) __asm__ __volatile__("nop");
-    REG_CACHE |= 0x00040000u;
+    REG_CACHE |= 0x00400000u; REG_CACHE |= 0x00040000u;
 }
 
-static void fill_bytes(uint32_t from, uint32_t n, uint8_t idx){
-    uint8_t b = (uint8_t)((idx << 4) | (idx & 0x0F));
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t o = from + i;
-        if (o >= REGION) return;
-        FB[o] = b;
-    }
+static void put(uint32_t off, uint8_t idx, int hi){
+    if (off >= REGION) return;
+    if (hi) FB[off] = (uint8_t)((FB[off] & 0x0F) | (idx << 4));
+    else    FB[off] = (uint8_t)((FB[off] & 0xF0) | (idx & 0x0F));
+}
+
+/* pixel within a zone, addressed with that zone's candidate pitch */
+static void zpx(uint32_t base, uint32_t pitch, int x, int y, uint8_t idx, uint32_t cap){
+    uint32_t off;
+    if (x < 0 || y < 0) return;
+    off = base + (uint32_t)y * pitch + ((uint32_t)x >> 1);
+    if (off >= cap) return;
+    put(off, idx, !(x & 1));
+}
+
+static void digit(uint32_t base, uint32_t pitch, int x0, int y0, int d, uint32_t cap){
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++)
+            if (D[d][r] & (1u << c))
+                for (int sy = 0; sy < SCALE; sy++)
+                    for (int sx = 0; sx < SCALE; sx++)
+                        zpx(base, pitch, x0 + c*SCALE + sx, y0 + r*SCALE + sy, IDX_TXT, cap);
 }
 
 int pyapp_main(void){
-    REG_SYSCFG1 &= ~0x10000000u;            /* keep the watchdog dead */
+    REG_SYSCFG1 &= ~0x10000000u;              /* keep the watchdog dead */
 
-    fill_bytes(0, REGION, 0);               /* clear region to transparent */
+    for (uint32_t i = 0; i < REGION; i++) FB[i] = 0;   /* transparent */
 
     for (uint32_t k = 0; k < NZONE; k++) {
-        uint32_t z = k * ZONE;
-        uint32_t start = z + 300u, rem, delta;
-        fill_bytes(z, 300u, IDX_SEP);       /* thin yellow separator, ~1 line */
-        /* Phase-align the column to byte 60 of a row *under this candidate*, so
-         * that IF P[k] is the true pitch the marks sit at x=120 -- comfortably
-         * inside the panel's visible 480px (240 bytes). Without this the column
-         * for some candidates lands past the visible edge and the straight line
-         * would be invisible even when the candidate is right. */
-        rem   = start % P[k];
-        delta = (40u + P[k] - rem) % P[k];
-        start += delta;
-        for (uint32_t off = start; off < z + ZONE; off += P[k])
-            fill_bytes(off, 24u, IDX_MARK); /* 24 B = 48 px: abuts into a SOLID
-                                            * vertical bar at the true pitch */
+        uint32_t p    = CAND[k];
+        uint32_t z    = k * ZONE;
+        uint32_t base = ((z + p - 1u) / p) * p;         /* align to a line start */
+        uint32_t cap  = (k + 1u) * ZONE;
+        uint32_t v    = p;
+        int dg[3], n = 0, x;
+        if (cap > REGION) cap = REGION;
+
+        /* thin separator so the three zones are visually distinct */
+        for (uint32_t i = z; i < z + 240u && i < REGION; i++)
+            FB[i] = (uint8_t)((IDX_SEP << 4) | IDX_SEP);
+
+        while (v && n < 3) { dg[n++] = (int)(v % 10u); v /= 10u; }
+        x = 40;
+        for (int j = n - 1; j >= 0; j--) {            /* digits, MSD first */
+            digit(base, p, x, 4, dg[j], cap);
+            x += 8*SCALE + 6;
+        }
     }
 
     flush();

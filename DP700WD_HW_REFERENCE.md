@@ -6442,3 +6442,22 @@ bar, while any other pitch breaks into a visible staircase -- much easier to jud
 than a column of thin dashes. Verified in the emulator against synthetic pitches
 288 and 292: only the matching zone renders a solid bar (1 distinct left edge; all
 others 8-10).
+
+**Pitch sweep pass 2 result: the solid bar landed in zone 5 => LINE PITCH = 292
+BYTES.** The fat-mark probe rendered a compact solid white block (not a staircase)
+at ~60% down the region in both copies, and zone 5's center is at 56% -- the only
+candidate that fits. Cross-checks: the independent height estimate was ~290, and
+292 is a multiple of 4 as expected, since VCR23's low half (the X increment) is 4.
+
+So the OSD scanout line pitch is **292 bytes = 584 px at 4bpp** -- NOT the region
+width (308 B / 616 px) and NOT the OSD window width (360 B / 720 px). Neither
+register value is the pitch; treat `VCR23 >> 16` as unreliable for this purpose
+until the discrepancy is explained (it reads 308 while the panel scans 292).
+
+Confirmation method now in flight, worth reusing: a **self-identifying** readout.
+Three stacked zones each draw their own candidate pitch as large (3x, 24 px)
+digits, addressed USING that candidate as the row pitch. Digits are only legible
+when the pitch matches the hardware, so the screen literally displays the right
+answer and needs no measuring, counting or ordinal reporting. Verified unbiased in
+the emulator: rendered at 288/292/296 the readable number is 288/292/296
+respectively, with the other two zones sheared into diagonal hash.

@@ -7503,3 +7503,54 @@ explicitly writes PE=0 alongside PR, as EHCI requires.
 
 Emulator: keyboard still enumerates and the REPL evaluated `6*7` typed through it; with no
 keyboard the summary prints zeros.
+
+### 10.41 The TT hub address was written to the wrong register
+
+Hardware: `i=40  n=48  z=40  f=00  P=15001405`, with `V=404040404040` and `R=00000000`.
+
+* `V=` all `40` — all six split configurations halt on the IN.
+* `R=00000000` — not one byte ever landed in the IN buffer.
+* `f=00` — the stock firmware's board flag is clear, so its stack does **not** force
+  full-speed connect on this board. PORTSC bit 24 is not the answer (`P=15001405` shows
+  the captured attempt did have it set, and it made no difference).
+* `i=40` — the lone unexpected IN halted too.
+
+**Honest caveat on `i=`:** a device is permitted to answer an unexpected IN on the default
+pipe with STALL rather than NAK, so `i=40` does *not* prove the controller synthesised the
+halt. The discriminator was weaker than 10.40 claimed. What it did do was force a
+re-derivation of the register map, which turned up a real error.
+
+**The operational map is the i.MX/ChipIdea one**, anchored by three independently confirmed
+registers: `+0x44` PORTSC (the firmware's `btst 1`, and `ehci_init`'s PFSC write to
+`softc[0x25c] + 0x44`), `+0x64` OTGSC (the firmware's VBUS-valid `and 0x200`), and `+0x68`
+USBMODE (reads 3 after we set host mode). In that map:
+
+| offset | absolute | register |
+|---|---|---|
+| +0x1C | `0xA000015C` | **TTCTRL** — hub address `TTHA` in bits **30:24** |
+| +0x24 | `0xA0000164` | **TXFILLTUNING** — TX FIFO threshold |
+
+`EHCI_TTCTRL` was defined as `OPREG(0x24)`. So every "TTHA = 0x7F" write went into
+**TXFILLTUNING**, and the embedded TT's hub address stayed **0** while our queue heads
+addressed split transactions to hub `0x7F`. Nothing answers at a hub address that was never
+assigned. Note also that TTHA sits at bits 30:24 of TTCTRL, whereas the QH's hub-address
+field is bits 22:16 — the two are *not* the same shift, and the old code used the QH shift
+for both.
+
+That mismatch has precisely the observed shape: a SETUP or OUT carries its payload inside
+the start-split and completes, while an IN needs the TT to buffer the device's response for
+a later complete-split, so it never returns a byte — `V=` all halted, `R=0`.
+
+The header comment at the top of `modusb_kbd.c` annotated `0xA0000164` as TXFILLTUNING
+correctly from the beginning; the `#define` twenty lines below it contradicted the comment,
+and that contradiction survived several builds. Two lessons already recorded elsewhere apply
+again: derive the map, don't reuse a shift because it looks familiar; and when a comment and
+the code next to it disagree, that is a finding, not noise.
+
+Fixed: `TTCTRL = TTHA(0x7F)` at `+0x1C` with the correct 30:24 shift, plus the firmware's
+own `TXFILLTUNING |= 0x7f0000` at `+0x24` (done because the stock stack does it on this
+silicon, not because it has anything to do with the TT). The summary now reports `T=` — the
+TTCTRL readback — so we can see whether TTHA actually stuck, replacing the `f=` slot that
+has served its purpose.
+
+Emulator: still enumerates and the REPL evaluated `8*5+2` from the modelled keyboard.

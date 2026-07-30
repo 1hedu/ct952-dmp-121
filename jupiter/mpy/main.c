@@ -236,6 +236,7 @@ int pyapp_main(void) {
             extern uint32_t usb_kbd_portsc(void);
             extern uint32_t usb_kbd_barein(void);
             extern uint32_t usb_kbd_rx(void);
+            extern uint32_t usb_kbd_ttctrl(void);
             char line[24];
             static const char hex[] = "0123456789abcdef";
             line[0] = 'S'; line[1] = '=';
@@ -267,14 +268,15 @@ int pyapp_main(void) {
              * qTD should stay ACTIVE (0x80) and time out. 0x40 instead means every IN
              * halts no matter what the device says, i.e. IN completion itself is
              * broken rather than the device rejecting our requests. */
-            /* f= is the stock firmware's own board flag at 0x40040f0c: non-zero means
-             * its EHCI stack forces this port to connect as full speed (PORTSC bit 24),
-             * i.e. the quirk is required on this hardware. */
-            mp_printf(&mp_plat_print, "i=%02x n=%02x z=%02x f=%02x P=%08x\n",
+            /* The firmware's board flag at 0x40040f0c read back 00, so the stock stack
+             * does NOT force full-speed connect on this board and PORTSC bit 24 is not
+             * the answer. T= replaces it: the TTCTRL readback, which says whether the
+             * embedded TT's hub address finally stuck at the right register (+0x1C). */
+            mp_printf(&mp_plat_print, "i=%02x n=%02x z=%02x T=%08x P=%08x\n",
                       (unsigned)(usb_kbd_barein() & 0xFF),
                       (unsigned)(usb_kbd_nodev() & 0xFF),
                       (unsigned)(usb_kbd_dv(7) & 0xFF),
-                      (unsigned)(*(volatile uint8_t *)0x40040f0cu),
+                      (unsigned)usb_kbd_ttctrl(),
                       (unsigned)usb_kbd_portsc());
         }
     }

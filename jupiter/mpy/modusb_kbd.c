@@ -48,7 +48,20 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
 #define EHCI_CONFIGFLAG  OPREG(0x40)
 #define EHCI_PORTSC0     OPREG(0x44)
 #define EHCI_OTGSC       OPREG(0x64)
-#define EHCI_TTCTRL      OPREG(0x24)
+/* TTCTRL is at +0x1C and TXFILLTUNING at +0x24 in this (i.MX / ChipIdea) layout, and
+ * TTCTRL's hub-address field TTHA lives in bits 30:24 -- NOT bits 22:16 like the QH's
+ * hub-address field. This was wrong for several builds: "TTCTRL" was defined as +0x24, so
+ * every TTHA=0x7F write actually went into TXFILLTUNING (the TX FIFO threshold) and the
+ * embedded TT's hub address stayed 0, while our queue heads addressed split transactions to
+ * hub 0x7F. Nothing answers at a hub address that was never assigned.
+ *
+ * That mismatch has exactly the observed shape: a SETUP or OUT carries its payload in the
+ * start-split and completes, but an IN needs the TT to buffer the device's response for a
+ * later complete-split, so it never returns a byte. The file header above had the correct
+ * annotation for +0x24 all along; the define below it contradicted the comment. */
+#define EHCI_TTCTRL      OPREG(0x1C)
+#define EHCI_TXFILLTUNE  OPREG(0x24)
+#define TTCTRL_TTHA(a)   (((uint32_t)(a) & 0x7Fu) << 24)
 #define EHCI_USBMODE     OPREG(0x68)
 #define USBMODE_CM_HOST  0x00000003u     /* controller mode = host */
 
@@ -124,7 +137,8 @@ static uint32_t g_dbg_setup, g_dbg_data, g_dbg_status, g_dbg_usbsts, g_dbg_frind
 /* SETUP bytes read back out of DMA memory after a failed transfer, and the DATA-stage
  * status recorded for each split-routing variant tried. */
 static uint8_t  g_dbg_sbytes[8];
-static uint32_t g_dbg_nodev, g_dbg_portsc, g_dbg_bare_in, g_dbg_rx;
+static uint32_t g_dbg_nodev, g_dbg_portsc, g_dbg_bare_in, g_dbg_rx, g_dbg_ttctrl;
+uint32_t usb_kbd_ttctrl(void) { return g_dbg_ttctrl; }
 uint32_t usb_kbd_barein(void) { return g_dbg_bare_in; }
 uint32_t usb_kbd_rx(void)     { return g_dbg_rx; }
 uint32_t usb_kbd_nodev(void)  { return g_dbg_nodev; }
@@ -519,7 +533,11 @@ int usb_kbd_bringup(void) {
      * (TTCTRL |= 0x7f0000). Transfers whose QH carries this hub address are routed
      * through the TT, which is how a directly attached low/full-speed device is
      * reached on this core. */
-    EHCI_TTCTRL = (EHCI_TTCTRL & ~0x007F0000u) | ((uint32_t)TT_HUB_ADDR << 16);
+    EHCI_TTCTRL = (EHCI_TTCTRL & ~0x7F000000u) | TTCTRL_TTHA(TT_HUB_ADDR);
+    /* And the write the stock firmware actually makes at +0x24: TXFILLTUNING |= 0x7f0000.
+     * That is a FIFO-threshold setting, not a TT setting -- it is done here because the
+     * firmware does it on this silicon, not because it addresses the TT. */
+    EHCI_TXFILLTUNE = EHCI_TXFILLTUNE | 0x007F0000u;
     EHCI_CONFIGFLAG = 1;                 /* route ports to the host controller */
     EHCI_USBCMD = USBCMD_RS;
     for (volatile int i = 0; i < 50000; i++) { }   /* let the port sample D+/D- */
@@ -667,6 +685,7 @@ int usb_kbd_bringup(void) {
         g_dbg_nodev = g_td_p[0][2];   /* SETUP token: no device should even ACK it */
         g_dev_addr = 0;
         g_dbg_bare_in = probe_bare_in();
+        g_dbg_ttctrl  = EHCI_TTCTRL;   /* did TTHA actually stick at +0x1C? */
         g_dbg_portsc = EHCI_PORTSC0;  /* is the port still connected+enabled by now? */
         g_failstep = 3; return 0;
     }

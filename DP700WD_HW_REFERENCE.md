@@ -7136,3 +7136,48 @@ whether this core needs the transfer described differently for a directly attach
 low-speed device. The emulator cannot arbitrate any of that: its model has no notion
 of device speed, so it enumerates a "low-speed" device with high-speed descriptors
 and reports success either way.
+
+### 10.35 FAILSTEP=3 explained: the low-speed device needs the core's EMBEDDED TT
+
+The frame reported **`FAILSTEP=3`** -- the very first control transfer
+(GET_DESCRIPTOR) fails, while the port is powered, connected, enabled and correctly
+identified as low-speed (10.34). That is precisely the case where a host controller
+must reach the device through a **transaction translator**.
+
+**This core has an embedded TT, and the firmware told us its address.** Recall the
+one unexplained firmware access from 10.31: `0xA0000164 |= 0x7f0000`. At op+0x24 that
+register is **TTCTRL**, and bits 22:16 are **TTHA (TT Hub Address)** -- so the
+firmware configures the embedded TT at hub address **0x7F**.
+
+EHCI routes a transfer through a TT purely by what the queue head says (QH word 2,
+Endpoint Capabilities):
+```
+    bits  7:0  uFrame S-mask       bits 22:16 Hub Addr
+    bits 15:8  uFrame C-mask       bits 29:23 Port Number      bits 31:30 Mult
+```
+Our QH word 2 was just `Mult=1` (0x40000000), leaving **Hub Addr = 0**, so the
+controller never engaged its TT and a low-speed control transfer could not complete.
+
+Fix, for the low-speed case only (high-speed devices must NOT set these):
+```
+    TTCTRL (op+0x24) TTHA := 0x7F                  /* mirror the firmware */
+    control QH   word2 := Mult1 | HubAddr(0x7F) | PortNum(1)
+    interrupt QH word2 := Mult1 | HubAddr(0x7F) | PortNum(1)
+                          | S-mask 0x01 | C-mask 0x1C   /* periodic split */
+```
+The periodic S/C-masks matter for the interrupt-IN endpoint the keyboard is polled
+on: a split periodic transfer needs a start-split microframe and complete-split
+microframes, which a high-speed endpoint does not use.
+
+This closes the chain of five independent defects, each of which hid the next:
+```
+    1. register map 0x30 off      -> could not even see PORTSC        (10.31)
+    2. block held in reset        -> registers read 0                 (10.32)
+    3. controller in device mode  -> port never reports               (10.32)
+    4. port power off             -> device unpowered, no CCS         (10.33)
+    5. no TT routing in the QH    -> low-speed transfers never work   (10.35)
+```
+None of the last four could be caught in the emulator: its model has no reset gating,
+no port power, no device speed and no transaction translator, and it enumerates a
+"low-speed" device with high-speed descriptors regardless. Every one was found by
+reading a register off the frame or a line of the firmware's own code.

@@ -48,6 +48,7 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
 #define EHCI_CONFIGFLAG  OPREG(0x40)
 #define EHCI_PORTSC0     OPREG(0x44)
 #define EHCI_OTGSC       OPREG(0x64)
+#define EHCI_TTCTRL      OPREG(0x24)
 #define EHCI_USBMODE     OPREG(0x68)
 #define USBMODE_CM_HOST  0x00000003u     /* controller mode = host */
 
@@ -93,6 +94,18 @@ int usb_kbd_lastxfer(void);
 #define QH_H             (1u << 15)    /* head of reclamation list            */
 #define QH_MPS(n)        (((uint32_t)(n) & 0x7FF) << 16)
 #define QH_MULT1         (1u << 30)    /* one transaction per uframe (word 2) */
+/* Split-transaction fields in QH word 2, needed for a LOW/FULL-speed device reached
+ * through a transaction translator. This core has an EMBEDDED TT, and the firmware
+ * configures it by setting TTCTRL.TTHA (0xA0000164 |= 0x7f0000), i.e. hub address
+ * 0x7F. A QH must carry that same hub address, plus the port number, or the
+ * controller never routes the transfer through the TT -- which is exactly why the
+ * first control transfer to the keyboard failed (FAILSTEP=3) while the port itself
+ * was powered, connected and correctly identified as low-speed. */
+#define QH_HUBADDR(a)    (((uint32_t)(a) & 0x7Fu) << 16)
+#define QH_PORTNUM(p)    (((uint32_t)(p) & 0x7Fu) << 23)
+#define TT_HUB_ADDR      0x7Fu          /* matches TTCTRL.TTHA set by the firmware */
+#define QH_SMASK_C       0x00000001u    /* start-split in uframe 0 (periodic)       */
+#define QH_CMASK_C       0x00001C00u    /* complete-split in uframes 2..4 (periodic)*/
 
 /* Standard USB request codes. */
 #define REQ_GET_DESCRIPTOR   0x06
@@ -175,7 +188,7 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
      * low/full-speed control endpoint on this core */
     g_qh[1] = (uint32_t)g_dev_addr | g_eps | QH_DTC | QH_H | QH_MPS(g_isls ? 8 : 64)
               | (g_isls ? QH_C : 0u);
-    g_qh[2] = QH_MULT1;
+    g_qh[2] = QH_MULT1 | (g_isls ? (QH_HUBADDR(TT_HUB_ADDR) | QH_PORTNUM(1)) : 0u);
     g_qh[3] = 0;                            /* current qTD                    */
     g_qh[4] = pa(ts);                       /* overlay: next qTD -> SETUP     */
     g_qh[5] = QTD_T;                        /* overlay: alt next              */
@@ -212,7 +225,8 @@ static int int_in_poll(uint8_t *out, int budget) {
     g_qh[0] = pa(g_qh) | (1u << 1);
     g_qh[1] = (uint32_t)g_dev_addr | (1u << 8) /* ep 1 */ |
               g_eps | QH_DTC | QH_H | QH_MPS(8);
-    g_qh[2] = QH_MULT1;
+    g_qh[2] = QH_MULT1 | (g_isls ? (QH_HUBADDR(TT_HUB_ADDR) | QH_PORTNUM(1) |
+                                    QH_SMASK_C | QH_CMASK_C) : 0u);
     g_qh[3] = 0;
     g_qh[4] = pa(td);
     g_qh[5] = QTD_T;
@@ -284,6 +298,11 @@ int usb_kbd_bringup(void) {
      * HOST before the port will report a connection. The firmware does this via
      * USB_HCInit, which we are replacing, so we must do it ourselves. */
     EHCI_USBMODE = (EHCI_USBMODE & ~0x00000003u) | USBMODE_CM_HOST;
+    /* Point the embedded TT at hub address 0x7F, exactly as the firmware does
+     * (TTCTRL |= 0x7f0000). Transfers whose QH carries this hub address are routed
+     * through the TT, which is how a directly attached low/full-speed device is
+     * reached on this core. */
+    EHCI_TTCTRL = (EHCI_TTCTRL & ~0x007F0000u) | ((uint32_t)TT_HUB_ADDR << 16);
     EHCI_CONFIGFLAG = 1;                 /* route ports to the host controller */
     EHCI_USBCMD = USBCMD_RS;
     for (volatile int i = 0; i < 50000; i++) { }   /* let the port sample D+/D- */

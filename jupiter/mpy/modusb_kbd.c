@@ -116,18 +116,54 @@ int usb_kbd_lastxfer(void);
 #define DESC_DEVICE          0x01
 #define DESC_CONFIG          0x02
 
-/* ---- DMA-visible structures in DRAM (.bss). 32-byte aligned per EHCI. ------- */
-static volatile uint32_t g_qh[12]     __attribute__((aligned(32)));  /* one Queue Head */
-static volatile uint32_t g_td[3][8]   __attribute__((aligned(32)));  /* SETUP/DATA/STATUS */
-static uint8_t           g_setup[8]   __attribute__((aligned(8)));
-static uint8_t           g_data[256]  __attribute__((aligned(8)));
+/* ---- DMA-visible structures in DRAM (.bss). 32-byte aligned per EHCI. -------
+ * CACHE COHERENCY: the host controller reads and writes these by DMA straight out
+ * of DRAM, while the CPU goes through its write-back D-cache. Written normally, the
+ * descriptors sit dirty in cache and the controller DMAs stale garbage; worse,
+ * qtd_wait() polls the qTD status word, so a cached read would never observe the
+ * controller's completion write and every transfer would appear to fail. That is
+ * consistent with FAILSTEP=3 persisting after the port itself came fully up.
+ *
+ * This SoC provides a D-cache BYPASS alias of DRAM, documented in the platform
+ * header: PLAT_BYPASS_DCACHE_STARTADR = 0xC0000000 (ctkav_platform.h:683). So keep
+ * the storage in .bss but touch it only through that alias, and hand the controller
+ * the ordinary 0x4xxxxxxx physical address.
+ *
+ * The emulator cannot expose this class of bug: it has no D-cache, so cached and
+ * uncached accesses are identical there. */
+static volatile uint32_t g_qh_s[12]   __attribute__((aligned(32)));  /* one Queue Head */
+static volatile uint32_t g_td_s[3][8] __attribute__((aligned(32)));  /* SETUP/DATA/STATUS */
+static uint8_t           g_setup_s[8] __attribute__((aligned(8)));
+static uint8_t           g_data_s[256]__attribute__((aligned(8)));
+
+#define UNCACHED(p) ((uintptr_t)(((uintptr_t)(p) & 0x0FFFFFFFu) | 0xC0000000u))
+
+/* uncached views, set up by dma_view_init() before any transfer */
+static volatile uint32_t *g_qh    = g_qh_s;
+static volatile uint32_t *g_td_p[3];
+static uint8_t           *g_setup = g_setup_s;
+static uint8_t           *g_data  = g_data_s;
+
+static void dma_view_init(void)
+{
+    g_qh    = (volatile uint32_t *)UNCACHED(g_qh_s);
+    g_td_p[0] = (volatile uint32_t *)UNCACHED(g_td_s[0]);
+    g_td_p[1] = (volatile uint32_t *)UNCACHED(g_td_s[1]);
+    g_td_p[2] = (volatile uint32_t *)UNCACHED(g_td_s[2]);
+    g_setup = (uint8_t *)UNCACHED(g_setup_s);
+    g_data  = (uint8_t *)UNCACHED(g_data_s);
+}
 
 static uint8_t g_dev_addr;     /* address we assigned to the keyboard */
 static uint8_t g_int_toggle;   /* interrupt-IN data toggle            */
 static uint8_t g_ready;        /* enumeration succeeded               */
 
-/* Guest physical address of an object (identity map: DRAM VMA == PA). */
-static inline uint32_t pa(volatile void *p) { return (uint32_t)(uintptr_t)p; }
+/* Physical address for the controller. Accepts either a cached (0x4xxxxxxx) or a
+ * bypass-alias (0xCxxxxxxx) pointer and always yields the DRAM physical address. */
+static inline uint32_t pa(volatile void *p)
+{
+    return ((uint32_t)(uintptr_t)p & 0x0FFFFFFFu) | 0x40000000u;
+}
 
 /* Spin until a qTD's Active bit clears, or a bounded budget elapses. Returns 1
  * if it retired, 0 on timeout (a NAK leaves the qTD Active). The controller
@@ -154,7 +190,7 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
     g_setup[4] = (uint8_t)wIndex;  g_setup[5] = (uint8_t)(wIndex >> 8);
     g_setup[6] = (uint8_t)wLength; g_setup[7] = (uint8_t)(wLength >> 8);
 
-    volatile uint32_t *ts = g_td[0], *td = g_td[1], *tk = g_td[2];
+    volatile uint32_t *ts = g_td_p[0], *td = g_td_p[1], *tk = g_td_p[2];
     int have_data = (wLength > 0);
 
     /* SETUP stage qTD. */
@@ -214,7 +250,7 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
  * Copies the report into `out` and returns 1 if a report arrived, 0 if the
  * endpoint NAKed (no key change) within the budget. */
 static int int_in_poll(uint8_t *out, int budget) {
-    volatile uint32_t *td = g_td[0];
+    volatile uint32_t *td = g_td_p[0];
     td[0] = QTD_T;
     td[1] = QTD_T;
     td[2] = QTD_ACTIVE | QTD_PID_IN | QTD_CERR | QTD_BYTES(8) |
@@ -279,6 +315,7 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
  * the Python module and the C REPL stdin path can call it. */
 int usb_kbd_bringup(void) {
     g_ready = 0; g_dev_addr = 0; g_int_toggle = 0; g_failstep = 0;
+    dma_view_init();   /* uncached views before any DMA structure is touched */
 
     /* Controller reset, then take ownership of all ports and run. */
     /* Derive the operational base from the capability register rather than

@@ -7181,3 +7181,28 @@ None of the last four could be caught in the emulator: its model has no reset ga
 no port power, no device speed and no transaction translator, and it enumerates a
 "low-speed" device with high-speed descriptors regardless. Every one was found by
 reading a register off the frame or a line of the firmware's own code.
+
+**FAILSTEP=3 persisted after the TT fix -- next cause: DMA/D-cache incoherency.**
+The host controller reads and writes the queue head, qTDs and data buffer by DMA
+directly out of DRAM, while the CPU accesses them through its **write-back D-cache**.
+Written normally, the descriptors sit dirty in cache and the controller DMAs stale
+contents. Worse, `qtd_wait()` polls the qTD status word: a cached read never observes
+the controller's completion write, so every transfer looks like a timeout -- exactly
+the persistent FAILSTEP=3 seen once the port itself was fully up.
+
+This SoC documents a **D-cache bypass alias** of DRAM in its own platform header:
+```
+    ctkav_platform.h:683   #define PLAT_BYPASS_DCACHE_STARTADR  (0xc0000000)
+```
+So the DMA structures stay in .bss, but every CPU access goes through
+`0xC0000000 | (addr & 0x0FFFFFFF)`, while the controller is still handed the ordinary
+`0x4xxxxxxx` physical address (`pa()` now normalises either form). No explicit cache
+flushing is needed, and the status polling becomes coherent by construction.
+
+**The emulator cannot expose this class of bug at all** -- it models no D-cache, so
+cached and uncached accesses are identical and the descriptors are always "coherent"
+there. Same shape as port power, device speed and the TT: real-hardware-only.
+
+Note the display path already had to solve the same problem, by explicitly flushing
+the D-cache after drawing (REG_CACHE 0x80000014, FLUSH_DCACHE 0x00400000). The
+bypass alias is the cleaner answer for small DMA descriptors that are polled.

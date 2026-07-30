@@ -7778,3 +7778,31 @@ free. This is a documented, core-level requirement rather than a spec-reasoned g
 is the first cause consistent with the device-independence of the failure.
 
 Emulator still enumerates (it does not model stream mode) and the REPL evaluated `5+37`.
+
+### 10.47 SDIS stuck but IN still failed -> the missing step is the USB reset PULSE
+
+`T=00000013` confirmed USBMODE = host | SDIS took, and the IN still halted identically
+(`B=80080d40`) for both the keyboard and the stick. So Stream Disable was necessary-hygiene
+but not the cause. Matching the QH (10.45) and SDIS (10.46) both failed, which is the signal
+that the missing piece is a *sequential bring-up step*, not a static register value.
+
+Found it in the firmware's USB reset sequence (0x6398..0x63e0):
+```
+    REG_PLAT_RESET_CONTROL_ENABLE  (0x80000324) = 0x04000000   ; ASSERT usb block reset
+    delay ~0x1e8480 (~2ms)
+    REG_PLAT_RESET_CONTROL_DISABLE (0x80000304) = 0x04000000   ; RELEASE usb block reset
+    delay ~2ms
+```
+It **pulses** the USB block reset -- assert, wait, release -- via the platform reset
+controller. Every build so far only ever *released* the reset (`0x80000304 = 0x0C000000`),
+never asserted it first. A release without a preceding assert does not reinitialise the USB
+**PHY**: the analog front-end comes up in an indeterminate state that can drive the TX path
+(so SETUP/OUT transmit and the device ACKs) but not the RX path (so every IN retires Halted
+with 0 bytes). That is an exact match for the device-independent symptom -- it explains why
+neither the QH fix nor SDIS moved it, and why the emulator (no modelled PHY) never showed it.
+
+Shipped: pulse the reset the firmware's way -- ungate the clocks, `RESET_CONTROL_ENABLE =
+0x04000000`, ~2ms, `RESET_CONTROL_DISABLE = 0x04000000`, ~2ms -- before EHCI HCRESET. Uses
+0x04000000 (PLAT_RESET_USB) alone, as the firmware does here, not the 0x0C000000 the release
+-only path used. Emulator still enumerates and ran `6*7`; the PHY reinit can only be judged
+on hardware.

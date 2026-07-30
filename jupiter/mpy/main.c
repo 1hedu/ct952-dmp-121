@@ -174,26 +174,31 @@ int pyapp_main(void) {
      * Clearing the two bits is the documented inverse of HAL_POWER_NORMAL, and is
      * harmless if they were already clear. */
     {
-        volatile uint32_t *clkgen  = (volatile uint32_t *)0x80000300u; /* CLK_GENERATOR_CONTROL */
-        volatile uint32_t *rst_dis = (volatile uint32_t *)0x80000304u; /* RESET_CONTROL_DISABLE */
+        volatile uint32_t *clkgen  = (volatile uint32_t *)0x80000300u; /* CLK_GENERATOR_CONTROL   */
+        volatile uint32_t *rst_ena = (volatile uint32_t *)0x80000324u; /* RESET_CONTROL_ENABLE    */
+        volatile uint32_t *rst_dis = (volatile uint32_t *)0x80000304u; /* RESET_CONTROL_DISABLE   */
 
-        /* RELEASE USB FROM RESET -- this is why the whole USB register block read
-         * back as zeros on hardware. aploader.c:471-473, immediately before jumping
-         * to the AP, does:
-         *     REG_PLAT_RESET_CONTROL_ENABLE = INT_SET_ALL & ~(DSU1|TIMER|SERVO|
-         *                                                     VOU|VOU2|PROM)
-         * i.e. it ASSERTS reset on every block except those six. USB is not among
-         * them, so the controller is held in reset and reads 0 (that is also why the
-         * display keeps working: VOU/VOU2 ARE in the keep-list).
-         * The firmware's own idiom for bringing a block back is to write the
-         * matching *_DISABLE bit to RESET_CONTROL_DISABLE (see input.c:1008-1009,
-         * gdi.c:3186-3187, hsystem.c:251-254). */
-        *rst_dis = 0x0C000000u;   /* PLAT_RESET_USB_DISABLE | USBCLKCKT_DISABLE */
+        /* USB was held in reset by the AP loader (aploader.c:471-473 asserts reset on
+         * every block except DSU1/TIMER/SERVO/VOU/VOU2/PROM), which is why the whole
+         * register block read back as zeros. Earlier builds just RELEASED the reset by
+         * writing RESET_CONTROL_DISABLE -- but that is not what the firmware does, and it
+         * left the USB PHY in an indeterminate state: it could transmit (SETUP/OUT worked
+         * and the device ACKed) but never receive (every IN halted with 0 bytes, on BOTH
+         * a low-speed keyboard and a high-speed stick -- host-side, not the device).
+         *
+         * The firmware does a full reset PULSE of the USB block (0x6398..0x63e0):
+         *     REG_PLAT_RESET_CONTROL_ENABLE  = 0x04000000   ; ASSERT usb reset
+         *     delay ~2ms
+         *     REG_PLAT_RESET_CONTROL_DISABLE = 0x04000000   ; RELEASE usb reset
+         *     delay ~2ms
+         * which is what reinitialises the PHY. Match it (0x04000000 = PLAT_RESET_USB;
+         * the firmware pulses only that bit here, not USBCLKCKT). */
+        *clkgen = *clkgen & ~0x01800000u;    /* ungate UCLK48M + HCLK first             */
         for (volatile int i = 0; i < 100000; i++) { }
-
-        /* then ungate the USB clocks (HAL_POWER_SAVE gated them, hsystem.c:562+) */
-        *clkgen = *clkgen & ~0x01800000u;               /* UCLK48M + HCLK for USB */
-        for (volatile int i = 0; i < 400000; i++) { }   /* let the clocks/PHY settle */
+        *rst_ena = 0x04000000u;              /* ASSERT USB block reset                  */
+        for (volatile int i = 0; i < 2000000; i++) { }
+        *rst_dis = 0x04000000u;              /* RELEASE USB block reset (PHY reinits)   */
+        for (volatile int i = 0; i < 2000000; i++) { }
     }
     /* Retry bringup: on real silicon the port takes time to report a connection
      * after the clocks come back (and after USB_HCExit() tore the controller down),

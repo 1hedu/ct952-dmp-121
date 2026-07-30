@@ -6821,3 +6821,55 @@ keyboard is seen working on the frame.
 
 Degradation is safe: when bringup fails the REPL falls back to UART1 RX rather
 than hanging, so the on-screen prompt still appears.
+
+### 10.28 Trap 0x07 on the PYAPP seize SOLVED: the payload window is inside the framebuffer
+
+The `trap 0x07 with ET=0` that killed every CT952_PYAPP seize is fully explained, and
+the USB-keyboard REPL is working again in the emulator.
+
+Diagnosis from the CPU state at the fault:
+```
+    pc=0x400c0004  npc=0x400c0008  tbr=0x40000060  (the FIRMWARE's trap base)
+```
+`tbr` still being the firmware's proves our entry code never ran -- `_tt` entry 0 is
+`b _app_init`, so had it executed, npc would be `_app_init` and tbr ours. The CPU was
+executing something that is not our payload.
+
+**Root cause: the payload window collides with the MM framebuffer.** The payload
+occupies 0x400c0000..~0x4015A378 (~620 KB), and
+`DS_FRAMEBUF_ST_MM = 0x400A2000..0x401A2000` (dvd_dram_16m.h:99-100) covers all of
+it. Once the firmware decodes a photo into that framebuffer, the payload is
+overwritten, so a seize at the old default of icount 120M lands in image data.
+Seizing at **22M** -- after boot and section load, before decode -- works.
+
+Two further 8 MB-era leftovers were fixed on the way (the same class of bug as the
+0x40500000 base):
+- `npc` was hardcoded `0x40500004`, i.e. out of bounds on a 2 MB part, so control
+  left the payload after a single instruction.
+- the seize `%sp` was hardcoded `0x407F0000`, also out of bounds, which would fault
+  the first window-overflow `std`.
+Both now derive from the payload base / real DRAM (`mach_pyapp_base()`,
+`mach_pyapp_sp()`, overridable via CT952_PYAPP_BASE / CT952_PYAPP_SP), and the
+default seize icount is 22M with the reason recorded at the assignment.
+
+**VERIFIED end to end in the emulator** -- the full stack, on the OSD console:
+```
+    usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64
+    usb_kbd: configured, polling ep 0x81
+    [pyapp] USB keyboard ready
+    MicroPython v1.29.0-preview... on ct952 with sparc-v8-be
+    >>> print(6*7)
+    42
+```
+i.e. USB HID enumeration -> interrupt-endpoint polling -> keystrokes into the REPL
+-> evaluated -> result rendered on the frame's own display at pitch 292.
+
+Caveat for hardware: this validates the driver and the REPL path, NOT that a real
+keyboard enumerates on the AP-loader path, where the loader has powered USB down
+(10.27). The AP build clears the USB clock gates, but that is still untested on
+silicon.
+
+**Recurring lesson, third instance:** three separate 8 MB-era hardcoded addresses
+(PYAPP base, npc, %sp) silently disabled or broke a working feature after the DRAM
+size was corrected. When a capability regresses, grep the harness for absolute
+addresses before doubting the model.

@@ -314,6 +314,16 @@ static machine_t *M(sparc_bus_t *b) { return (machine_t *)b; }
  * disabling the whole CT952_PYAPP path (and with it the USB-keyboard REPL that
  * path had already proven). Default to the AP link base the mpy app is built at
  * and allow an override. */
+/* Initial %sp for a PYAPP seize. Must lie inside the real 2 MB DRAM; the old
+ * 0x407F0000 was another 8 MB-era leftover, so window-overflow std/ldd faulted.
+ * Matches _stack_top in ct952_app.ld (top of the payload window, 16B aligned). */
+static uint32_t mach_pyapp_sp(void)
+{
+    const char *e = getenv("CT952_PYAPP_SP");
+    if (e && *e) return (uint32_t)strtoul(e, NULL, 0);
+    return 0x401EFFF0u;
+}
+
 static uint32_t mach_pyapp_base(void)
 {
     const char *e = getenv("CT952_PYAPP_BASE");
@@ -3130,7 +3140,8 @@ uint64_t machine_run(machine_t *m, uint64_t n)
      * PROC1 CPU and jump into the DRAM-resident MicroPython payload, either when
      * the firmware first calls a specific app entry (CT952_PYAPP_HOOK=<pc>, the
      * "replaced app") or at a fixed icount (CT952_PYAPP_AT=<icount>, default
-     * 120M once the firmware has booted). Python then runs on-device with the
+     * 22M once the firmware has booted -- see the note at the default). Python
+     * then runs on-device with the
      * firmware's hardware initialised and its state live -- reachable via
      * ct952.peek32/poke32 and callable via ct952.call. §12.79. */
     static long pyapp_at = -2; static uint32_t pyapp_hook = 0; static int pyapp_done = 0;
@@ -3145,7 +3156,15 @@ uint64_t machine_run(machine_t *m, uint64_t n)
         const char *h = getenv("CT952_PYAPP_HOOK");
         pyapp_hook = h ? (uint32_t)strtoul(h, NULL, 0) : 0;
         pyapp_at = e ? (long)strtoull(e, NULL, 0)
-                     : (getenv("CT952_PYAPP") && !h ? 120000000L : -1);
+                     /* Default 22M, NOT the old 120M. The payload window
+                      * (0x400c0000, ~620 KB) lies inside DS_FRAMEBUF_ST_MM
+                      * (0x400A2000..0x401A2000), so once the firmware decodes a
+                      * photo into that framebuffer the payload is OVERWRITTEN and
+                      * the seize lands in image data -> "trap 0x07 with ET=0" a
+                      * few hundred instructions in. 22M is after the boot/section
+                      * load but before decode, and is verified to reach an
+                      * interactive USB-keyboard REPL. */
+                     : (getenv("CT952_PYAPP") && !h ? 22000000L : -1);
     }
     while (done < n && !m->cpu.halted && !m->watchdog_fired) {
         if (!pyapp_done && getenv("CT952_PYAPP") &&
@@ -3175,8 +3194,8 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                  * watches PROC1 (0x98080020) live. §12.82. */
                 sparc_reset(&m->cpu2, &m->bus2);
                 m->cpu2.pc  = mach_pyapp_base();
-                m->cpu2.npc = 0x40500004u;
-                sparc_set_reg(&m->cpu2, 14, 0x407F0000u);
+                m->cpu2.npc = mach_pyapp_base() + 4u;
+                sparc_set_reg(&m->cpu2, 14, mach_pyapp_sp());
                 m->cpu2.psr = 0xF3000FA0u;           /* S=1 so it can wr psr/wim/tbr */
                 m->cpu2.halted = 0;
                 m->proc2_on = 1;
@@ -3189,8 +3208,8 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                 pyapp_saved_ctx = m->cpu;
                 pyapp_ctx_valid = 1;
                 m->cpu.pc  = mach_pyapp_base();         /* payload entry stub */
-                m->cpu.npc = 0x40500004u;
-                sparc_set_reg(&m->cpu, 14, 0x407F0000u);/* %sp: top of the payload window */
+                m->cpu.npc = mach_pyapp_base() + 4u;    /* NOT a hardcoded window! */
+                sparc_set_reg(&m->cpu, 14, mach_pyapp_sp());  /* %sp inside real DRAM */
                 sparc_set_reg(&m->cpu, 30, 0);          /* %fp = 0 */
                 /* Mask device interrupts (PIL=15) so eCos's timer tick can't
                  * context-switch PROC1 away from the Python app; window/flush traps

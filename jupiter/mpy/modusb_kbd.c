@@ -78,20 +78,10 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
 #define PORTSC_PEC       0x00000008u   /* Port Enable Change (RW1C)           */
 #define PORTSC_OCC       0x00000020u   /* Over-current Change (RW1C)          */
 #define PORTSC_RW1C      (PORTSC_CSC | PORTSC_PEC | PORTSC_OCC)
-/* Port Force Full Speed Connect. Found in the STOCK FIRMWARE's own EHCI stack, which
- * is a BSD-derived driver with Transdimension/ChipIdea quirks ("TDI EHCI OTG
- * Controller"). Its ehci_init prints "forcing host to connect as full speed" and then
- * does exactly: read PORTSC (= regbase+0x44, which independently confirms our operational
- * base), AND with 0xFFFFFFD5 to preserve everything except the write-1-to-clear change
- * bits, OR in bit 24, write back. It is gated on a board flag the firmware keeps at
- * 0x40040f0c. Setting it makes the port connect at full/low speed instead of chirping for
- * high speed, which on some PHYs is required for a low-speed device to work at all. */
-#define PORTSC_PFSC      0x01000000u
 
 /* Read-modify-write PORTSC the way the firmware does: never write 1 back to a change bit
  * that happens to be set, or the write silently acknowledges an event we have not handled.
  * The old code did plain `PORTSC |= x` read-modify-writes and clobbered them. */
-static int g_pfsc = 0;               /* try the quirk on the second bringup attempt */
 static void portsc_rmw(uint32_t set, uint32_t clr)
 {
     uint32_t v = OPREG(0x44) & ~(PORTSC_RW1C | clr);
@@ -123,41 +113,11 @@ static uint32_t g_isls = 0;
  * speed supports) and is replaced by bMaxPacketSize0 from the device descriptor once
  * we have read it -- rather than guessed from the port speed. */
 static uint32_t g_mps0 = 8;
-/* Which bringup step failed, kept for the final on-screen summary: the per-attempt
- * lines scroll off a 7-row console, so the reason has to persist.
+/* Which bringup step failed, kept for a one-line failure message.
  * 1 idle line  2 port not enabled  3 GET_DESCRIPTOR  4 SET_ADDRESS
  * 5 GET_CONFIG  6 SET_CONFIGURATION  0 success */
 static int g_failstep = 0;
-/* Controller state captured at the first failed transfer, so the reason survives the
- * scrolling console. Guessing has been exhausted; these bits state what happened:
- *   qTD token bit7 Active  (still set => the controller never executed the qTD)
- *             bit6 Halted, bit5 DataBufErr, bit4 Babble, bit3 XactErr,
- *             bit2 MissedUframe, bit1 SplitXstate, bits11:10 CERR
- *   USBSTS bit12 HCHalted, bit4 HostSysErr, bit3 FrameRollover, bit1 ErrInt */
-static uint32_t g_dbg_setup, g_dbg_data, g_dbg_status, g_dbg_usbsts, g_dbg_frindex, g_dbg_qh3;
-/* SETUP bytes read back out of DMA memory after a failed transfer, and the DATA-stage
- * status recorded for each split-routing variant tried. */
-static uint8_t  g_dbg_sbytes[8];
-static uint32_t g_dbg_nodev, g_dbg_portsc, g_dbg_bare_in, g_dbg_rx, g_dbg_ttctrl;
-uint32_t usb_kbd_ttctrl(void) { return g_dbg_ttctrl; }
-uint32_t usb_kbd_barein(void) { return g_dbg_bare_in; }
-uint32_t usb_kbd_rx(void)     { return g_dbg_rx; }
-uint32_t usb_kbd_nodev(void)  { return g_dbg_nodev; }
-uint32_t usb_kbd_portsc(void) { return g_dbg_portsc; }
-static uint32_t g_dbg_dv[8];   /* [0..2] per routing, [3] the zero-length probe */
-uint32_t usb_kbd_dv(int i)       { return g_dbg_dv[i & 7]; }
-uint32_t usb_kbd_setupbyte(int i){ return g_dbg_sbytes[i & 7]; }
-uint32_t usb_kbd_dbg(int which)
-{
-    switch (which) {
-    case 0: return g_dbg_setup;   case 1: return g_dbg_status;
-    case 2: return g_dbg_usbsts;  case 3: return g_dbg_frindex;
-    case 5: return g_dbg_data;
-    default: return g_dbg_qh3;
-    }
-}
 int usb_kbd_failstep(void) { return g_failstep; }
-int usb_kbd_lastxfer(void);
 #define QH_DTC           (1u << 14)    /* take data toggle from the qTD       */
 #define QH_H             (1u << 15)    /* head of reclamation list            */
 #define QH_MPS(n)        (((uint32_t)(n) & 0x7FF) << 16)
@@ -330,6 +290,27 @@ static int qtd_wait(volatile uint32_t *td, int budget) {
     return 0;
 }
 
+/* Wait up to `ms` REAL milliseconds (measured on the FRINDEX timebase) for a qTD to
+ * retire. This matters for the interrupt endpoint: the controller only services the
+ * schedule about once per 1ms frame, so a spin-count budget of a few thousand
+ * iterations (~hundreds of us) expires before the transaction is even attempted, and
+ * the poll cancels a report the device was about to deliver. That is what made the
+ * keyboard drop most keystrokes ("press three, get one"). Returns 1 if it retired. */
+static int qtd_wait_ms(volatile uint32_t *td, int ms) {
+    uint32_t f0 = OPREG(0x0C) & 0x3FFFu;
+    long guard = (long)ms * 40000L;   /* backstop if FRINDEX is not advancing */
+    for (long i = 0; i < guard; i++) {
+        if (!(td[2] & QTD_ACTIVE)) {
+            return 1;
+        }
+        uint32_t d = (OPREG(0x0C) - f0) & 0x3FFFu;
+        if ((int)(d >> 3) >= ms) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /* Run a control transfer on endpoint 0. For IN transfers the data lands in
  * g_data; returns the number of bytes transferred (residual-corrected), or -1
  * on failure. */
@@ -433,10 +414,10 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
     return 0;
 }
 
-/* Poll the interrupt-IN endpoint (0x81) once for an 8-byte HID boot report.
- * Copies the report into `out` and returns 1 if a report arrived, 0 if the
- * endpoint NAKed (no key change) within the budget. */
-static int int_in_poll(uint8_t *out, int budget) {
+/* Poll the interrupt-IN endpoint (0x81) once for an 8-byte HID boot report, waiting up
+ * to `ms` real milliseconds. Copies the report into `out` and returns 1 if a report
+ * arrived, 0 if the endpoint NAKed (no key change) within the window. */
+static int int_in_poll(uint8_t *out, int ms) {
     volatile uint32_t *td = g_td_p[0];
     async_stop();
     td[0] = QTD_T;
@@ -458,7 +439,7 @@ static int int_in_poll(uint8_t *out, int budget) {
 
     async_start(pa(g_qh));
 
-    if (!qtd_wait(td, budget)) {
+    if (!qtd_wait_ms(td, ms)) {
         td[2] = 0;                 /* cancel the pending qTD (NAK / no key) */
         return 0;
     }
@@ -497,54 +478,10 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
     }
 }
 
-/* Is an IN transaction structurally possible at all?
- *
- * Hardware says every SETUP/OUT stage succeeds and every IN stage comes back bare
- * Halted with no bytes transferred, while a transfer to a nonexistent address fails
- * differently (XactErr, CERR=0) -- so packets do reach the wire and the controller can
- * tell silence from a stall. This probe issues a lone IN to endpoint 0 with no control
- * transfer pending. A device answers that with NAK, and a NAK is invisible in the qTD
- * status: the controller simply retries, so the qTD stays ACTIVE and this times out.
- *
- *   result 0x80 (still Active)  -> INs work at the bus level; NAKs are being collected,
- *                                  so the halts really are protocol responses.
- *   result 0x40 (Halted)        -> every IN halts regardless of what the device says,
- *                                  i.e. IN completion is structurally broken (the
- *                                  complete-split half of a split transaction).
- */
-static uint32_t probe_bare_in(void)
-{
-    volatile uint32_t *td = g_td_p[0];
-    async_stop();
-    td[0] = QTD_T;
-    td[1] = QTD_T;
-    td[2] = QTD_ACTIVE | QTD_PID_IN | QTD_CERR | QTD_BYTES(8);
-    td[3] = pa(g_data);
-    td[4] = td[5] = td[6] = td[7] = 0;
-
-    g_qh[0] = pa(g_qh) | (1u << 1);
-    g_qh[1] = g_eps | QH_DTC | QH_H | QH_RL8 | QH_MPS(8) |
-              (g_isls ? QH_C : 0u);
-    g_qh[2] = qh_word2(0);
-    g_qh[3] = 0;
-    g_qh[4] = pa(td);
-    g_qh[5] = QTD_T;
-    g_qh[6] = 0;
-    for (int i = 7; i < 12; i++) g_qh[i] = 0;
-
-    async_start(pa(g_qh));
-    qtd_wait(td, 400000);
-    return td[2];
-}
-
 /* Reset the controller + root-hub port, enumerate and configure the keyboard.
  * Returns 1 on success, 0 if no device / enumeration failed. Plain C so both
  * the Python module and the C REPL stdin path can call it. */
 int usb_kbd_bringup(void) {
-    /* Force-full-speed (PORTSC bit 24) is OFF: the firmware's board flag at 0x40040f0c
-     * read back 0 (f=00 on hardware), so the stock stack does NOT force it on this board,
-     * and the earlier attempt that did set it changed nothing. Match the firmware. */
-    g_pfsc = 0;
     g_ready = 0; g_dev_addr = 0; g_int_toggle = 0; g_failstep = 0;
     dma_view_init();   /* uncached views before any DMA structure is touched */
 
@@ -587,16 +524,8 @@ int usb_kbd_bringup(void) {
     EHCI_USBCMD = USBCMD_RS;
     for (volatile int i = 0; i < 50000; i++) { }   /* let the port sample D+/D- */
 
-    /* Staged diagnostics. On hardware this failed silently, so report WHICH step
-     * fails and the PORTSC value, rather than inferring it. PORTSC line status
-     * (bits 11:10) is the decisive field for a keyboard: 01 = LOW-SPEED device.
-     * EHCI alone cannot talk to a low- or full-speed device -- it needs either a
-     * companion (OHCI/UHCI) or a high-speed hub's transaction translator -- and
-     * virtually every USB keyboard, including a Gearhead KB1500U, is low-speed. */
-    /* PORT POWER. Hardware showed PORTSC=1C000400: line status 01 (a LOW-SPEED
-     * device is on the wire) but PP=0 and CCS=0 -- the port was never powered, so
-     * the connect could not latch. Set PP and give VBUS time to come up. */
-    portsc_rmw(PORTSC_PP | (g_pfsc ? PORTSC_PFSC : 0u), 0);
+    /* PORT POWER: set PP and give VBUS time to come up before expecting a connect. */
+    portsc_rmw(PORTSC_PP, 0);
     /* USB 2.0 timing after applying VBUS: a port must settle for >=100ms before a
      * connect means anything, and the connection must then be debounced for 100ms
      * (TATTDB) before reset. A cheap HID also needs that long just to boot its own
@@ -630,12 +559,7 @@ int usb_kbd_bringup(void) {
      *
      * TIMING IS NORMATIVE HERE. USB 2.0 requires the reset (SE0) to be driven for at
      * least 10ms, and EHCI tells root-hub software to hold it ~50ms; the device then
-     * needs up to 10ms of recovery (TRSTRCY) before it will answer a SETUP. The
-     * previous code held PR for 20000 spin iterations -- about 3ms by the measured
-     * ~6.5 iterations/us -- and gave 3ms of recovery. A short reset leaves the device
-     * in an indeterminate state rather than the Default state, which is consistent
-     * with what the hardware reported: the SETUP packet is ACKed (s=00) but the
-     * device STALLs the data stage (d=40) instead of returning its descriptor. */
+     * needs up to 10ms of recovery (TRSTRCY) before it will answer a SETUP. */
     /* Clearing the connect-change latch is the one place a 1 SHOULD be written. */
     EHCI_PORTSC0 = (EHCI_PORTSC0 & ~(PORTSC_PED | PORTSC_PEC | PORTSC_OCC)) | PORTSC_CSC;
     portsc_rmw(PORTSC_PR, PORTSC_PED);   /* PE must be written 0 alongside PR */
@@ -655,63 +579,17 @@ int usb_kbd_bringup(void) {
     /* Enumerate at address 0. Ask for only the first 8 bytes first: that is one
      * max-packet at any speed, needs no assumption about bMaxPacketSize0, and is what
      * every real host stack does. The first control transfer after a port reset is
-     * also allowed to fail, so retry a few times before giving up. */
+     * allowed to fail, so retry a few times before giving up. */
     g_mps0 = 8;
     int got = 0;
-    /* Try each split-transaction routing in turn. The qTD status cannot distinguish a
-     * STALL from the device from a STALL synthesised by a misused embedded TT, so let
-     * the device settle it: whichever routing produces a descriptor is the right one,
-     * and the DATA-stage status of each is recorded for the on-screen summary. */
-    /* Sweep the split-transaction configuration. The three fields that decide whether
-     * a low-speed control endpoint is reached through the embedded TT are the QH's hub
-     * address, its endpoint speed, and its C bit. Those are no longer swept: the stock
-     * firmware's own QH builder settled them (HubAddr=0, PortNum=0, CMASK=0x08, RL=8, C
-     * for a non-high-speed control endpoint), and qh_word2()/g_qh[1] now match it. Just
-     * retry the read a few times, since the first control transfer after a reset may fail,
-     * and record each attempt's DATA-stage status for the summary. */
     for (int ci = 0; ci < 4; ci++) {
         got = ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 8);
-        if (ci < 6) g_dbg_dv[ci] = g_td_p[1][2];
         if (got >= 8) {
             break;
         }
-        g_dbg_setup   = g_td_p[0][2];      /* SETUP qTD token   */
-        g_dbg_data    = g_td_p[1][2];      /* DATA  qTD token   */
-        g_dbg_status  = g_td_p[2][2];      /* STATUS qTD token  */
-        g_dbg_usbsts  = EHCI_USBSTS;
-        g_dbg_frindex = OPREG(0x0C);       /* FRINDEX: is the controller running? */
-        g_dbg_qh3     = g_qh[6];           /* QH overlay token   */
-        for (int b = 0; b < 8; b++) {
-            g_dbg_sbytes[b] = g_setup[b];
-        }
-        g_dbg_rx = ((uint32_t)g_data[0] << 24) | ((uint32_t)g_data[1] << 16) |
-                   ((uint32_t)g_data[2] << 8)  | (uint32_t)g_data[3];
         hc_delay_ms(10);
     }
     if (got < 8) {
-        /* Last discriminator before giving up: does the device reject EVERYTHING, or
-         * only our IN data stage? SET_ADDRESS(0) is a request the device already
-         * satisfies and it has no data stage at all, so a clean status stage here says
-         * the device is in Default state and answering us, and that the failure is
-         * specific to the data phase (toggle / packet size / split completion). A
-         * halted status stage says the device rejects us outright, i.e. it is not in
-         * Default state and the reset still is not taking. */
-        ctrl_xfer(0x00, REQ_SET_ADDRESS, 0, 0, 0);
-        g_dbg_dv[7] = g_td_p[2][2];   /* slots 0..5 hold the combination sweep */
-        /* CONTROL EXPERIMENT. Address 7 cannot exist -- no address has been assigned
-         * yet, so nothing on the wire will answer. A working bus MUST fail differently
-         * here: three attempts, CERR counted down to 0, XactErr (bit 3) set, i.e. 0x48
-         * or 0x68. If this returns the SAME bare Halted 0x40 as every real request,
-         * then 0x40 is not the device stalling us -- the controller is halting the
-         * queue by itself and every protocol theory is void. This is the one reading
-         * that separates "the keyboard refuses us" from "we never reached the wire". */
-        g_dev_addr = 7;
-        ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 8);
-        g_dbg_nodev = g_td_p[0][2];   /* SETUP token: no device should even ACK it */
-        g_dev_addr = 0;
-        g_dbg_bare_in = probe_bare_in();
-        g_dbg_ttctrl  = EHCI_USBMODE;  /* T= now reports USBMODE: bit4 SDIS, bits1:0 host */
-        g_dbg_portsc = EHCI_PORTSC0;  /* is the port still connected+enabled by now? */
         g_failstep = 3; return 0;
     }
     /* Adopt the device's real endpoint-0 packet size for every later transfer. */
@@ -759,7 +637,10 @@ int usb_kbd_c_getchar(void) {
         return -1;
     }
     uint8_t rep[8];
-    if (int_in_poll(rep, 4000) && rep[2] != 0) {
+    /* ~12ms window: long enough for the controller to actually service the interrupt
+     * endpoint (which it does about once per frame), short enough that the REPL stays
+     * responsive to UART too. */
+    if (int_in_poll(rep, 12) && rep[2] != 0) {
         char c = usage_to_ascii(rep[0], rep[2]);
         if (c) {
             return (unsigned char)c;
@@ -783,7 +664,7 @@ static mp_obj_t usb_kbd_poll(void) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("usb_kbd not initialised"));
     }
     uint8_t rep[8];
-    if (int_in_poll(rep, 200000)) {
+    if (int_in_poll(rep, 200)) {
         return mp_obj_new_bytes(rep, 8);
     }
     return mp_const_none;
@@ -799,7 +680,7 @@ static mp_obj_t usb_kbd_getchar(void) {
     }
     uint8_t rep[8];
     for (int tries = 0; tries < 48; tries++) {
-        if (int_in_poll(rep, 20000)) {
+        if (int_in_poll(rep, 12)) {
             if (rep[2] != 0) {                       /* key-down (first key) */
                 char c = usage_to_ascii(rep[0], rep[2]);
                 if (c) {

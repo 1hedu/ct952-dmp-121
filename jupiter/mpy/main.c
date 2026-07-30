@@ -125,41 +125,6 @@ int pyapp_main(void) {
            "print('OSD console', ct952.WIDTH, 'x', ct952.HEIGHT, '  >>>')\n",
            MP_PARSE_FILE_INPUT);
 
-    /* Default embedded script -- runs with NO keyboard, so the frame is useful
-     * standalone. It is INVESTIGATIVE: it prints the display registers that could
-     * account for the two things still unexplained about this display (HW
-     * reference 10.22/10.24): the scanout pitch being 292 while VCR22/VCR23 both
-     * say 308, and the OSD's absolute vertical limit at panel line ~139. Dumped:
-     * H_REQ (DRAM accesses per line), REDUNDANT (extra first access), the V/H
-     * scaling registers, LB_CR1/CR2 (OSD line-buffer control -- leading suspect
-     * for the ~139 limit), VCR25 (OSD upscaling) and MEM_LINE.
-     *
-     * NOTE: the hook removed here probed a "PYSC" header at 0x40740000, which is
-     * OUTSIDE this part's 2 MB DRAM (0x40000000..0x40200000) -- an out-of-bounds
-     * read on real silicon that only ever worked under the emulator. */
-    static const char investigate[] =
-        /* hand-rolled hex: this port builds at MICROPY_CONFIG_ROM_LEVEL_MINIMUM,
-         * where MICROPY_PY_BUILTINS_STR_OP_MODULO is 0, so "'%08X' % v" raises
-         * TypeError (it silently produced no output on the first attempt). */
-        "import ct952\n"
-        "D='0123456789ABCDEF'\n"
-        "def h(a):\n"
-        "    v=ct952.peek32(a)\n"
-        "    s=''\n"
-        "    for i in range(8):\n"
-        "        s=D[v&15]+s\n"
-        "        v>>=4\n"
-        "    return s\n"
-        /* LB_CR1 is CLOSED: the write-back test read 00300000, so the write stuck,
-         * and the pitch stayed 292 -- LB_CR1's low field genuinely does not set the
-         * scanout pitch. Those lines are gone; the remaining registers are recorded in
-         * the hardware reference, so the console rows they used are now free for the
-         * USB enumeration diagnostics printed below. */
-        "print('mpy ok')\n"
-;
-    mp_hal_stdout_tx_strn("[pyapp] embedded investigate script\n", 36);
-    do_str(investigate, MP_PARSE_FILE_INPUT);
-
     /* Milestone 3: bring up the USB keyboard and hand the frame an interactive
      * REPL on its own screen -- no serial cable, no host. If no keyboard is found
      * the REPL still reads UART1 RX, so behaviour degrades rather than hanging.
@@ -203,105 +168,19 @@ int pyapp_main(void) {
     /* Retry bringup: on real silicon the port takes time to report a connection
      * after the clocks come back (and after USB_HCExit() tore the controller down),
      * so a single attempt can lose the race even with a keyboard plugged in. Each
-     * attempt does a full HCRESET, so retrying is safe. */
-    /* DO NOT WRITE THESE. An earlier build here set
-     *     REG_PLAT_CLK_FREQ_CONTROL1 (0x80000308) |= 0x04008000
-     * and programmed UPLL (0x80000318) when it read back 0, copying what the stock
-     * firmware's USB_HCInit does at 0xad64c. On hardware the AP stopped running
-     * altogether and the frame came back up in the stock slideshow, i.e. the SoC hung or
-     * reset and the watchdog restarted it.
-     *
-     * That is unsurprising in hindsight: spflash.c treats bit 15 of this register as
-     * CPU/flash-clock related (it clears bits 25 and 15 around flash access, and clears
-     * bit 15 for CPU_27M), so setting it underneath a running system can change the clock
-     * the code is executing from. UPLL is worse -- reprogramming a PLL that is already
-     * locked, on the strength of a register that might not even read back, is not a
-     * diagnostic.
-     *
-     * The firmware does these writes from a cold USB init, not from inside a live system
-     * that has already booted. So: READ them, report them, and decide with the values in
-     * hand. K= and U= below. */
+     * attempt does a full HCRESET and re-resets the root port, so retrying is safe. */
     int kbd_ok = 0;
-    extern int usb_kbd_failstep(void);
-    extern uint32_t usb_kbd_dbg(int);
-    {
-        int tries;
-        /* A full retry re-resets the root port, which is worth doing twice before
-         * declaring failure; the descriptor read itself already retries internally. */
-        for (tries = 0; tries < 2 && !kbd_ok; tries++) {
-            kbd_ok = usb_kbd_bringup();
-            if (!kbd_ok) for (volatile int i = 0; i < 600000; i++) { }
-        }
+    for (int tries = 0; tries < 2 && !kbd_ok; tries++) {
+        kbd_ok = usb_kbd_bringup();
+        if (!kbd_ok) for (volatile int i = 0; i < 600000; i++) { }
     }
     if (kbd_ok) {
-        mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
+        mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready -- type Python below\n", 48);
     } else {
-        /* name the failing step; the per-attempt lines scroll off the 7-row console */
-        mp_printf(&mp_plat_print, "[pyapp] no USB kbd FAILSTEP=%d\n",
+        extern int usb_kbd_failstep(void);
+        mp_printf(&mp_plat_print, "[pyapp] no USB keyboard (step %d); REPL reads UART1\n",
                   usb_kbd_failstep());
-        /* One short line, printed LAST so it cannot be cut off or wrapped: the
-         * STATUS BYTE of each control stage plus the QH overlay token. Which stage
-         * halted is the discriminator -- a halted SETUP means the device rejected
-         * the request outright, whereas a good SETUP with a halted DATA stage means
-         * it accepted the request and then refused to return the descriptor. */
-        /* FULL tokens, not just the status byte. TotalBytes lives in bits 30:16, and it
-         * is the number that decides whether "the device ACKed our SETUP" was ever true:
-         * a SETUP qTD that retires with TotalBytes still 8 sent NOTHING, which would mean
-         * the bus never carried a packet and every protocol conclusion drawn from s=00 is
-         * void. A=SETUP token, B=DATA token. A=xx00xxxx means the 8 bytes went out. */
-        mp_printf(&mp_plat_print, "A=%08x B=%08x\n",
-                  (unsigned)usb_kbd_dbg(0), (unsigned)usb_kbd_dbg(5));
-        /* K = REG_PLAT_CLK_FREQ_CONTROL1, U = UPLL. If K is missing bits 26/15 the write
-         * above did not stick; if U is 0 the USB PHY has no 48MHz clock. */
-        mp_printf(&mp_plat_print, "K=%08x U=%08x\n",
-                  (unsigned)*(volatile uint32_t *)0x80000308u,
-                  (unsigned)*(volatile uint32_t *)0x80000318u);
-        /* The SETUP packet as the controller actually fetched it from DMA memory. A
-         * device ACKs any well-formed packet and then STALLs a request it cannot
-         * parse, so garbage here produces exactly the s=00 d=40 we are chasing.
-         * Expect 8006000100000800. */
-        {
-            extern uint32_t usb_kbd_dv(int);
-            extern uint32_t usb_kbd_nodev(void);
-            extern uint32_t usb_kbd_portsc(void);
-            extern uint32_t usb_kbd_barein(void);
-            extern uint32_t usb_kbd_rx(void);
-            extern uint32_t usb_kbd_ttctrl(void);
-            /* The SETUP bytes read back correct (8006000100000800) on hardware, so that
-             * line is gone; V= keeps the six-configuration sweep and R= whatever landed in
-             * the IN buffer. */
-            mp_printf(&mp_plat_print, "V=%02x%02x%02x%02x%02x%02x R=%08x\n",
-                      (unsigned)(usb_kbd_dv(0) & 0xFF), (unsigned)(usb_kbd_dv(1) & 0xFF),
-                      (unsigned)(usb_kbd_dv(2) & 0xFF), (unsigned)(usb_kbd_dv(3) & 0xFF),
-                      (unsigned)(usb_kbd_dv(4) & 0xFF), (unsigned)(usb_kbd_dv(5) & 0xFF),
-                      (unsigned)usb_kbd_rx());
-            /* LAST line, because only the last one is reliably readable on a 7-row
-             * console: the no-device control experiment first (0x48/0x68 = the bus
-             * really times out when nobody answers, so 0x40 elsewhere is a genuine
-             * device STALL; 0x40 here means the controller halts regardless of any
-             * device), then the zero-length probe and the port state. */
-            /* i= is the decisive one: a lone IN to endpoint 0 with nothing pending.
-             * A device answers that with NAK, which is invisible in the status, so the
-             * qTD should stay ACTIVE (0x80) and time out. 0x40 instead means every IN
-             * halts no matter what the device says, i.e. IN completion itself is
-             * broken rather than the device rejecting our requests. */
-            /* The firmware's board flag at 0x40040f0c read back 00, so the stock stack
-             * does NOT force full-speed connect on this board and PORTSC bit 24 is not
-             * the answer. T= replaces it: the TTCTRL readback, which says whether the
-             * embedded TT's hub address finally stuck at the right register (+0x1C). */
-            mp_printf(&mp_plat_print, "i=%02x n=%02x z=%02x T=%08x P=%08x\n",
-                      (unsigned)(usb_kbd_barein() & 0xFF),
-                      (unsigned)(usb_kbd_nodev() & 0xFF),
-                      (unsigned)(usb_kbd_dv(7) & 0xFF),
-                      (unsigned)usb_kbd_ttctrl(),
-                      (unsigned)usb_kbd_portsc());
-        }
     }
-    /* The register dump that used to run here has been REMOVED, and that matters for
-     * the diagnostics above: it printed three more lines after them, which on a 7-row
-     * scrolling console is what left only a single line of USB state readable. PORTSC
-     * is now reported inside that summary as P=, and CAP/MODE/CLK/RST are already
-     * recorded in the hardware reference (10.31-10.33). */
     for (;;) {
         if (pyexec_friendly_repl() != 0) break;
     }

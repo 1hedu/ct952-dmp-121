@@ -449,10 +449,14 @@ static int int_in_poll(uint8_t *out, int ms) {
     return 1;
 }
 
-/* ---- HID usage -> ASCII (US layout, unshifted + a few shifted) -------------- */
+/* ---- HID usage -> ASCII (US layout) ----------------------------------------- */
 static char usage_to_ascii(uint8_t mod, uint8_t u) {
     int shift = (mod & 0x22) != 0;   /* left/right shift */
+    int ctrl  = (mod & 0x11) != 0;   /* left/right ctrl  */
     if (u >= 0x04 && u <= 0x1D) {    /* a..z */
+        if (ctrl) {
+            return (char)(u - 0x04 + 1);  /* Ctrl-A..Ctrl-Z -> 0x01..0x1A */
+        }
         char c = (char)('a' + (u - 0x04));
         return shift ? (char)(c - 32) : c;
     }
@@ -462,20 +466,78 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
     }
     switch (u) {
     case 0x27: return shift ? ')' : '0';
-    case 0x28: return '\n';   /* Enter     */
+    case 0x28: return '\r';   /* Enter -> CR (readline treats CR/LF as submit) */
+    case 0x29: return 0x1B;   /* Escape    */
+    case 0x2A: return 0x08;   /* Backspace -> BS (readline deletes on 8 and 127) */
     case 0x2B: return '\t';   /* Tab       */
     case 0x2C: return ' ';    /* Space     */
     case 0x2D: return shift ? '_' : '-';
     case 0x2E: return shift ? '+' : '=';
     case 0x2F: return shift ? '{' : '[';
     case 0x30: return shift ? '}' : ']';
+    case 0x31: return shift ? '|' : '\\';
     case 0x33: return shift ? ':' : ';';
     case 0x34: return shift ? '"' : '\'';
+    case 0x35: return shift ? '~' : '`';
     case 0x36: return shift ? '<' : ',';
     case 0x37: return shift ? '>' : '.';
     case 0x38: return shift ? '?' : '/';
+    case 0x4C: return 0x7F;   /* Delete Forward -> DEL */
     default:   return 0;
     }
+}
+
+/* Press/release edge detection for the boot keyboard.
+ *
+ * The 8-byte report holds up to six key slots as an UNORDERED SET, and the device sends
+ * a report on every state change (SET_IDLE(0)). Emitting a character whenever slot 1 is
+ * non-zero double-types: when a second key is added or lifted, slot 1 can still hold the
+ * first key, so it re-fires. The Holtek spec (keyboard_spec_MI00.md §3) says to compare
+ * each report against the previous one and emit only NEWLY pressed usages. A small queue
+ * buffers those so the one-char-at-a-time REPL stdin path loses nothing. */
+static uint8_t g_prev_keys[6];        /* usages down in the previous report */
+static char    g_keyq[16];
+static int     g_keyq_head, g_keyq_tail;
+
+static void keyq_push(char c) {
+    int n = (g_keyq_tail + 1) & 15;
+    if (n != g_keyq_head) { g_keyq[g_keyq_tail] = c; g_keyq_tail = n; }
+}
+static int keyq_pop(void) {
+    if (g_keyq_head == g_keyq_tail) return -1;
+    char c = g_keyq[g_keyq_head];
+    g_keyq_head = (g_keyq_head + 1) & 15;
+    return (unsigned char)c;
+}
+static int key_was_down(uint8_t k) {
+    for (int i = 0; i < 6; i++) if (g_prev_keys[i] == k) return 1;
+    return 0;
+}
+/* Turn one 8-byte report into queued characters for the keys that are newly down. */
+static void process_report(const uint8_t *rep) {
+    const uint8_t *cur = rep + 2;     /* the six key slots */
+    /* ErrorRollOver: all six slots 0x01 -> discard, it is not six keypresses. */
+    if (cur[0]==1 && cur[1]==1 && cur[2]==1 && cur[3]==1 && cur[4]==1 && cur[5]==1) {
+        return;
+    }
+    for (int i = 0; i < 6; i++) {
+        uint8_t k = cur[i];
+        if (k == 0 || k >= 0xE0) continue;   /* empty slot / modifier usage */
+        if (!key_was_down(k)) {              /* newly pressed this report */
+            char c = usage_to_ascii(rep[0], k);
+            if (c) keyq_push(c);
+        }
+    }
+    for (int i = 0; i < 6; i++) g_prev_keys[i] = cur[i];
+}
+/* One poll + edge-decode; returns the next queued character or -1. Shared by the REPL
+ * stdin path and the Python usb_kbd.getchar(). */
+static int kbd_next_char(int poll_ms) {
+    int c = keyq_pop();
+    if (c >= 0) return c;
+    uint8_t rep[8];
+    if (int_in_poll(rep, poll_ms)) process_report(rep);
+    return keyq_pop();
 }
 
 /* Reset the controller + root-hub port, enumerate and configure the keyboard.
@@ -483,6 +545,8 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
  * the Python module and the C REPL stdin path can call it. */
 int usb_kbd_bringup(void) {
     g_ready = 0; g_dev_addr = 0; g_int_toggle = 0; g_failstep = 0;
+    for (int i = 0; i < 6; i++) g_prev_keys[i] = 0;   /* reset edge-detect state */
+    g_keyq_head = g_keyq_tail = 0;
     dma_view_init();   /* uncached views before any DMA structure is touched */
 
     /* Controller reset, then take ownership of all ports and run. */
@@ -636,17 +700,10 @@ int usb_kbd_c_getchar(void) {
     if (!g_ready) {
         return -1;
     }
-    uint8_t rep[8];
     /* ~12ms window: long enough for the controller to actually service the interrupt
      * endpoint (which it does about once per frame), short enough that the REPL stays
-     * responsive to UART too. */
-    if (int_in_poll(rep, 12) && rep[2] != 0) {
-        char c = usage_to_ascii(rep[0], rep[2]);
-        if (c) {
-            return (unsigned char)c;
-        }
-    }
-    return -1;
+     * responsive to UART too. Edge-decoded so held/overlapping keys do not double-type. */
+    return kbd_next_char(12);
 }
 
 /* ============================ Python surface ================================= */
@@ -678,17 +735,11 @@ static mp_obj_t usb_kbd_getchar(void) {
     if (!g_ready) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("usb_kbd not initialised"));
     }
-    uint8_t rep[8];
     for (int tries = 0; tries < 48; tries++) {
-        if (int_in_poll(rep, 12)) {
-            if (rep[2] != 0) {                       /* key-down (first key) */
-                char c = usage_to_ascii(rep[0], rep[2]);
-                if (c) {
-                    char s[1] = { c };
-                    return mp_obj_new_str(s, 1);
-                }
-            }
-            /* key-up (all zero) or a non-printable key: keep polling */
+        int c = kbd_next_char(12);
+        if (c >= 0) {
+            char s[1] = { (char)c };
+            return mp_obj_new_str(s, 1);
         }
     }
     return mp_const_none;

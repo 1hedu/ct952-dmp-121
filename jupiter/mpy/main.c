@@ -223,12 +223,14 @@ int pyapp_main(void) {
         /* name the failing step; the per-attempt lines scroll off the 7-row console */
         mp_printf(&mp_plat_print, "[pyapp] no USB kbd FAILSTEP=%d\n",
                   usb_kbd_failstep());
-        /* what the controller actually did -- no more guessing at causes */
-        mp_printf(&mp_plat_print, "SET=%08x STA=%08x\n",
-                  (unsigned)usb_kbd_dbg(0), (unsigned)usb_kbd_dbg(1));
-        mp_printf(&mp_plat_print, "STS=%08x FRI=%08x QH=%08x\n",
-                  (unsigned)usb_kbd_dbg(2), (unsigned)usb_kbd_dbg(3),
-                  (unsigned)usb_kbd_dbg(4));
+        /* One short line, printed LAST so it cannot be cut off or wrapped: the
+         * STATUS BYTE of each control stage plus the QH overlay token. Which stage
+         * halted is the discriminator -- a halted SETUP means the device rejected
+         * the request outright, whereas a good SETUP with a halted DATA stage means
+         * it accepted the request and then refused to return the descriptor. */
+        mp_printf(&mp_plat_print, "s=%02x d=%02x k=%02x Q=%08x\n",
+                  (unsigned)(usb_kbd_dbg(0) & 0xFF), (unsigned)(usb_kbd_dbg(5) & 0xFF),
+                  (unsigned)(usb_kbd_dbg(1) & 0xFF), (unsigned)usb_kbd_dbg(4));
     }
     /* Decisive values printed LAST so they survive on a 7-line scrolling console
      * (the first attempt buried them above the REPL banner).

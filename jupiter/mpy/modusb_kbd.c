@@ -94,12 +94,13 @@ static int g_failstep = 0;
  *             bit6 Halted, bit5 DataBufErr, bit4 Babble, bit3 XactErr,
  *             bit2 MissedUframe, bit1 SplitXstate, bits11:10 CERR
  *   USBSTS bit12 HCHalted, bit4 HostSysErr, bit3 FrameRollover, bit1 ErrInt */
-static uint32_t g_dbg_setup, g_dbg_status, g_dbg_usbsts, g_dbg_frindex, g_dbg_qh3;
+static uint32_t g_dbg_setup, g_dbg_data, g_dbg_status, g_dbg_usbsts, g_dbg_frindex, g_dbg_qh3;
 uint32_t usb_kbd_dbg(int which)
 {
     switch (which) {
     case 0: return g_dbg_setup;   case 1: return g_dbg_status;
     case 2: return g_dbg_usbsts;  case 3: return g_dbg_frindex;
+    case 5: return g_dbg_data;
     default: return g_dbg_qh3;
     }
 }
@@ -403,6 +404,7 @@ int usb_kbd_bringup(void) {
     /* Enumerate at address 0: read the 18-byte device descriptor. */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 18) < 18) {
         g_dbg_setup   = g_td_p[0][2];      /* SETUP qTD token   */
+        g_dbg_data    = g_td_p[1][2];      /* DATA  qTD token   */
         g_dbg_status  = g_td_p[2][2];      /* STATUS qTD token  */
         g_dbg_usbsts  = EHCI_USBSTS;
         g_dbg_frindex = OPREG(0x0C);       /* FRINDEX: is the controller running? */

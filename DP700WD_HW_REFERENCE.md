@@ -7238,3 +7238,44 @@ enumeration has resisted three plausible fixes. Rather than a fourth guess, the 
 step is determined by the token bits above -- Active-still-set and XactErr point in
 opposite directions (schedule vs. signalling), and there is no way to tell them apart
 without reading them.
+
+### 10.36 The keyboard RESPONDS and rejects us: STALL, not a hardware fault
+
+First real controller state off the frame (top line was cut off, but the rest is
+decisive):
+```
+    STS=00000086   FRI=00000d18   QH=80120d40
+```
+| value | decode |
+|---|---|
+| USBSTS bit1 | USBERRINT -- a transaction error was reported |
+| USBSTS bit2 | Port Change Detect |
+| USBSTS bit7 | SRI (SOF received) -- **the controller is generating frames** |
+| USBSTS bit12 | HCHalted = **0**, so the controller is running |
+| FRINDEX = 0xd18 | non-zero, frames are advancing |
+| QH token | DT=1, **TotalBytes=18**, CERR=**3**, status byte **0x40 = Halted only** |
+
+Halted with **no** XactErr, Babble or DataBufErr, and CERR *not* decremented, is the
+EHCI signature of a **STALL handshake from the device**. So the keyboard is powered,
+enumerable and *talking* -- it is refusing the request. That reclassifies the problem
+from hardware bring-up to USB protocol, and it means the port/reset/power/speed/TT/
+cache work in 10.31-10.35 got us all the way to a live conversation.
+
+`TotalBytes = 18` is a further clue: 18 is the GET_DESCRIPTOR wLength, i.e. the
+overlay is showing the **DATA** stage, not the 8-byte SETUP stage. That suggests the
+SETUP was accepted and the IN data stage halted. Confirming that needs the per-stage
+status bytes, so the AP now prints exactly one short line, last, that cannot wrap:
+```
+    s=<SETUP status> d=<DATA status> k=<STATUS status> Q=<QH overlay token>
+```
+Discriminator:
+* `s` halted -> the device rejected the request outright (SETUP contents wrong).
+* `s` clean, `d` halted -> request accepted, descriptor fetch refused: look at MPS0
+  (8 for low speed), the data-stage toggle (DT must be 1 for the first IN), or the
+  split/TT handling of a multi-packet IN.
+* everything 0 -> the qTDs were never executed (schedule problem, not signalling).
+
+Ruled out already: the SETUP packet byte order. USB fields are little-endian and the
+packet is assembled byte-by-byte (`g_setup[2] = wValue & 0xFF; g_setup[3] = wValue >> 8`
+...), which is endian-correct on this big-endian SPARC -- a plausible suspect worth
+checking on a BE host, but not the cause here.

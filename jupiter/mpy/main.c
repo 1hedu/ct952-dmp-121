@@ -163,25 +163,8 @@ int pyapp_main(void) {
         "print('HREQ=' + h(0x80001A08) + ' RED=' + h(0x80001A18))\n"
         "print('VSCL=' + h(0x80001A1C) + ' LB2=' + h(0x80001A2C))\n"
         "print('V22 =' + h(0x80000D88) + ' V23=' + h(0x80000D8C))\n"
-        /* EHCI state, read BEFORE any bringup attempt. The keyboard works on the
-         * CT952_PYAPP path but not on --apload, and rather than guess why, look at
-         * the controller: CAPLENGTH/HCIVERSION says whether the block responds at
-         * all, PORTSC0 bit0 (CCS) says whether a device is seen, and USBCMD bit0
-         * (RS) whether it is running. On hardware this also answers the only
-         * question that matters -- is the controller alive after the loader's
-         * USB_HCExit() + power-down, once the clocks are restored. */
-        "print('CAP=' + h(0xA0000100) + ' CMD=' + h(0xA0000110))\n"
-        "print('STS=' + h(0xA0000114) + ' CFG=' + h(0xA0000150))\n"
-        "print('PORT=' + h(0xA0000154) + ' CLK=' + h(0x80000300))\n"
-        /* Probe for an OHCI COMPANION controller. A USB keyboard is a LOW-SPEED
-         * device and EHCI alone cannot address one -- it needs a companion
-         * (OHCI/UHCI) or a high-speed hub's transaction translator. The no-crutch
-         * boot inventory showed the firmware touching 0xa0001000/10a4/112c, which
-         * is consistent with an OHCI block there: OHCI HcRevision (base+0x00) reads
-         * 0x00000010, HcControl is +0x04, HcRhDescriptorA +0x48, PortStatus1 +0x54.
-         * If REV reads ...10 then the keyboard route is OHCI, not EHCI. */
-        "print('oREV=' + h(0xA0001000) + ' oCTL=' + h(0xA0001004))\n"
-        "print('oRHD=' + h(0xA0001048) + ' oPRT=' + h(0xA0001054))\n";
+        "print('mpy ok')\n"
+;
     mp_hal_stdout_tx_strn("[pyapp] embedded investigate script\n", 36);
     do_str(investigate, MP_PARSE_FILE_INPUT);
 
@@ -218,8 +201,30 @@ int pyapp_main(void) {
     if (kbd_ok) {
         mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
     } else {
-        mp_hal_stdout_tx_strn("[pyapp] no USB kbd; REPL on UART1 RX\n", 37);
+        mp_hal_stdout_tx_strn("[pyapp] no USB kbd\n", 19);
     }
+    /* Decisive values printed LAST so they survive on a 7-line scrolling console
+     * (the first attempt buried them above the REPL banner).
+     *   PORTSC bits 11:10 = line status; 01 => a LOW-SPEED device is attached, which
+     *     an EHCI-only driver cannot address.
+     *   oREV = OHCI HcRevision at 0xA0001000; 0x10 => an OHCI companion exists and
+     *     is the correct route for a keyboard.
+     * That the splash screen takes visibly longer with USB connected shows the
+     * FIRMWARE does enumerate this keyboard, so the chip supports it -- the gap is
+     * in our driver, not the silicon. */
+    do_str("import ct952\n"
+           "D='0123456789ABCDEF'\n"
+           "def h(a):\n"
+           "    v=ct952.peek32(a)\n"
+           "    s=''\n"
+           "    for i in range(8):\n"
+           "        s=D[v&15]+s\n"
+           "        v>>=4\n"
+           "    return s\n"
+           "p=ct952.peek32(0xA0000154)\n"
+           "print('PORTSC=' + h(0xA0000154) + ' LS=' + str((p>>10)&3))\n"
+           "print('oREV=' + h(0xA0001000) + ' oPRT=' + h(0xA0001054))\n",
+           MP_PARSE_FILE_INPUT);
     for (;;) {
         if (pyexec_friendly_repl() != 0) break;
     }

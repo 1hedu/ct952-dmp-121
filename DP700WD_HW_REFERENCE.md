@@ -6684,3 +6684,41 @@ Final AP display recipe, superseding 10.23's position advice:
 Cause of the ~139-line limit is not established (OSD line-buffer depth at
 REG_DISP_LB_CR1/CR2 0x1A28/0x1A2C, or a DRAM-bandwidth/H_REQ budget, are the
 candidates). Recorded as an empirical limit; not needed for a working console.
+
+### 10.25 MicroPython on-screen, no keyboard, with an embedded investigative script
+
+Milestone 2. The interpreter now runs inside the live firmware and routes every
+`print()` to the frame's panel through the console retargeted to the confirmed
+geometry (pitch 292, 4bpp @0x40084000, 56 rows -> **60x7 text cells**). Verified in
+the emulator end to end: boots through the REAL AP loader, `mp_init()` +
+`ct952.init()` succeed, the console reports "OSD console 480 x 56", and the embedded
+script's six output lines render legibly on the OSD scanout.
+
+Console specifics that matter:
+- Glyphs are blitted as WHOLE BYTES: at 4bpp a glyph's x origin is always a
+  multiple of 8, hence byte-aligned, so each 8-px row is exactly 4 bytes.
+- Scroll is `memmove` by `8 * 292`, clamped inside the 24576-byte region.
+- Text is drawn on index 0 (transparent) so the panel shows through.
+- `console_setup()` programs ONLY the two window fields (OSD_SIZE height := 56
+  preserving the enable bit and width, OSD_POS := (78<<16)|102). It no longer
+  writes VCR20/21 or palette RAM -- both clobbered the loader's config on silicon.
+
+**No keyboard required.** `pyapp_main()` runs an embedded script, so the frame is
+useful standalone. Two bugs fixed getting there, both invisible in earlier work:
+1. The previous staged-script hook probed a "PYSC" header at **0x40740000**, which
+   is outside this part's 2 MB DRAM (0x40000000..0x40200000) -- an out-of-bounds
+   read that only ever "worked" because the emulator mapped it.
+2. This port builds at `MICROPY_CONFIG_ROM_LEVEL_MINIMUM`, where
+   `MICROPY_PY_BUILTINS_STR_OP_MODULO` is **0**, so `"'%08X' % v"` raises
+   TypeError. The first script version therefore printed NOTHING while still
+   reporting that it had started. Hex is now hand-rolled from a digit string.
+   Lesson: at MINIMUM ROM level, assume %-formatting, f-strings and most of the
+   stdlib are absent.
+
+The script dumps the registers that could explain the two open display puzzles
+(the 292-vs-308 pitch, and the ~139-line shear limit): H_REQ, REDUNDANT, VSCALE,
+HU/HD_SCALE, LB_CR1/CR2, VCR25 and MEM_LINE. Emulator values are mostly 0 (it does
+not model them), which is precisely why this has to be read on the frame.
+
+Also confirms the window writes take effect: the emulator run reported back
+`SZ=003802D0` (height 0x038 = 56) and `POS=004E0066` (y=78, x=102).

@@ -138,9 +138,18 @@ int pyapp_main(void) {
      * OUTSIDE this part's 2 MB DRAM (0x40000000..0x40200000) -- an out-of-bounds
      * read on real silicon that only ever worked under the emulator. */
     static const char investigate[] =
+        /* hand-rolled hex: this port builds at MICROPY_CONFIG_ROM_LEVEL_MINIMUM,
+         * where MICROPY_PY_BUILTINS_STR_OP_MODULO is 0, so "'%08X' % v" raises
+         * TypeError (it silently produced no output on the first attempt). */
         "import ct952\n"
+        "D='0123456789ABCDEF'\n"
         "def h(a):\n"
-        "    return '%08X' % ct952.peek32(a)\n"
+        "    v=ct952.peek32(a)\n"
+        "    s=''\n"
+        "    for i in range(8):\n"
+        "        s=D[v&15]+s\n"
+        "        v>>=4\n"
+        "    return s\n"
         "print('IC=' + h(0x800028C8) + ' HREQ=' + h(0x80001A08))\n"
         "print('RED=' + h(0x80001A18) + ' VSCL=' + h(0x80001A1C))\n"
         "print('HU =' + h(0x80001A20) + ' HD  =' + h(0x80001A24))\n"

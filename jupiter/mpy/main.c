@@ -150,19 +150,11 @@ int pyapp_main(void) {
         "        s=D[v&15]+s\n"
         "        v>>=4\n"
         "    return s\n"
-        /* LB_CR1 write-back check. Clearing LB_CR1's low field did NOT move the
-         * pitch (still 292), which kills the "pitch = stride - LB_CR1_low" idea --
-         * but only if the write actually STUCK. So write it and read it straight
-         * back: if it reads 00300010 again the register is write-protected or
-         * re-driven and the test was inconclusive; if it reads 00300000 the write
-         * held and LB_CR1 genuinely does not affect the pitch. Costs one line. */
-        "print('LB1 before=' + h(0x80001A28))\n"
-        "ct952.poke32(0x80001A28, 0x00300000)\n"
-        "print('LB1 after =' + h(0x80001A28))\n"
-        "ct952.poke32(0x80001A28, 0x00300010)\n"
-        "print('HREQ=' + h(0x80001A08) + ' RED=' + h(0x80001A18))\n"
-        "print('VSCL=' + h(0x80001A1C) + ' LB2=' + h(0x80001A2C))\n"
-        "print('V22 =' + h(0x80000D88) + ' V23=' + h(0x80000D8C))\n"
+        /* LB_CR1 is CLOSED: the write-back test read 00300000, so the write stuck,
+         * and the pitch stayed 292 -- LB_CR1's low field genuinely does not set the
+         * scanout pitch. Those lines are gone; the remaining registers are recorded in
+         * the hardware reference, so the console rows they used are now free for the
+         * USB enumeration diagnostics printed below. */
         "print('mpy ok')\n"
 ;
     mp_hal_stdout_tx_strn("[pyapp] embedded investigate script\n", 36);
@@ -233,6 +225,31 @@ int pyapp_main(void) {
         mp_printf(&mp_plat_print, "s=%02x d=%02x k=%02x Q=%08x\n",
                   (unsigned)(usb_kbd_dbg(0) & 0xFF), (unsigned)(usb_kbd_dbg(5) & 0xFF),
                   (unsigned)(usb_kbd_dbg(1) & 0xFF), (unsigned)usb_kbd_dbg(4));
+        /* The SETUP packet as the controller actually fetched it from DMA memory. A
+         * device ACKs any well-formed packet and then STALLs a request it cannot
+         * parse, so garbage here produces exactly the s=00 d=40 we are chasing.
+         * Expect 8006000100000800. */
+        {
+            extern uint32_t usb_kbd_setupbyte(int);
+            extern uint32_t usb_kbd_dv(int);
+            char line[24];
+            static const char hex[] = "0123456789abcdef";
+            line[0] = 'S'; line[1] = '=';
+            for (int i = 0; i < 8; i++) {
+                uint32_t b = usb_kbd_setupbyte(i);
+                line[2 + i * 2]     = hex[(b >> 4) & 0xF];
+                line[2 + i * 2 + 1] = hex[b & 0xF];
+            }
+            line[18] = '\n';
+            mp_hal_stdout_tx_strn(line, 19);
+            /* DATA-stage status per split routing (TT/port1, TT/port0, no TT) and the
+             * status stage of a zero-length SET_ADDRESS(0) probe: z=00 means the device
+             * answers a request with no data stage, so it IS in Default state and only
+             * the data phase is broken. */
+            mp_printf(&mp_plat_print, "d=%02x %02x %02x z=%02x\n",
+                      (unsigned)(usb_kbd_dv(0) & 0xFF), (unsigned)(usb_kbd_dv(1) & 0xFF),
+                      (unsigned)(usb_kbd_dv(2) & 0xFF), (unsigned)(usb_kbd_dv(3) & 0xFF));
+        }
     }
     /* Decisive values printed LAST so they survive on a 7-line scrolling console
      * (the first attempt buried them above the REPL banner).

@@ -7336,3 +7336,49 @@ Verified in the emulator: `usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64` th
 `configured, polling ep 0x81` and a live REPL, so the new timing path did not regress
 the modelled controller (and `MPS0=64` shows the descriptor-derived packet size being
 adopted rather than guessed).
+
+### 10.38 Reset timing was NOT it — and LB_CR1 is closed
+
+Two results from the same run.
+
+**LB_CR1 (closed).** The write-back test read `LB1 after = 00300000`, so the write
+*stuck*, and the pitch stayed 292. That closes the confound left open in 10.24: the low
+field of LB_CR1 genuinely does not set the scanout pitch. The 292-vs-308 discrepancy
+still has no register that accounts for it, but LB_CR1 is no longer a candidate.
+
+**USB, after a spec-legal 60ms reset + 20ms recovery + 8-byte first request:**
+```
+    s=0   d=40   k=80   q=80080d40
+```
+`TotalBytes` in the overlay is now **8** (`(0x80080d40 >> 16) & 0x7FFF`), confirming the
+short first request is the transfer being executed. Everything else is unchanged: SETUP
+ACKed, IN data stage bare-Halted (STALL), CERR still 3, status stage never run. So
+**reset timing was not the cause** — it was a genuine spec violation worth fixing, but
+it is not what the keyboard is objecting to.
+
+What that leaves, and how the next build discriminates it without more guessing:
+
+1. **The SETUP payload might not be what we think.** A device ACKs any packet with a
+   good CRC and STALLs a request it cannot parse, so garbage in the 8 SETUP bytes
+   produces exactly `s=00 d=40`. The qTDs demonstrably reach the controller (the
+   `TotalBytes=8` we programmed comes back in the overlay), but that does not prove the
+   *buffer* does. The AP now reads the 8 bytes back out of DMA memory and prints them:
+   `S=8006000100000800` is correct, anything else is the answer.
+2. **The embedded TT may be the wrong path.** The firmware writing `TTCTRL.TTHA` does
+   not prove a QH must carry that hub address. This core can drive a directly attached
+   low-speed device natively *or* through the embedded TT with split transactions, and
+   if we issue splits into a port that is not behind a TT, **the TT itself can answer
+   STALL** — indistinguishable from a device STALL in the qTD status. So the driver now
+   tries three routings in turn and records the DATA-stage status of each:
+   `d=<TT,port1> <TT,port0> <no TT>`. Whichever returns a descriptor is the right one.
+3. **Does the device reject everything, or only the data phase?** A zero-length
+   `SET_ADDRESS(0)` — a request the device already satisfies, with no data stage at all
+   — is issued as a last probe, and its status-stage token printed as `z=`. `z=00` means
+   the device is in Default state and answering us, so the fault is specific to the data
+   phase (toggle, packet size, or split completion). `z=40` means it rejects us
+   outright, i.e. it is still not in Default state and the reset is not taking.
+
+Emulator check: the modelled controller enumerates on the first routing (it reports a
+high-speed device, which needs no TT fields), and the failure path prints
+`s=00 d=00 k=00 Q=00000000 / S=0000000000000000 / d=00 00 00 z=00` with no keyboard
+attached, so the new diagnostics are safe on both paths.

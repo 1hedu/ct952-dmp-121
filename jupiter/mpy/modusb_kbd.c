@@ -99,6 +99,12 @@ static int g_failstep = 0;
  *             bit2 MissedUframe, bit1 SplitXstate, bits11:10 CERR
  *   USBSTS bit12 HCHalted, bit4 HostSysErr, bit3 FrameRollover, bit1 ErrInt */
 static uint32_t g_dbg_setup, g_dbg_data, g_dbg_status, g_dbg_usbsts, g_dbg_frindex, g_dbg_qh3;
+/* SETUP bytes read back out of DMA memory after a failed transfer, and the DATA-stage
+ * status recorded for each split-routing variant tried. */
+static uint8_t  g_dbg_sbytes[8];
+static uint32_t g_dbg_dv[4];   /* [0..2] per routing, [3] the zero-length probe */
+uint32_t usb_kbd_dv(int i)       { return g_dbg_dv[i & 3]; }
+uint32_t usb_kbd_setupbyte(int i){ return g_dbg_sbytes[i & 7]; }
 uint32_t usb_kbd_dbg(int which)
 {
     switch (which) {
@@ -124,6 +130,18 @@ int usb_kbd_lastxfer(void);
 #define QH_HUBADDR(a)    (((uint32_t)(a) & 0x7Fu) << 16)
 #define QH_PORTNUM(p)    (((uint32_t)(p) & 0x7Fu) << 23)
 #define TT_HUB_ADDR      0x7Fu          /* matches TTCTRL.TTHA set by the firmware */
+/* Which split-transaction routing to use for a low-speed device on the ROOT port. The
+ * firmware setting TTCTRL.TTHA does not prove that a QH must carry that hub address:
+ * this core can drive a directly attached low/full-speed device either through its
+ * embedded TT (split transactions) or natively at that speed. The choice is not
+ * cosmetic -- if we issue splits when the port is not behind a TT, the TT itself can
+ * answer STALL, which in the qTD status is indistinguishable from the device
+ * stalling. Hardware reported exactly a bare Halted (STALL) with a spec-legal 60ms
+ * reset, so try each routing and report which one the device answers. */
+#define TT_MODE_PORT1    0
+#define TT_MODE_PORT0    1
+#define TT_MODE_NONE     2
+static int g_tt_mode = TT_MODE_PORT1;
 #define QH_SMASK_C       0x00000001u    /* start-split in uframe 0 (periodic)       */
 #define QH_CMASK_C       0x00001C00u    /* complete-split in uframes 2..4 (periodic)*/
 
@@ -185,6 +203,19 @@ static inline uint32_t pa(volatile void *p)
     return ((uint32_t)(uintptr_t)p & 0x0FFFFFFFu) | 0x40000000u;
 }
 
+/* QH word 2 (endpoint capabilities). A high-speed device needs no TT fields at all;
+ * a low-speed one needs them only if we are routing through the embedded TT. `periodic`
+ * adds the split start/complete masks, which apply to interrupt endpoints only. */
+static uint32_t qh_word2(int periodic)
+{
+    if (!g_isls || g_tt_mode == TT_MODE_NONE) {
+        return QH_MULT1;
+    }
+    uint32_t w = QH_MULT1 | QH_HUBADDR(TT_HUB_ADDR) |
+                 QH_PORTNUM(g_tt_mode == TT_MODE_PORT0 ? 0u : 1u);
+    return periodic ? (w | QH_SMASK_C | QH_CMASK_C) : w;
+}
+
 /* Spin until a qTD's Active bit clears, or a bounded budget elapses. Returns 1
  * if it retired, 0 on timeout (a NAK leaves the qTD Active). The controller
  * services the async ring on a background cadence, so we just poll memory. */
@@ -244,7 +275,7 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
      * low/full-speed control endpoint on this core */
     g_qh[1] = (uint32_t)g_dev_addr | g_eps | QH_DTC | QH_H | QH_MPS(g_mps0)
               | (g_isls ? QH_C : 0u);
-    g_qh[2] = QH_MULT1 | (g_isls ? (QH_HUBADDR(TT_HUB_ADDR) | QH_PORTNUM(1)) : 0u);
+    g_qh[2] = qh_word2(0);
     g_qh[3] = 0;                            /* current qTD                    */
     g_qh[4] = pa(ts);                       /* overlay: next qTD -> SETUP     */
     g_qh[5] = QTD_T;                        /* overlay: alt next              */
@@ -281,8 +312,7 @@ static int int_in_poll(uint8_t *out, int budget) {
     g_qh[0] = pa(g_qh) | (1u << 1);
     g_qh[1] = (uint32_t)g_dev_addr | (1u << 8) /* ep 1 */ |
               g_eps | QH_DTC | QH_H | QH_MPS(8);
-    g_qh[2] = QH_MULT1 | (g_isls ? (QH_HUBADDR(TT_HUB_ADDR) | QH_PORTNUM(1) |
-                                    QH_SMASK_C | QH_CMASK_C) : 0u);
+    g_qh[2] = qh_word2(1);
     g_qh[3] = 0;
     g_qh[4] = pa(td);
     g_qh[5] = QTD_T;
@@ -443,20 +473,47 @@ int usb_kbd_bringup(void) {
      * also allowed to fail, so retry a few times before giving up. */
     g_mps0 = 8;
     int got = 0;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        got = ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 8);
+    /* Try each split-transaction routing in turn. The qTD status cannot distinguish a
+     * STALL from the device from a STALL synthesised by a misused embedded TT, so let
+     * the device settle it: whichever routing produces a descriptor is the right one,
+     * and the DATA-stage status of each is recorded for the on-screen summary. */
+    for (g_tt_mode = TT_MODE_PORT1; g_tt_mode <= TT_MODE_NONE; g_tt_mode++) {
+        for (int attempt = 0; attempt < 2 && got < 8; attempt++) {
+            got = ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 8);
+            if (got >= 8) {
+                break;
+            }
+            g_dbg_setup   = g_td_p[0][2];      /* SETUP qTD token   */
+            g_dbg_data    = g_td_p[1][2];      /* DATA  qTD token   */
+            g_dbg_status  = g_td_p[2][2];      /* STATUS qTD token  */
+            g_dbg_usbsts  = EHCI_USBSTS;
+            g_dbg_frindex = OPREG(0x0C);       /* FRINDEX: is the controller running? */
+            g_dbg_qh3     = g_qh[6];           /* QH overlay token   */
+            /* What the controller actually fetched as the SETUP packet, read back out
+             * of DMA memory. A device ACKs any SETUP with a good CRC and then STALLs an
+             * unparseable request, so garbage here would look exactly like the observed
+             * s=00 d=40. Expect 80 06 00 01 00 00 08 00. */
+            for (int b = 0; b < 8; b++) {
+                g_dbg_sbytes[b] = g_setup[b];
+            }
+            hc_delay_ms(10);
+        }
+        g_dbg_dv[g_tt_mode] = g_td_p[1][2];
         if (got >= 8) {
             break;
         }
-        g_dbg_setup   = g_td_p[0][2];      /* SETUP qTD token   */
-        g_dbg_data    = g_td_p[1][2];      /* DATA  qTD token   */
-        g_dbg_status  = g_td_p[2][2];      /* STATUS qTD token  */
-        g_dbg_usbsts  = EHCI_USBSTS;
-        g_dbg_frindex = OPREG(0x0C);       /* FRINDEX: is the controller running? */
-        g_dbg_qh3     = g_qh[6];           /* QH overlay token   */
-        hc_delay_ms(10);
     }
     if (got < 8) {
+        /* Last discriminator before giving up: does the device reject EVERYTHING, or
+         * only our IN data stage? SET_ADDRESS(0) is a request the device already
+         * satisfies and it has no data stage at all, so a clean status stage here says
+         * the device is in Default state and answering us, and that the failure is
+         * specific to the data phase (toggle / packet size / split completion). A
+         * halted status stage says the device rejects us outright, i.e. it is not in
+         * Default state and the reset still is not taking. */
+        g_tt_mode = TT_MODE_PORT1;
+        ctrl_xfer(0x00, REQ_SET_ADDRESS, 0, 0, 0);
+        g_dbg_dv[3] = g_td_p[2][2];
         g_failstep = 3; return 0;
     }
     /* Adopt the device's real endpoint-0 packet size for every later transfer. */

@@ -172,7 +172,16 @@ int pyapp_main(void) {
          * USB_HCExit() + power-down, once the clocks are restored. */
         "print('CAP=' + h(0xA0000100) + ' CMD=' + h(0xA0000110))\n"
         "print('STS=' + h(0xA0000114) + ' CFG=' + h(0xA0000150))\n"
-        "print('PORT=' + h(0xA0000154) + ' CLK=' + h(0x80000300))\n";
+        "print('PORT=' + h(0xA0000154) + ' CLK=' + h(0x80000300))\n"
+        /* Probe for an OHCI COMPANION controller. A USB keyboard is a LOW-SPEED
+         * device and EHCI alone cannot address one -- it needs a companion
+         * (OHCI/UHCI) or a high-speed hub's transaction translator. The no-crutch
+         * boot inventory showed the firmware touching 0xa0001000/10a4/112c, which
+         * is consistent with an OHCI block there: OHCI HcRevision (base+0x00) reads
+         * 0x00000010, HcControl is +0x04, HcRhDescriptorA +0x48, PortStatus1 +0x54.
+         * If REV reads ...10 then the keyboard route is OHCI, not EHCI. */
+        "print('oREV=' + h(0xA0001000) + ' oCTL=' + h(0xA0001004))\n"
+        "print('oRHD=' + h(0xA0001048) + ' oPRT=' + h(0xA0001054))\n";
     mp_hal_stdout_tx_strn("[pyapp] embedded investigate script\n", 36);
     do_str(investigate, MP_PARSE_FILE_INPUT);
 
@@ -201,7 +210,7 @@ int pyapp_main(void) {
     int kbd_ok = 0;
     {
         int tries;
-        for (tries = 0; tries < 8 && !kbd_ok; tries++) {
+        for (tries = 0; tries < 2 && !kbd_ok; tries++) {
             kbd_ok = usb_kbd_bringup();
             if (!kbd_ok) for (volatile int i = 0; i < 600000; i++) { }
         }

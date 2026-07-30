@@ -6923,3 +6923,35 @@ machine_call). Every one of them looked like a hardware or firmware mystery. The
 standing rule is now: before theorising about silicon, check whether the emulator is
 even modelling the thing under test -- and prefer reading state off the device to
 reasoning about it.
+
+### 10.30 Keyboard fails on real hardware: almost certainly a LOW-SPEED device on an EHCI-only driver
+
+On the frame the keyboard (Gearhead KB1500U, 89-key mini) is not detected, even
+though the emulator now enumerates its modelled keyboard on the same --apload path.
+
+**Leading explanation, and the emulator could never have caught it: USB keyboards are
+LOW-SPEED (1.5 Mbps) devices, and our driver is EHCI-only.** EHCI addresses
+high-speed (480 Mbps) devices only. A low- or full-speed device requires either
+  (a) a companion host controller (OHCI or UHCI) sharing the same port, or
+  (b) a high-speed HUB, whose transaction translator does the split transactions.
+The emulator's HID model does not represent device SPEED at all -- it answers EHCI
+transfers directly -- so an EHCI-only driver "works" there and cannot work on
+silicon. This is a fidelity gap that predicts real failure, unlike the previous four
+harness artifacts.
+
+Two consequences worth testing in one flash, both now instrumented:
+1. **PORTSC line status (bits 11:10)** after the port reset. `LS=1` (01b) means a
+   LOW-SPEED device is attached -- confirmation. The AP now prints
+   `usb1 PORTSC=`, `usb2 PORTSC=... LS=n`, and a specific `usb FAIL:` line naming the
+   step that failed (no CCS / port not enabled / GET_DESCRIPTOR), instead of failing
+   silently.
+2. **Is there an OHCI companion?** The no-crutch boot inventory showed the firmware
+   touching 0xa0001000, 0xa00010a4 and 0xa000112c, which fits an OHCI register block
+   at 0xA0001000 (HcRevision +0x00 reads 0x00000010, HcControl +0x04,
+   HcRhDescriptorA +0x48, HcRhPortStatus1 +0x54). The AP prints those four. If
+   HcRevision reads ...10, the keyboard route is **OHCI, not EHCI**, and the driver
+   needs an OHCI front end -- a real but well-understood piece of work.
+
+Cheap workaround if OHCI is absent: plug the keyboard in through a **USB 2.0 hub**.
+The hub enumerates at high speed and its transaction translator lets the existing
+EHCI driver reach the low-speed keyboard behind it.

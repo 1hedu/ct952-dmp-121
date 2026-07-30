@@ -230,8 +230,16 @@ int usb_kbd_bringup(void) {
     EHCI_CONFIGFLAG = 1;                 /* route ports to EHCI */
     EHCI_USBCMD = USBCMD_RS;
 
+    /* Staged diagnostics. On hardware this failed silently, so report WHICH step
+     * fails and the PORTSC value, rather than inferring it. PORTSC line status
+     * (bits 11:10) is the decisive field for a keyboard: 01 = LOW-SPEED device.
+     * EHCI alone cannot talk to a low- or full-speed device -- it needs either a
+     * companion (OHCI/UHCI) or a high-speed hub's transaction translator -- and
+     * virtually every USB keyboard, including a Gearhead KB1500U, is low-speed. */
+    mp_printf(&mp_plat_print, "usb1 PORTSC=%08x\n", (unsigned)EHCI_PORTSC0);
     if (!(EHCI_PORTSC0 & PORTSC_CCS)) {
-        return 0;                        /* nothing plugged in */
+        mp_printf(&mp_plat_print, "usb FAIL: no CCS (nothing connected)\n");
+        return 0;
     }
     /* Clear the connect-change latch, then reset the port. */
     EHCI_PORTSC0 = (EHCI_PORTSC0 & ~PORTSC_PED) | PORTSC_CSC;
@@ -239,12 +247,17 @@ int usb_kbd_bringup(void) {
     for (volatile int i = 0; i < 20000; i++) { }
     EHCI_PORTSC0 = EHCI_PORTSC0 & ~PORTSC_PR;   /* de-assert -> HS enable */
     for (volatile int i = 0; i < 20000; i++) { }
+    mp_printf(&mp_plat_print, "usb2 PORTSC=%08x LS=%d\n", (unsigned)EHCI_PORTSC0,
+              (int)((EHCI_PORTSC0 >> 10) & 3));
     if (!(EHCI_PORTSC0 & PORTSC_PED)) {
-        return 0;                        /* port did not enable */
+        mp_printf(&mp_plat_print, "usb FAIL: port not enabled after reset\n");
+        return 0;
     }
 
     /* Enumerate at address 0: read the 18-byte device descriptor. */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 18) < 18) {
+        mp_printf(&mp_plat_print, "usb FAIL: GET_DESCRIPTOR (PORTSC=%08x)\n",
+                  (unsigned)EHCI_PORTSC0);
         return 0;
     }
     mp_printf(&mp_plat_print,

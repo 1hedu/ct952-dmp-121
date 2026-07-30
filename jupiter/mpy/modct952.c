@@ -26,7 +26,13 @@
 #define REG_OSD_SIZE  (*(volatile uint32_t *)0x80001A54u)
 #define DISP_OSD_EN   0x10000000u
 #define OSD_W         480                   /* panel's visible width in pixels   */
-#define OSD_H         82                    /* 24024/292 lines                    */
+/* Usable rows = the OSD window height we program. Two measured hardware limits
+ * force 56 (see HW reference 10.24): the window is painted twice 157 panel lines
+ * apart, so hiding the duplicate needs y >= 77; and the OSD only renders correctly
+ * above panel line ~139, so y + height - 1 must stay below it. y=78/height=56
+ * satisfies both. 56/8 = 7 text rows of 60 columns. */
+#define OSD_H         56
+#define OSD_WIN_Y     78                    /* window y: duplicate falls off-screen */
 
 /* I/O register access (peripheral space at 0x80000000). */
 #define IOREG(off)    (*(volatile uint32_t *)(0x80000000u + (off)))
@@ -358,6 +364,17 @@ static void console_setup(void) {
     g_osd_w = OSD_W; g_osd_h = OSD_H;              /* 480 x 82, pitch 292 */
     g_cols  = g_osd_w / 8; g_rows = g_osd_h / 8;   /* 60 cols x 10 rows   */
     g_osd_fb = OSD_FB;                             /* 0x40084000          */
+
+    /* The ONLY display registers worth writing, both narrow and reversible
+     * (loader values: OSD_POS 0x001C0066, OSD_SIZE 0x104E0268): shrink the window
+     * to OSD_H lines (preserving the enable bit and width) and move it to
+     * OSD_WIN_Y so its duplicate falls past the panel's last line. Verified on
+     * hardware: single copy, no shear, all rows clean. */
+    {
+        uint32_t sz = REG_OSD_SIZE;
+        REG_OSD_SIZE = (sz & ~0x0FFF0000u) | ((uint32_t)OSD_H << 16);
+        REG_OSD_POS  = ((uint32_t)OSD_WIN_Y << 16) | 102u;
+    }
 
     con_bg = 0x00;                                 /* transparent: panel shows through */
     con_fg = 0x02;                                 /* white in the loader's palette    */

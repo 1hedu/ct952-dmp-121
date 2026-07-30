@@ -125,27 +125,30 @@ int pyapp_main(void) {
            "print('OSD console', ct952.WIDTH, 'x', ct952.HEIGHT, '  >>>')\n",
            MP_PARSE_FILE_INPUT);
 
-    // An experiment script staged by the emulator (CT952_PYAPP_SCRIPT) at
-    // 0x40740000 with a "PYSC" header runs non-interactively -- used by the
-    // concurrent PROC2 debugger, where there is no keyboard.
-    volatile uint32_t *shdr = (volatile uint32_t *)0x40740000u;
-    if (shdr[0] == 0x50595343u) {   /* "PYSC" */
-        mp_hal_stdout_tx_strn("[pyapp] running staged script\n", 30);
-        do_str((const char *)0x40740008u, MP_PARSE_FILE_INPUT);
-        mp_hal_stdout_tx_strn("[pyapp] script done\n", 20);
-    } else {
-        if (usb_kbd_bringup()) {
-            mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
-        } else {
-            mp_hal_stdout_tx_strn("[pyapp] REPL on UART1 RX\n", 25);
-        }
-        mp_hal_stdout_tx_strn("[pyapp] the firmware is live: ct952.peek32/poke32/call\n", 55);
-        for (;;) {
-            if (pyexec_friendly_repl() != 0) {
-                break;
-            }
-        }
-    }
+    /* Default embedded script -- runs with NO keyboard, so the frame is useful
+     * standalone. It is INVESTIGATIVE: it prints the display registers that could
+     * account for the two things still unexplained about this display (HW
+     * reference 10.22/10.24): the scanout pitch being 292 while VCR22/VCR23 both
+     * say 308, and the OSD's absolute vertical limit at panel line ~139. Dumped:
+     * H_REQ (DRAM accesses per line), REDUNDANT (extra first access), the V/H
+     * scaling registers, LB_CR1/CR2 (OSD line-buffer control -- leading suspect
+     * for the ~139 limit), VCR25 (OSD upscaling) and MEM_LINE.
+     *
+     * NOTE: the hook removed here probed a "PYSC" header at 0x40740000, which is
+     * OUTSIDE this part's 2 MB DRAM (0x40000000..0x40200000) -- an out-of-bounds
+     * read on real silicon that only ever worked under the emulator. */
+    static const char investigate[] =
+        "import ct952\n"
+        "def h(a):\n"
+        "    return '%08X' % ct952.peek32(a)\n"
+        "print('IC=' + h(0x800028C8) + ' HREQ=' + h(0x80001A08))\n"
+        "print('RED=' + h(0x80001A18) + ' VSCL=' + h(0x80001A1C))\n"
+        "print('HU =' + h(0x80001A20) + ' HD  =' + h(0x80001A24))\n"
+        "print('LB1=' + h(0x80001A28) + ' LB2 =' + h(0x80001A2C))\n"
+        "print('V25=' + h(0x80000D94) + ' MEML=' + h(0x80001A68))\n"
+        "print('SZ =' + h(0x80001A54) + ' POS =' + h(0x80001A50))\n";
+    mp_hal_stdout_tx_strn("[pyapp] embedded investigate script\n", 36);
+    do_str(investigate, MP_PARSE_FILE_INPUT);
     #endif
 
     mp_deinit();

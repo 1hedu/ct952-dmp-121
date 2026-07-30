@@ -212,7 +212,9 @@ int pyapp_main(void) {
     extern uint32_t usb_kbd_dbg(int);
     {
         int tries;
-        for (tries = 0; tries < 1 && !kbd_ok; tries++) {
+        /* A full retry re-resets the root port, which is worth doing twice before
+         * declaring failure; the descriptor read itself already retries internally. */
+        for (tries = 0; tries < 2 && !kbd_ok; tries++) {
             kbd_ok = usb_kbd_bringup();
             if (!kbd_ok) for (volatile int i = 0; i < 600000; i++) { }
         }

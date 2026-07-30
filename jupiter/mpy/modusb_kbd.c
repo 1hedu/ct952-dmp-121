@@ -83,6 +83,10 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
  * speed the device does not run at. */
 static uint32_t g_eps = QH_EPS_HS;
 static uint32_t g_isls = 0;
+/* Endpoint-0 max packet size. Starts at the smallest legal value (8, which every
+ * speed supports) and is replaced by bMaxPacketSize0 from the device descriptor once
+ * we have read it -- rather than guessed from the port speed. */
+static uint32_t g_mps0 = 8;
 /* Which bringup step failed, kept for the final on-screen summary: the per-attempt
  * lines scroll off a 7-row console, so the reason has to persist.
  * 1 idle line  2 port not enabled  3 GET_DESCRIPTOR  4 SET_ADDRESS
@@ -238,7 +242,7 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
     g_qh[0] = pa(g_qh) | (1u << 1);        /* horizontal link, Typ=QH(01)   */
     /* control endpoint: speed from the port, and the C bit is required for a
      * low/full-speed control endpoint on this core */
-    g_qh[1] = (uint32_t)g_dev_addr | g_eps | QH_DTC | QH_H | QH_MPS(g_isls ? 8 : 64)
+    g_qh[1] = (uint32_t)g_dev_addr | g_eps | QH_DTC | QH_H | QH_MPS(g_mps0)
               | (g_isls ? QH_C : 0u);
     g_qh[2] = QH_MULT1 | (g_isls ? (QH_HUBADDR(TT_HUB_ADDR) | QH_PORTNUM(1)) : 0u);
     g_qh[3] = 0;                            /* current qTD                    */
@@ -326,6 +330,25 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
     }
 }
 
+/* Real-time delay, in milliseconds. The CPU clock is unknown, so spin-count delays
+ * are guesswork; FRINDEX is a hardware timebase that ticks once per 125us microframe
+ * (8 ticks per 1ms frame) whenever the controller is running, so derive the delay
+ * from it. If FRINDEX is not advancing -- the controller is halted, or it counts
+ * whole frames on this core -- the iteration guard still bounds the wait. The guard
+ * is sized from measured hardware behaviour: ~2.7M spin iterations elapsed while
+ * FRINDEX advanced 3352 counts, i.e. roughly 6.5 iterations per microsecond. */
+static void hc_delay_ms(int ms)
+{
+    uint32_t f0 = OPREG(0x0C) & 0x3FFFu;
+    long guard = (long)ms * 20000L;          /* ~3x the expected time, as a backstop */
+    for (long i = 0; i < guard; i++) {
+        uint32_t d = (OPREG(0x0C) - f0) & 0x3FFFu;
+        if ((int)(d >> 3) >= ms) {
+            return;
+        }
+    }
+}
+
 /* Reset the controller + root-hub port, enumerate and configure the keyboard.
  * Returns 1 on success, 0 if no device / enumeration failed. Plain C so both
  * the Python module and the C REPL stdin path can call it. */
@@ -389,26 +412,59 @@ int usb_kbd_bringup(void) {
         mp_printf(&mp_plat_print, "usb: no CCS but LS=%d, continuing\n",
                   (int)((EHCI_PORTSC0 >> 10) & 3u));
     }
-    /* Clear the connect-change latch, then reset the port. */
+    /* Clear the connect-change latch, then reset the port.
+     *
+     * TIMING IS NORMATIVE HERE. USB 2.0 requires the reset (SE0) to be driven for at
+     * least 10ms, and EHCI tells root-hub software to hold it ~50ms; the device then
+     * needs up to 10ms of recovery (TRSTRCY) before it will answer a SETUP. The
+     * previous code held PR for 20000 spin iterations -- about 3ms by the measured
+     * ~6.5 iterations/us -- and gave 3ms of recovery. A short reset leaves the device
+     * in an indeterminate state rather than the Default state, which is consistent
+     * with what the hardware reported: the SETUP packet is ACKed (s=00) but the
+     * device STALLs the data stage (d=40) instead of returning its descriptor. */
     EHCI_PORTSC0 = (EHCI_PORTSC0 & ~PORTSC_PED) | PORTSC_CSC;
     EHCI_PORTSC0 = EHCI_PORTSC0 | PORTSC_PR;
-    for (volatile int i = 0; i < 20000; i++) { }
-    EHCI_PORTSC0 = EHCI_PORTSC0 & ~PORTSC_PR;   /* de-assert -> HS enable */
-    for (volatile int i = 0; i < 20000; i++) { }
+    hc_delay_ms(60);
+    EHCI_PORTSC0 = EHCI_PORTSC0 & ~PORTSC_PR;   /* de-assert -> port enable */
+    /* The controller finishes the reset itself and clears PR when done. */
+    for (int i = 0; i < 40 && (EHCI_PORTSC0 & PORTSC_PR); i++) {
+        hc_delay_ms(1);
+    }
+    hc_delay_ms(20);                            /* TRSTRCY recovery */
 
     if (!(EHCI_PORTSC0 & PORTSC_PED)) {
         mp_printf(&mp_plat_print, "usb FAIL: port not enabled after reset\n");
         g_failstep = 2; return 0;
     }
 
-    /* Enumerate at address 0: read the 18-byte device descriptor. */
-    if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 18) < 18) {
+    /* Enumerate at address 0. Ask for only the first 8 bytes first: that is one
+     * max-packet at any speed, needs no assumption about bMaxPacketSize0, and is what
+     * every real host stack does. The first control transfer after a port reset is
+     * also allowed to fail, so retry a few times before giving up. */
+    g_mps0 = 8;
+    int got = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        got = ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 8);
+        if (got >= 8) {
+            break;
+        }
         g_dbg_setup   = g_td_p[0][2];      /* SETUP qTD token   */
         g_dbg_data    = g_td_p[1][2];      /* DATA  qTD token   */
         g_dbg_status  = g_td_p[2][2];      /* STATUS qTD token  */
         g_dbg_usbsts  = EHCI_USBSTS;
         g_dbg_frindex = OPREG(0x0C);       /* FRINDEX: is the controller running? */
         g_dbg_qh3     = g_qh[6];           /* QH overlay token   */
+        hc_delay_ms(10);
+    }
+    if (got < 8) {
+        g_failstep = 3; return 0;
+    }
+    /* Adopt the device's real endpoint-0 packet size for every later transfer. */
+    if (g_data[7] == 8 || g_data[7] == 16 || g_data[7] == 32 || g_data[7] == 64) {
+        g_mps0 = g_data[7];
+    }
+    /* Now the full 18-byte descriptor. */
+    if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 18) < 18) {
         g_failstep = 3; return 0;
     }
     mp_printf(&mp_plat_print,
@@ -421,6 +477,7 @@ int usb_kbd_bringup(void) {
         g_failstep = 4; return 0;
     }
     g_dev_addr = 1;
+    hc_delay_ms(5);   /* TSETADDR: the device needs 2ms before it answers on addr 1 */
 
     /* Read the configuration descriptor set (config+iface+HID+endpoint). */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_CONFIG << 8), 0, 34) < 9) {

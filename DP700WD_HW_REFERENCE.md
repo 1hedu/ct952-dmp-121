@@ -7279,3 +7279,60 @@ Ruled out already: the SETUP packet byte order. USB fields are little-endian and
 packet is assembled byte-by-byte (`g_setup[2] = wValue & 0xFF; g_setup[3] = wValue >> 8`
 ...), which is endian-correct on this big-endian SPARC -- a plausible suspect worth
 checking on a BE host, but not the cause here.
+
+### 10.37 Reset timing was the defect: the device was never put in Default state
+
+The per-stage line came back from the frame as:
+```
+    s=00   d=40   k=80   Q=80120d40
+```
+| field | value | decode |
+|---|---|---|
+| SETUP qTD status | `0x00` | retired, not halted, no error -- the SETUP packet was **ACKed** |
+| DATA qTD status | `0x40` | **Halted, nothing else** -> STALL on the IN data stage |
+| STATUS qTD status | `0x80` | still **Active** -- never ran, the queue was halted before it |
+
+So the transfer dies exactly at the data stage. One correction to the 10.36
+discriminator table: a clean SETUP stage does **not** mean the device accepted the
+request. A device ACKs every SETUP packet at the packet level and expresses rejection
+as a STALL on the *following* stage. `s=00 d=40` is therefore the ordinary way a
+device says "I will not answer that request in my current state" -- request contents
+and device state are both still live suspects, not excluded.
+
+`wValue` is correct (`DESC_DEVICE << 8` = 0x0100, type in the high byte -- the classic
+bug, and not present). What *is* wrong is **timing**, and it is normative:
+
+| requirement | spec | what the code did |
+|---|---|---|
+| port reset (SE0) asserted | >=10ms (USB 2.0), ~50ms for a root hub (EHCI) | 20000 spin iterations ~= **3ms** |
+| TRSTRCY recovery before first SETUP | up to 10ms | 20000 iterations ~= **3ms** |
+| TSETADDR after SET_ADDRESS | 2ms | none |
+
+A reset that short does not drive the device's state machine into **Default state**,
+so the first control request arrives while the device is still in an indeterminate
+state -- which is precisely a STALL, not a signalling error. That matches every bit of
+the observed evidence, including CERR staying at 3.
+
+The spin-count delays were guesswork anyway, because the CPU clock is unknown. There
+is a hardware timebase available: **FRINDEX ticks once per 125us microframe** (8 ticks
+per 1ms frame) whenever the controller runs, so `hc_delay_ms()` now waits on FRINDEX
+and keeps an iteration cap only as a backstop against a stuck counter. The cap is
+sized from measured behaviour: ~2.7M spin iterations elapsed while FRINDEX advanced
+3352 counts on hardware, i.e. roughly **6.5 spin iterations per microsecond** -- which
+is also how the 3ms figures above were derived.
+
+Three further corrections shipped with it, all of them what a real host stack does:
+
+1. **Ask for 8 bytes first.** The first GET_DESCRIPTOR requests only 8 bytes -- one
+   max packet at any speed -- so no assumption about `bMaxPacketSize0` is needed to
+   read it. `MPS0` is then taken from `g_data[7]` (validated as 8/16/32/64) and used
+   for every later transfer, replacing the `g_isls ? 8 : 64` guess.
+2. **Retry the first transfer.** The first control transfer after a port reset is
+   allowed to fail; three attempts, 10ms apart, before declaring FAILSTEP=3. The whole
+   bring-up (including a fresh port reset) is now attempted twice.
+3. **TSETADDR.** 5ms after SET_ADDRESS before addressing the device as 1.
+
+Verified in the emulator: `usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64` then
+`configured, polling ep 0x81` and a live REPL, so the new timing path did not regress
+the modelled controller (and `MPS0=64` shows the descriptor-derived packet size being
+adopted rather than guessed).

@@ -7653,3 +7653,50 @@ The registers are now **read and reported only**, as `K=` (CLK_FREQ_CONTROL1) an
 `A=` / `B=` (full SETUP and DATA tokens, with `TotalBytes` in bits 30:16) are unchanged and
 still the decisive reading — that is the number that says whether the eight SETUP bytes ever
 left the controller.
+
+### 10.44 Decisive: SETUP transmits and is ACKed; only the IN data stage fails
+
+Full transfer-descriptor tokens off the frame:
+
+```
+    A = 80000e00   (SETUP qTD)      B = 80080d40   (DATA qTD)
+```
+
+Decoding `TotalBytes` (bits 30:16) and the status byte (bits 7:0):
+
+| token | DT | TotalBytes | PID | CERR | status | meaning |
+|---|---|---|---|---|---|---|
+| A `80000e00` | 1 | **0** | SETUP | 3 | `00` | all 8 SETUP bytes transmitted, retired clean |
+| B `80080d40` | 1 | **8** | IN | 3 | `40` | 0 of 8 bytes received, bare Halted |
+
+This closes several open questions at once:
+
+* **The SETUP fully transmitted** (`TotalBytes` went 8 -> 0) and retired with a clean
+  status. A device only ACKs a SETUP packet it received with a good CRC, so the keyboard
+  **received our GET_DESCRIPTOR** and acknowledged it.
+* Therefore the **transmit path works and the PHY has a clock.** 10.42's worry that
+  nothing was being transmitted is disproven, which also means the CLK_FREQ_CONTROL1 /
+  UPLL writes were never needed — reverting them (10.43) was right on both counts.
+* The **IN data stage halts with 0 bytes and CERR intact** — the STALL signature — and a
+  device in Default state must *never* STALL `GET_DESCRIPTOR(DEVICE)`. Combined with the
+  fact that every SETUP/OUT succeeds and every IN halts (10.40), the most likely cause is
+  not the device refusing us but the **complete-split** — the second half of a split
+  transaction, which is what pulls IN data back through the embedded TT — failing.
+
+**The emulator cannot arbitrate this.** It models a high-speed device with no transaction
+translator and no split timing, and it enumerates our exact QH/qTD structures without
+complaint — which proves the structures are valid EHCI but says nothing about the embedded
+TT's complete-split behaviour on real silicon. Every split-related change from here is
+un-validatable in the emulator, so blind flash cycles are low-value.
+
+That leaves two materially different ways forward, recorded here as the decision point:
+
+1. **Keep fixing the bare-metal driver** — reverse-engineer how the stock EHCI driver
+   builds a low-speed control endpoint's QH (hub address, port, and whether it uses splits
+   at all for a root-port device), match it, flash. Faithful and self-contained, but each
+   iteration is a flash cycle the emulator can't pre-check.
+2. **Call the firmware's own USB stack** — the frame demonstrably enumerates this keyboard
+   during boot, and `usb/Host_Device/usbwrap.h` exposes `USB_HCInit`, `USB_CheckConnect`,
+   `USB_FindDevice`. Invoke those from the AP via the already-proven `ct952.call`, letting
+   the working driver do the enumeration. Fastest way to learn whether the defect is purely
+   in our split handling; the wrapper is mass-storage-oriented, so HID reach is unproven.

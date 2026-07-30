@@ -7847,3 +7847,25 @@ emulator-validated; the frame is the test.
 If it enumerates, this was the whole thing all along -- and the earlier register work (QH,
 SDIS, reset pulse) was all real hygiene that a corrupted request masked. If it still stalls,
 the SoC swaps structures but not data buffers, and the swap comes back out.
+
+### 10.49 CONFIRMED ON HARDWARE: keyboard enumerates, keys reach the REPL
+
+10.48 was correct. With the data buffers byte-swapped to cancel the SoC's hardware DMA
+word-swap, the keyboard enumerates and typed characters appear at the on-screen `>>>`
+prompt on the real frame. **Milestone 3 (USB keyboard -> live REPL) is done on hardware**,
+completing the banner -> MicroPython -> keyboard sequence end to end.
+
+The DMA endianness was the root cause the whole time. Everything upstream of it was real
+and necessary -- the ChipIdea register map (op base +0x40), host mode + SDIS, the port
+power/reset timing, the firmware-matched queue head (HubAddr 0, CMASK 0x08, RL 8), the USB
+reset pulse, the D-cache bypass alias -- but a byte-swapped SETUP request meant the device
+could never parse a request, so none of it could show a result until the swap was fixed.
+The lesson is the one this log keeps relearning: when the emulator and hardware disagree,
+the discrepancy IS the clue. The functional emulator modelled no DMA swap, so it enumerated
+throughout while hardware never could; chasing that gap directly would have found this many
+rounds sooner.
+
+**Emulator faithfulness debt:** the emulator now DIVERGES from hardware -- with the swap
+compensation in the driver, the emulator (no modelled swap) fails to enumerate. To restore
+it as a validation tool, ct952emu's EHCI DMA must byte-swap 32-bit words the way the silicon
+does. Until then, the USB path is hardware-validated only.

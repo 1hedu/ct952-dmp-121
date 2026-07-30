@@ -88,6 +88,21 @@ static uint32_t g_isls = 0;
  * 1 idle line  2 port not enabled  3 GET_DESCRIPTOR  4 SET_ADDRESS
  * 5 GET_CONFIG  6 SET_CONFIGURATION  0 success */
 static int g_failstep = 0;
+/* Controller state captured at the first failed transfer, so the reason survives the
+ * scrolling console. Guessing has been exhausted; these bits state what happened:
+ *   qTD token bit7 Active  (still set => the controller never executed the qTD)
+ *             bit6 Halted, bit5 DataBufErr, bit4 Babble, bit3 XactErr,
+ *             bit2 MissedUframe, bit1 SplitXstate, bits11:10 CERR
+ *   USBSTS bit12 HCHalted, bit4 HostSysErr, bit3 FrameRollover, bit1 ErrInt */
+static uint32_t g_dbg_setup, g_dbg_status, g_dbg_usbsts, g_dbg_frindex, g_dbg_qh3;
+uint32_t usb_kbd_dbg(int which)
+{
+    switch (which) {
+    case 0: return g_dbg_setup;   case 1: return g_dbg_status;
+    case 2: return g_dbg_usbsts;  case 3: return g_dbg_frindex;
+    default: return g_dbg_qh3;
+    }
+}
 int usb_kbd_failstep(void) { return g_failstep; }
 int usb_kbd_lastxfer(void);
 #define QH_DTC           (1u << 14)    /* take data toggle from the qTD       */
@@ -325,8 +340,7 @@ int usb_kbd_bringup(void) {
         uint32_t caplen = cap & 0xFFu;
         if (caplen >= 0x10u && caplen <= 0x80u)
             g_op = EHCI_CAP_BASE + caplen;
-        mp_printf(&mp_plat_print, "usb HCCAP=%08x caplen=%02x op=%08x\n",
-                  (unsigned)cap, (unsigned)caplen, (unsigned)g_op);
+        (void)cap;
     }
 
     EHCI_USBCMD = USBCMD_HCRESET;
@@ -355,7 +369,7 @@ int usb_kbd_bringup(void) {
      * the connect could not latch. Set PP and give VBUS time to come up. */
     EHCI_PORTSC0 = EHCI_PORTSC0 | PORTSC_PP;
     for (volatile int i = 0; i < 600000; i++) { }
-    mp_printf(&mp_plat_print, "usb1 PORTSC=%08x\n", (unsigned)EHCI_PORTSC0);
+
 
     /* Take the device speed from the line-status field rather than assuming
      * high-speed: 01 = low-speed, 10 = full-speed. */
@@ -380,8 +394,7 @@ int usb_kbd_bringup(void) {
     for (volatile int i = 0; i < 20000; i++) { }
     EHCI_PORTSC0 = EHCI_PORTSC0 & ~PORTSC_PR;   /* de-assert -> HS enable */
     for (volatile int i = 0; i < 20000; i++) { }
-    mp_printf(&mp_plat_print, "usb2 PORTSC=%08x LS=%d\n", (unsigned)EHCI_PORTSC0,
-              (int)((EHCI_PORTSC0 >> 10) & 3));
+
     if (!(EHCI_PORTSC0 & PORTSC_PED)) {
         mp_printf(&mp_plat_print, "usb FAIL: port not enabled after reset\n");
         g_failstep = 2; return 0;
@@ -389,8 +402,11 @@ int usb_kbd_bringup(void) {
 
     /* Enumerate at address 0: read the 18-byte device descriptor. */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 18) < 18) {
-        mp_printf(&mp_plat_print, "usb FAIL: GET_DESCRIPTOR (PORTSC=%08x)\n",
-                  (unsigned)EHCI_PORTSC0);
+        g_dbg_setup   = g_td_p[0][2];      /* SETUP qTD token   */
+        g_dbg_status  = g_td_p[2][2];      /* STATUS qTD token  */
+        g_dbg_usbsts  = EHCI_USBSTS;
+        g_dbg_frindex = OPREG(0x0C);       /* FRINDEX: is the controller running? */
+        g_dbg_qh3     = g_qh[6];           /* QH overlay token   */
         g_failstep = 3; return 0;
     }
     mp_printf(&mp_plat_print,

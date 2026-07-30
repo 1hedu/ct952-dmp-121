@@ -7206,3 +7206,35 @@ there. Same shape as port power, device speed and the TT: real-hardware-only.
 Note the display path already had to solve the same problem, by explicitly flushing
 the D-cache after drawing (REG_CACHE 0x80000014, FLUSH_DCACHE 0x00400000). The
 bypass alias is the cleaner answer for small DMA descriptors that are polled.
+
+**Three hypothesis-driven fixes (TT routing, cache bypass, port power) did not clear
+FAILSTEP=3, so stop proposing causes and read what the controller DID.** The AP now
+captures, at the moment the first control transfer fails, and prints in the surviving
+summary:
+
+```
+    SET=<SETUP qTD token>   STA=<STATUS qTD token>
+    STS=<USBSTS>            FRI=<FRINDEX>   QH=<QH overlay token>
+```
+How to read them -- each points at a different root cause, so this one readout
+discriminates between all the remaining possibilities:
+
+| observation | meaning |
+|---|---|
+| token bit 7 (Active) still **1** | the controller never executed the qTD -- schedule not running, QH not reachable, or ASE/ASYNCLISTADDR wrong |
+| bit 6 Halted + bit 3 **XactErr** | device did not respond / bad handshake -- speed or TT configuration still wrong |
+| bit 6 Halted + CERR (11:10) == 0 | retried to exhaustion |
+| bit 4 Babble / bit 5 DataBufErr | packet-size or buffer-address problem (MPS0, alignment) |
+| bit 2 MissedUframe | periodic/split scheduling problem |
+| USBSTS bit 12 HCHalted **1** | the controller is not running at all |
+| FRINDEX not advancing between runs | ditto -- no frames are being generated |
+| token reads back as **0 / garbage** | our descriptor writes are not reaching the controller's view of DRAM |
+
+Earlier per-attempt log lines were trimmed so these two lines cannot scroll off the
+7-row console.
+
+Recording the honest status: the USB port is fully up on hardware (10.34) but
+enumeration has resisted three plausible fixes. Rather than a fourth guess, the next
+step is determined by the token bits above -- Active-still-set and XactErr point in
+opposite directions (schedule vs. signalling), and there is no way to tell them apart
+without reading them.

@@ -209,6 +209,7 @@ int pyapp_main(void) {
      * attempt does a full HCRESET, so retrying is safe. */
     int kbd_ok = 0;
     extern int usb_kbd_failstep(void);
+    extern uint32_t usb_kbd_dbg(int);
     {
         int tries;
         for (tries = 0; tries < 1 && !kbd_ok; tries++) {
@@ -220,8 +221,14 @@ int pyapp_main(void) {
         mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
     } else {
         /* name the failing step; the per-attempt lines scroll off the 7-row console */
-        mp_printf(&mp_plat_print, "[pyapp] no USB kbd  FAILSTEP=%d\n",
+        mp_printf(&mp_plat_print, "[pyapp] no USB kbd FAILSTEP=%d\n",
                   usb_kbd_failstep());
+        /* what the controller actually did -- no more guessing at causes */
+        mp_printf(&mp_plat_print, "SET=%08x STA=%08x\n",
+                  (unsigned)usb_kbd_dbg(0), (unsigned)usb_kbd_dbg(1));
+        mp_printf(&mp_plat_print, "STS=%08x FRI=%08x QH=%08x\n",
+                  (unsigned)usb_kbd_dbg(2), (unsigned)usb_kbd_dbg(3),
+                  (unsigned)usb_kbd_dbg(4));
     }
     /* Decisive values printed LAST so they survive on a 7-line scrolling console
      * (the first attempt buried them above the REPL banner).

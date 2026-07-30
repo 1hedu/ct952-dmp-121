@@ -121,58 +121,87 @@ static void text(int x0, int y0, const char *str, uint8_t fg, int s){
     for (int i = 0; str[i]; i++) glyph(x0 + i*8*s, y0, (uint8_t)str[i], fg, s);
 }
 
-/* --- final banner: single clean copy, within the OSD's vertical limit --------
- * Two independent hardware limits, both measured on the panel, and they conflict
- * at the loader's window height:
+/* --- LB_CR1 MECHANISM TEST -----------------------------------------------------
+ * Hypothesis from the on-frame register dump (10.26): the OSD's effective line
+ * advance is the VCR23 stride MINUS REG_DISP_LB_CR1's low field.
+ *      measured: VCR23 stride 308, LB_CR1 low 16, drawing pitch 292 = 308 - 16
+ * Horizontal scaling is already excluded (HU/HD unity with enables clear, VCR25=0),
+ * so LB_CR1 is the remaining candidate -- but 308-16=292 is only an exact numerical
+ * coincidence until the relationship is shown to MOVE.
  *
- *  1) THE DUPLICATE. The OSD window is painted twice, 157 panel lines apart (row
- *     ruler, 10.23). Both copies move with OSD_POS, so hiding the second one needs
- *     y + 157 > 233, i.e. **y >= 77**.
+ * Experiment: zero LB_CR1's low field (keeping its high field, 48), which predicts
+ * the pitch becomes 308 - 0 = 308. Then draw "292" / "300" / "308", each rendered
+ * USING ITS OWN VALUE as the row pitch. The legible number names the actual pitch --
+ * the same self-identifying method that established 292, needing no counting or
+ * estimating.
  *
- *  2) THE SHEAR LIMIT. The OSD only renders correctly ABOVE panel line ~139 --
- *     an ABSOLUTE limit, not a window-relative one. Proof: with y=95 the shear
- *     began at buffer row ~44 (panel 139) and with y=80 it began at row ~60
- *     (panel 140) -- the same panel line both times. It is also why the loader's
- *     y=28 was clean for all 78 rows: window 28..105 sits entirely above it.
- *     So we need y + height - 1 < ~139.
+ *   "308" legible  -> the pitch followed LB_CR1: HYPOTHESIS CONFIRMED, and the pitch
+ *                     is derivable (VCR23_stride - LB_CR1_low), not a magic number.
+ *   "292" legible  -> LB_CR1 has no effect: hypothesis dead, 292 stays empirical.
+ *   nothing legible -> the LB_CR1 write disturbed the display; a power cycle reverts
+ *                     it (nothing is written to flash).
  *
- * With the loader's 78-line window those cannot both hold (77+77 = 154 > 139), so
- * the window must ALSO be made shorter. y=78 with height 56 satisfies both:
- * window 78..133 (comfortably above the limit) and the duplicate at 235,
- * off-screen. Cost: 56 usable rows instead of 78.
- *
- * At 56 rows we use 1x text (8 px) for 7 lines of 60 columns. 1x is known legible
- * on this panel -- the row-ruler labels were read off a photo at 1x.
- *
- * Two register writes only, both narrow and reversible (loader values:
- * OSD_POS = 0x001C0066, OSD_SIZE = 0x104E0268): the window's POSITION and its
- * HEIGHT field. Base, stride, width, palette and all timing are left untouched. */
+ * Window still programmed as established (height 56 @ y=78): no duplicate, and
+ * nothing below the ~139-line shear limit. */
 #define REG_OSD_POS  (*(volatile uint32_t *)0x80001A50u)
 #define REG_OSD_SIZE (*(volatile uint32_t *)0x80001A54u)
+#define REG_LB_CR1   (*(volatile uint32_t *)0x80001A28u)
+
+#define NZONE 3u
+#define ZONE  5400u          /* bytes per zone: ~17.5 rows even at pitch 308 */
+
+static const uint16_t CAND[NZONE] = { 292, 300, 308 };
+
+/* pixel inside a zone, addressed with THAT zone's candidate pitch */
+static void zpx(uint32_t base, uint32_t pitch, int x, int y, uint8_t idx, uint32_t cap){
+    uint32_t off;
+    if (x < 0 || y < 0 || x >= VIS_W) return;
+    off = base + (uint32_t)y * pitch + ((uint32_t)x >> 1);
+    if (off >= cap || off >= REGION) return;
+    if (x & 1) FB[off] = (uint8_t)((FB[off] & 0xF0) | (idx & 0x0F));
+    else       FB[off] = (uint8_t)((FB[off] & 0x0F) | ((idx & 0x0F) << 4));
+}
+
+static void zdigit(uint32_t base, uint32_t pitch, int x0, int y0, uint8_t ch,
+                   uint32_t cap, int sc){
+    const uint8_t *g = font8x8[ch - 0x20];
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++)
+            if (g[r] & (1u << c))
+                for (int sy = 0; sy < sc; sy++)
+                    for (int sx = 0; sx < sc; sx++)
+                        zpx(base, pitch, x0 + c*sc + sx, y0 + r*sc + sy, C_TXT, cap);
+}
 
 int pyapp_main(void){
-    uint32_t sz;
+    uint32_t sz, lb;
     REG_SYSCFG1 &= ~0x10000000u;               /* keep the watchdog dead */
 
-    /* shrink the window to 56 lines (preserve enable bit + width), then move it
-     * down so the duplicate falls off the bottom edge */
+    /* established window config: single copy, clear of the shear limit */
     sz = REG_OSD_SIZE;
     REG_OSD_SIZE = (sz & ~0x0FFF0000u) | (ROWS << 16);
-    REG_OSD_POS  = (78u << 16) | 102u;         /* y=78, keep the loader's x=102 */
+    REG_OSD_POS  = (78u << 16) | 102u;
+
+    /* THE EXPERIMENT: clear LB_CR1's low field (was 16), keep the high field (48) */
+    lb = REG_LB_CR1;
+    REG_LB_CR1 = lb & ~0x0000FFFFu;
 
     for (uint32_t i = 0; i < REGION; i++) FB[i] = 0;   /* transparent */
 
-    text(4,  0,  "CT952A LIVE - BARE METAL ON SILICON", C_HI,  1);
-    text(4,  8,  "PITCH 292  4BPP @0x40084000  60 COLS", C_TXT, 1);
-    text(4,  16, "WINDOW 616X56 @ Y=78  ONE COPY", C_TXT, 1);
-    text(4,  24, "SHEAR LIMIT: PANEL LINE 139", C_TXT, 1);
-    text(4,  32, "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789", C_TXT, 1);
-    text(4,  40, "the quick brown fox jumps over a dog", C_TXT, 1);
-    text(4,  48, "NEXT: MICROPYTHON REPL ON THIS SCREEN", C_HI,  1);
-
-    /* full-height shear detector: straight iff the pitch holds over every row */
-    for (uint32_t y = 0; y < ROWS; y++)
-        for (int x = 452; x < 472; x++) px(x, (int)y, C_TXT);
+    for (uint32_t k = 0; k < NZONE; k++) {
+        uint32_t p = CAND[k];
+        uint32_t z = k * ZONE;
+        uint32_t base = ((z + p - 1u) / p) * p;        /* align to a line start */
+        uint32_t cap  = (k + 1u) * ZONE;
+        uint32_t v = p;
+        char dg[4]; int n = 0, x = 30;
+        if (cap > REGION) cap = REGION;
+        while (v && n < 3) { dg[n++] = (char)('0' + v % 10u); v /= 10u; }
+        for (int j = n - 1; j >= 0; j--) {             /* MSD first, 2x scale */
+            zdigit(base, p, x, 2, (uint8_t)dg[j], cap, 2);
+            x += 8*2 + 5;
+        }
+    }
 
     flush();
     for (;;){}

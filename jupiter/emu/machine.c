@@ -307,6 +307,20 @@ static void machine_maybe_jpeg_decode(machine_t *m)
 
 static machine_t *M(sparc_bus_t *b) { return (machine_t *)b; }
 
+/* Base of the DRAM-resident MicroPython payload window (CT952_PYAPP).
+ * Historically hardcoded 0x40500000, which was only valid while the emulator
+ * modelled 8 MB of DRAM. The real part has 2 MB (0x40000000..0x40200000), so that
+ * address is out of bounds and machine_dram_ptr() returns NULL -- silently
+ * disabling the whole CT952_PYAPP path (and with it the USB-keyboard REPL that
+ * path had already proven). Default to the AP link base the mpy app is built at
+ * and allow an override. */
+static uint32_t mach_pyapp_base(void)
+{
+    const char *e = getenv("CT952_PYAPP_BASE");
+    if (e && *e) return (uint32_t)strtoul(e, NULL, 0);
+    return 0x400c0000u;
+}
+
 static uint32_t io_get(machine_t *m, uint32_t off)
 {
     return m->io[off / 4];
@@ -2838,7 +2852,7 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
         if (e && *e) {
             FILE *pf = fopen(e, "rb");
             if (pf) {
-                uint8_t *dst = machine_dram_ptr(m, 0x40500000u);
+                uint8_t *dst = machine_dram_ptr(m, mach_pyapp_base());
                 long n = 0;
                 if (dst) {
                     fseek(pf, 0, SEEK_END); n = ftell(pf); fseek(pf, 0, SEEK_SET);
@@ -2847,7 +2861,8 @@ int machine_init(machine_t *m, const uint8_t *flash, uint32_t flash_size)
                     } else n = -2;
                 }
                 fclose(pf);
-                fprintf(stderr, "[PYAPP] loaded %s (%ld bytes) at 0x40500000\n", e, n);
+                fprintf(stderr, "[PYAPP] loaded %s (%ld bytes) at 0x%08x\n", e, n,
+                        mach_pyapp_base());
             } else {
                 fprintf(stderr, "[PYAPP] cannot open %s\n", e);
             }
@@ -3159,7 +3174,7 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                  * running the firmware. Python then peeks/pokes shared DRAM and
                  * watches PROC1 (0x98080020) live. §12.82. */
                 sparc_reset(&m->cpu2, &m->bus2);
-                m->cpu2.pc  = 0x40500000u;
+                m->cpu2.pc  = mach_pyapp_base();
                 m->cpu2.npc = 0x40500004u;
                 sparc_set_reg(&m->cpu2, 14, 0x407F0000u);
                 m->cpu2.psr = 0xF3000FA0u;           /* S=1 so it can wr psr/wim/tbr */
@@ -3173,7 +3188,7 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                  * PROC1 exactly where it was seized (call-and-resume). */
                 pyapp_saved_ctx = m->cpu;
                 pyapp_ctx_valid = 1;
-                m->cpu.pc  = 0x40500000u;               /* payload entry stub */
+                m->cpu.pc  = mach_pyapp_base();         /* payload entry stub */
                 m->cpu.npc = 0x40500004u;
                 sparc_set_reg(&m->cpu, 14, 0x407F0000u);/* %sp: top of the payload window */
                 sparc_set_reg(&m->cpu, 30, 0);          /* %fp = 0 */
@@ -3181,7 +3196,7 @@ uint64_t machine_run(machine_t *m, uint64_t n)
                  * context-switch PROC1 away from the Python app; window/flush traps
                  * are not maskable by PIL, so the NLR longjmp still works. */
                 m->cpu.psr |= 0x00000F00u;
-                fprintf(stderr, "[PYAPP] launched Python app (seized PROC1 -> 0x40500000) "
+                fprintf(stderr, "[PYAPP] launched Python app (seized PROC1 -> base) "
                         "at icount=%llu pc-was-hook=%d\n",
                         (unsigned long long)m->cpu.icount, pyapp_hook ? 1 : 0);
             }

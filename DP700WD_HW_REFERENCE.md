@@ -7612,3 +7612,44 @@ Reading it: `A=xx00xxxx` means the SETUP really transferred and the device genui
 answering — the protocol reasoning stands and the fault is downstream. `A=xx08xxxx` means
 nothing was ever transmitted and 10.36-10.41's entire protocol analysis was built on a
 status byte that did not mean what it appeared to.
+
+### 10.43 Retraction: do not write CLK_FREQ_CONTROL1 or UPLL from a running AP
+
+The 10.42 build **stopped running on hardware** — the frame came up in the stock
+slideshow instead of the payload, i.e. the SoC hung or reset and the watchdog restarted
+it. Cause: that build wrote, from inside a live already-booted system,
+
+```
+    REG_PLAT_CLK_FREQ_CONTROL1 (0x80000308) |= 0x04008000
+    REG_PLAT_UPLL_CONTROL      (0x80000318)  = 288MHz value, if it read back 0
+```
+
+Both writes are wrong to make there, and the SDK sources we already had said so:
+
+* `spflash.c:87-93` treats **bit 15** of CLK_FREQ_CONTROL1 as CPU/flash-clock related —
+  it clears bits 25 and 15 around flash access and clears bit 15 for `CPU_27M`. Setting
+  it underneath running code can change the clock that code is executing from.
+* Reprogramming a **PLL that is already locked**, on the strength of a register that may
+  not read back meaningfully, is not a diagnostic — it is a reset.
+
+The firmware makes these writes from a *cold* USB init during boot, not from an AP that
+has taken over a system which is already running. Copying a register write out of a
+driver without matching the state it runs in is the mistake, and it is the same
+read-before-write discipline this log has insisted on elsewhere.
+
+No recovery needed: `mkrunap` APs run from DRAM and write no flash, so a power cycle
+returns the stock firmware. That non-destructive property is why this was a lost round
+trip and not a brick.
+
+The registers are now **read and reported only**, as `K=` (CLK_FREQ_CONTROL1) and `U=`
+(UPLL). What their values mean:
+
+| reading | conclusion |
+|---|---|
+| `K` already has bits 26 and 15 set | the loader left the USB clocking configured; not the problem |
+| `K` missing them, `U` non-zero | UPLL runs but the USB leg of the clock tree is gated — a targeted single-bit write becomes worth trying, from a controlled point |
+| `U` = 0 | the USB PHY has no 48 MHz clock at all, which would explain a transmit path that never receives |
+
+`A=` / `B=` (full SETUP and DATA tokens, with `TotalBytes` in bits 30:16) are unchanged and
+still the decisive reading — that is the number that says whether the eight SETUP bytes ever
+left the controller.

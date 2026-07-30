@@ -199,28 +199,23 @@ int pyapp_main(void) {
      * after the clocks come back (and after USB_HCExit() tore the controller down),
      * so a single attempt can lose the race even with a keyboard plugged in. Each
      * attempt does a full HCRESET, so retrying is safe. */
-    /* The clock setup the STOCK FIRMWARE's USB init does and we never did. Its
-     * USB_HCInit path (0xad64c) runs, for every mode:
+    /* DO NOT WRITE THESE. An earlier build here set
      *     REG_PLAT_CLK_FREQ_CONTROL1 (0x80000308) |= 0x04008000
-     * i.e. bits 26 and 15. Neither is an audio divider (hadac.c preserves both in its
-     * 0xC7C08000 mask) and bit 24 is the video clock, so these are the USB side. The AP
-     * loader calls USB_HCExit() before jumping to us, so whatever the firmware set up
-     * while enumerating during boot has been torn down again.
+     * and programmed UPLL (0x80000318) when it read back 0, copying what the stock
+     * firmware's USB_HCInit does at 0xad64c. On hardware the AP stopped running
+     * altogether and the frame came back up in the stock slideshow, i.e. the SoC hung or
+     * reset and the watchdog restarted it.
      *
-     * The USB PHY runs off UPLL: hsystem.c MODE_UPLL programs it as
-     *     (0 << 20) + (0 << 18) + (1 << 11) + 14   -> "Fout = 288" (288/6 = 48MHz)
-     * so if UPLL reads back 0 it is not running and the PHY has no clock at all. Both
-     * values are reported below rather than assumed. */
-    {
-        volatile uint32_t *clkfreq1 = (volatile uint32_t *)0x80000308u;
-        volatile uint32_t *upll     = (volatile uint32_t *)0x80000318u;
-        *clkfreq1 = *clkfreq1 | 0x04008000u;
-        if (*upll == 0u) {
-            *upll = (0u << 20) | (0u << 18) | (1u << 11) | 14u;   /* Fout = 288MHz */
-            for (volatile int i = 0; i < 200000; i++) { }         /* let it lock */
-        }
-    }
-
+     * That is unsurprising in hindsight: spflash.c treats bit 15 of this register as
+     * CPU/flash-clock related (it clears bits 25 and 15 around flash access, and clears
+     * bit 15 for CPU_27M), so setting it underneath a running system can change the clock
+     * the code is executing from. UPLL is worse -- reprogramming a PLL that is already
+     * locked, on the strength of a register that might not even read back, is not a
+     * diagnostic.
+     *
+     * The firmware does these writes from a cold USB init, not from inside a live system
+     * that has already booted. So: READ them, report them, and decide with the values in
+     * hand. K= and U= below. */
     int kbd_ok = 0;
     extern int usb_kbd_failstep(void);
     extern uint32_t usb_kbd_dbg(int);

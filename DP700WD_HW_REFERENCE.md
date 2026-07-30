@@ -7806,3 +7806,44 @@ Shipped: pulse the reset the firmware's way -- ungate the clocks, `RESET_CONTROL
 0x04000000 (PLAT_RESET_USB) alone, as the firmware does here, not the 0x0C000000 the release
 -only path used. Emulator still enumerates and ran `6*7`; the PHY reinit can only be judged
 on hardware.
+
+### 10.48 The RX path works -> the SETUP payload is byte-swapped on the wire (DMA endianness)
+
+The reset pulse (10.47) did not change `A`/`B` either. But this round's readings finally
+isolate the mechanism by ELIMINATION:
+
+* `n=48` (nonexistent address 7) = XactErr, CERR counted to 0 -> no response.
+* `B=80080d40` (real device) = Halted, CERR=**3**, no error bits -> a **decoded STALL**.
+
+The controller can only report a STALL if it **received and decoded a handshake PID from
+the device**. So the RX path works, and the reset-pulse/PHY theory is wrong: the device
+genuinely sends STALL. Two functional devices both ACK the SETUP then STALL the data stage
+identically, and it works in the emulator but not on hardware. One thing explains all of
+it: **the SETUP payload is byte-order-corrupted on the wire.**
+
+The EHCI queue heads and qTDs work when written with ordinary big-endian CPU stores -- the
+buffer pointers resolve, the links traverse, SETUP transmits. That is only possible if the
+SoC's DMA **byte-swaps 32-bit words in hardware** to feed the little-endian core (native BE
+store + hardware swap = correct value to the LE controller). But that same hardware swap
+also hits the **data buffers**: the 8 SETUP bytes laid down in USB order arrive on the wire
+word-swapped, e.g. `80 06 00 01 00 00 08 00` -> `01 00 06 80 00 08 00 00`. A device ACKs the
+packet anyway (valid CRC over whatever bytes) and then STALLs the data stage because the
+request is unparseable. That is:
+
+* device-independent (every device gets the same garbage request), and
+* invisible in the emulator (a functional model with no DMA swap).
+
+It also retires the "S=8006000100000800 confirmed correct" check from 10.36 -- that read our
+buffer, not the wire.
+
+Shipped: `bswap32_buf()` reverses the bytes within each 32-bit word of the SETUP buffer
+before the transfer and of received IN data after, cancelling the hardware swap so the wire
+carries the intended order. Confirmation that the swap is the mechanism, not the emulator's
+absence of it: with this change the EMULATOR now fails at FAILSTEP=3 (its no-swap DMA makes
+our compensation corrupt the setup there) -- the fix and the model are inverted, exactly as
+a hardware DMA swap predicts. This build is therefore hardware-only and cannot be
+emulator-validated; the frame is the test.
+
+If it enumerates, this was the whole thing all along -- and the earlier register work (QH,
+SDIS, reset pulse) was all real hygiene that a corrupted request masked. If it still stalls,
+the SoC swaps structures but not data buffers, and the swap comes back out.

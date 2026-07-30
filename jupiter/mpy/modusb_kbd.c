@@ -333,6 +333,28 @@ static int qtd_wait(volatile uint32_t *td, int budget) {
 /* Run a control transfer on endpoint 0. For IN transfers the data lands in
  * g_data; returns the number of bytes transferred (residual-corrected), or -1
  * on failure. */
+/* Reverse the bytes within each aligned 32-bit word of a buffer.
+ *
+ * WHY: the EHCI queue heads and qTDs work when written with ordinary big-endian CPU
+ * stores, which proves the SoC's DMA byte-swaps 32-bit words in hardware to feed the
+ * little-endian controller (native BE store + hardware swap = correct value to the LE
+ * core; that is the only way the buffer pointers and links resolve). But that same
+ * hardware swap also hits the DATA buffers, so the 8 SETUP bytes we lay down in USB
+ * order arrive on the wire word-swapped -- garbage. A device ACKs the SETUP packet
+ * regardless (its CRC is valid over whatever bytes) and then STALLs the data stage
+ * because the request is unparseable. That is an exact match for what hardware showed:
+ * SETUP transmits and is ACKed, every IN halts with a decoded STALL, on a low-speed
+ * keyboard AND a high-speed stick alike -- and the emulator, a functional model with no
+ * DMA swap, never reproduced it. Pre-swapping the buffer cancels the hardware swap so
+ * the wire sees the intended byte order. */
+static void bswap32_buf(uint8_t *p, int nbytes) {
+    for (int i = 0; i + 4 <= nbytes; i += 4) {
+        uint8_t a = p[i], b = p[i + 1];
+        p[i] = p[i + 3]; p[i + 1] = p[i + 2];
+        p[i + 2] = b;    p[i + 3] = a;
+    }
+}
+
 static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
                      uint16_t wValue, uint16_t wIndex, uint16_t wLength) {
     int dir_in = (bmRequestType & 0x80) != 0;
@@ -344,6 +366,8 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
     g_setup[2] = (uint8_t)wValue;  g_setup[3] = (uint8_t)(wValue >> 8);
     g_setup[4] = (uint8_t)wIndex;  g_setup[5] = (uint8_t)(wIndex >> 8);
     g_setup[6] = (uint8_t)wLength; g_setup[7] = (uint8_t)(wLength >> 8);
+    /* Compensate for the SoC's hardware DMA word-swap (see bswap32_buf). */
+    bswap32_buf(g_setup, 8);
 
     volatile uint32_t *ts = g_td_p[0], *td = g_td_p[1], *tk = g_td_p[2];
     int have_data = (wLength > 0);
@@ -400,7 +424,11 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
     if (have_data && dir_in) {
         uint32_t resid = (td[2] >> 16) & 0x7FFF;   /* bytes not transferred */
         int got = (int)wLength - (int)resid;
-        return got < 0 ? 0 : got;
+        if (got < 0) got = 0;
+        /* Received IN data was word-swapped by the same hardware DMA swap; undo it so the
+         * descriptor parses in USB byte order. Round up to whole words. */
+        bswap32_buf(g_data, (got + 3) & ~3);
+        return got;
     }
     return 0;
 }
@@ -434,6 +462,7 @@ static int int_in_poll(uint8_t *out, int budget) {
         td[2] = 0;                 /* cancel the pending qTD (NAK / no key) */
         return 0;
     }
+    bswap32_buf(g_data, 8);   /* undo the hardware DMA word-swap on the HID report */
     memcpy(out, g_data, 8);
     g_int_toggle ^= 1;
     return 1;

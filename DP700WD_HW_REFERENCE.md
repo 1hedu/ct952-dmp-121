@@ -6789,3 +6789,35 @@ REDUNDANT (0x1A18, = 8), LB_CR1's HIGH field (48), LB_CR2 (720), or a fixed
 hardware offset between the OSD read channel's fetch width (VCR22 low = 77 units =
 308 B) and its line advance (measured 292 B = 73 units -- exactly 4 units less,
 which may itself be the clue).
+
+### 10.27 REPL on screen; USB keyboard blocked by the loader gating the USB clocks
+
+The interpreter now reaches an interactive prompt on the panel: the emulator run
+shows the MicroPython banner and `>>>` rendered on the OSD console with scrolling
+working, in the 60x7 cell area. Whatever drives stdin, the REPL itself is on-screen.
+
+**Found: the AP loader powers USB down before jumping to the AP.** `aploader.c:134-139`
+runs, for the USB/servo source:
+```
+    HAL_PowerControl(HAL_POWER_USB, HAL_POWER_SAVE);
+    USB_HCExit();
+```
+and HAL_POWER_SAVE sets `PLAT_UCLK48M_USB_DISABLE | PLAT_HCLK_USB_DISABLE`
+(0x01000000 | 0x00800000) in `REG_PLAT_CLK_GENERATOR_CONTROL` at **0x80000300**
+(hsystem.c:562-584, ctkav_platform.h:246/249/295-296). With those clocks gated the
+EHCI register block is dead, so `usb_kbd_bringup()` sees no port connection and
+returns 0 -- which is exactly the observed failure. The AP now clears both bits (the
+documented inverse of HAL_POWER_NORMAL) and waits for the PHY before bringup.
+
+**Status: still UNVERIFIED.** With the clocks re-enabled the emulator STILL reports
+"no USB kbd", so either there is a second blocker (USB_HCExit() also tears down
+controller state that needs re-initialising, and the port may need power via
+HAL_WriteGPIO(USB_POWER_GRP, PIN_USB_POWER, 1) under SUPPORT_USB_POWER_BY_IO), or
+the emulator's EHCI model is simply not reachable on the --apload path. The
+emulator cannot settle this: it attaches a HID device ("[USBKBD] attached HID
+keyboard on port 0") yet the driver never sees the port, and USB is one of the
+axes it does not model faithfully. Do not claim keyboard support until a real
+keyboard is seen working on the frame.
+
+Degradation is safe: when bringup fails the REPL falls back to UART1 RX rather
+than hanging, so the on-screen prompt still appears.

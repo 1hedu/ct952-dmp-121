@@ -150,14 +150,49 @@ int pyapp_main(void) {
         "        s=D[v&15]+s\n"
         "        v>>=4\n"
         "    return s\n"
-        "print('IC=' + h(0x800028C8) + ' HREQ=' + h(0x80001A08))\n"
-        "print('RED=' + h(0x80001A18) + ' VSCL=' + h(0x80001A1C))\n"
-        "print('HU =' + h(0x80001A20) + ' HD  =' + h(0x80001A24))\n"
-        "print('LB1=' + h(0x80001A28) + ' LB2 =' + h(0x80001A2C))\n"
-        "print('V25=' + h(0x80000D94) + ' MEML=' + h(0x80001A68))\n"
-        "print('SZ =' + h(0x80001A54) + ' POS =' + h(0x80001A50))\n";
+        /* LB_CR1 write-back check. Clearing LB_CR1's low field did NOT move the
+         * pitch (still 292), which kills the "pitch = stride - LB_CR1_low" idea --
+         * but only if the write actually STUCK. So write it and read it straight
+         * back: if it reads 00300010 again the register is write-protected or
+         * re-driven and the test was inconclusive; if it reads 00300000 the write
+         * held and LB_CR1 genuinely does not affect the pitch. Costs one line. */
+        "print('LB1 before=' + h(0x80001A28))\n"
+        "ct952.poke32(0x80001A28, 0x00300000)\n"
+        "print('LB1 after =' + h(0x80001A28))\n"
+        "ct952.poke32(0x80001A28, 0x00300010)\n"
+        "print('HREQ=' + h(0x80001A08) + ' RED=' + h(0x80001A18))\n"
+        "print('VSCL=' + h(0x80001A1C) + ' LB2=' + h(0x80001A2C))\n"
+        "print('V22 =' + h(0x80000D88) + ' V23=' + h(0x80000D8C))\n"
+        "print('keyboard: type at the >>> prompt')\n";
     mp_hal_stdout_tx_strn("[pyapp] embedded investigate script\n", 36);
     do_str(investigate, MP_PARSE_FILE_INPUT);
+
+    /* Milestone 3: bring up the USB keyboard and hand the frame an interactive
+     * REPL on its own screen -- no serial cable, no host. If no keyboard is found
+     * the REPL still reads UART1 RX, so behaviour degrades rather than hanging.
+     *
+     * RE-ENABLE THE USB CLOCKS FIRST. aploader.c:134-139 runs
+     *     HAL_PowerControl(HAL_POWER_USB, HAL_POWER_SAVE); USB_HCExit();
+     * for the USB/servo source before jumping to the AP, and HAL_POWER_SAVE sets
+     * PLAT_UCLK48M_USB_DISABLE|PLAT_HCLK_USB_DISABLE in
+     * REG_PLAT_CLK_GENERATOR_CONTROL (0x80000300, hsystem.c:562-584). With those
+     * clocks gated the EHCI registers are dead, so usb_kbd_bringup() sees no port
+     * connection and gives up -- exactly what happened on the first attempt.
+     * Clearing the two bits is the documented inverse of HAL_POWER_NORMAL, and is
+     * harmless if they were already clear. */
+    {
+        volatile uint32_t *clkgen = (volatile uint32_t *)0x80000300u;
+        *clkgen = *clkgen & ~0x01800000u;               /* UCLK48M + HCLK for USB */
+        for (volatile int i = 0; i < 200000; i++) { }   /* let the PHY settle */
+    }
+    if (usb_kbd_bringup()) {
+        mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
+    } else {
+        mp_hal_stdout_tx_strn("[pyapp] no USB kbd; REPL on UART1 RX\n", 37);
+    }
+    for (;;) {
+        if (pyexec_friendly_repl() != 0) break;
+    }
     #endif
 
     mp_deinit();

@@ -7700,3 +7700,50 @@ That leaves two materially different ways forward, recorded here as the decision
    `USB_FindDevice`. Invoke those from the AP via the already-proven `ct952.call`, letting
    the working driver do the enumeration. Fastest way to learn whether the defect is purely
    in our split handling; the wrapper is mass-storage-oriented, so HID reach is unproven.
+
+### 10.45 The firmware's own QH builder: root device = HubAddr 0, and CMASK on control
+
+Reverse-engineered the stock EHCI driver's queue-head builder at 0xb16e8..0xb183c — the
+ground truth for this core and board. It resolves the IN failure directly.
+
+**qh_endphub (word 2), 0xb1810..0xb1838:**
+```
+    o1 = 0x40000000                 ; MULT = 1
+    o0 = (PortNum << 23) | MULT
+    o0 |= (HubAddr << 16)
+    o1 = o0 | 0x800                 ; CMASK bit 3 -> bits 15:8 = 0x08
+    if xfertype == interrupt: o0 |= 0x802   ; + SMASK bit 1
+    st -> qh.endphub
+```
+and **HubAddr / PortNum come from `device->myhsport`** (0xb1708..0xb1728):
+```
+    o2 = device->myhsport           ; the high-speed hub this device sits behind
+    if (o2 == 0) { HubAddr = 0; PortNum = 0; }      ; <-- root-port device
+    else         { HubAddr = o2->parent->address; PortNum = device->ttport; }
+```
+
+Our keyboard is attached **directly to the root port**, so `myhsport` is NULL and the
+firmware programs **HubAddr = 0, PortNum = 0** — it does *not* put TTCTRL.TTHA (0x7F) in
+the QH. Every build since 10.31 had HubAddr = 0x7F, PortNum = 1, addressing split
+transactions to a hub that isn't there. That is why the IN never came back.
+
+**qh_endp (word 1), 0xb17b4..0xb180c**, adds two fields we omitted:
+* **CMASK = 0x08 on the control QH.** The firmware sets it unconditionally (the `| 0x800`
+  above), control included. On this embedded-TT core the complete-split mask is what makes
+  the controller schedule the CSPLIT that retrieves IN data; with CMASK = 0 the IN data
+  stage is never completed — precisely "SETUP transmits, IN halts, 0 bytes" (10.44).
+* **RL (NakCountReload) = 8** in bits 31:28 (base `0x80000000`, control ORs in the C bit
+  -> `0x88000000`). A keyboard NAKs constantly; RL bounds how many the controller absorbs.
+* C bit set for a **non-high-speed control** endpoint only — which we already did.
+
+Shipped, matching the firmware exactly for a root-port device:
+* `qh_word2()` = `MULT(1) | 0x800` (CMASK 0x08), HubAddr = 0, PortNum = 0; interrupt adds
+  SMASK `0x02`. The whole TThA / port-number / six-way split sweep is gone — it was built
+  on the wrong model.
+* `qh_endp` gains `QH_RL8` (0x80000000) on every endpoint.
+* Force-full-speed stays OFF (the board flag read `f=00`).
+
+The emulator still enumerates (it models a high-speed device, so the split fields are
+inert there) and the REPL evaluated `7*6` typed through it. This is the first hardware fix
+in the sequence taken verbatim from the frame's own working driver rather than reasoned
+from the spec, so it is the strongest candidate yet.

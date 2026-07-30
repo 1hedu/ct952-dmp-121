@@ -179,13 +179,11 @@ int usb_kbd_lastxfer(void);
  * answer STALL, which in the qTD status is indistinguishable from the device
  * stalling. Hardware reported exactly a bare Halted (STALL) with a spec-legal 60ms
  * reset, so try each routing and report which one the device answers. */
-#define TT_MODE_PORT1    0
-#define TT_MODE_PORT0    1
-#define TT_MODE_NONE     2
-static int g_tt_mode = TT_MODE_PORT1;
-/* Whether to set the QH's C (control-endpoint) bit, also under test: it selects the
- * split-transaction control path for a low/full-speed endpoint. */
-static int g_ctrl_c = 1;
+/* NAK-count reload, qh_endp bits 31:28. The firmware's QH builder sets this to 8 for
+ * every endpoint (0xb17f8 loads 0x80000000 as the base of qh_endp; the control case ORs
+ * in the C bit to make 0x88000000). It bounds how many NAKs the controller absorbs before
+ * moving on, and a keyboard NAKs constantly, so leaving it 0 was another difference. */
+#define QH_RL8           0x80000000u
 #define QH_SMASK_C       0x00000001u    /* start-split in uframe 0 (periodic)       */
 #define QH_CMASK_C       0x00001C00u    /* complete-split in uframes 2..4 (periodic)*/
 
@@ -266,17 +264,25 @@ static void hc_delay_ms(int ms)
     }
 }
 
-/* QH word 2 (endpoint capabilities). A high-speed device needs no TT fields at all;
- * a low-speed one needs them only if we are routing through the embedded TT. `periodic`
- * adds the split start/complete masks, which apply to interrupt endpoints only. */
+/* QH word 2 (endpoint capabilities), built to match the STOCK FIRMWARE's own EHCI QH
+ * builder (0xb16e8..0xb183c), which is the ground truth for this core + this board.
+ *
+ * The firmware reads device->myhsport (the high-speed hub the device sits behind). For a
+ * device attached directly to the ROOT PORT -- which our keyboard is -- that pointer is
+ * NULL, and the builder then sets **HubAddr = 0 and PortNum = 0** (0xb1710 -> 0xb1724:
+ * `clr %l6; clr %l5`). It does NOT use TTCTRL.TTHA (0x7F) as the QH hub address; that was
+ * the mistake behind every IN halting. It also sets **CMASK = 0x08** unconditionally --
+ * even on a control endpoint (`or %o0, 0x800`, and 0x800 lands in bits 15:8 as 0x08) --
+ * and adds **SMASK = 0x02** only for an interrupt endpoint (`or %o0, 0x802`). On this
+ * embedded-TT core the complete-split mask is what makes the controller issue the CSPLIT
+ * that pulls IN data back; with CMASK = 0 the IN data stage never completes, which is
+ * exactly the "SETUP transmits, IN halts with 0 bytes" seen on hardware. */
+#define QH_CMASK_FW      0x00000800u   /* CMASK = 0x08 (complete-split at uframe 3) */
+#define QH_SMASK_FW      0x00000002u   /* SMASK = 0x02 (interrupt start-split)       */
 static uint32_t qh_word2(int periodic)
 {
-    if (!g_isls || g_tt_mode == TT_MODE_NONE) {
-        return QH_MULT1;
-    }
-    uint32_t w = QH_MULT1 | QH_HUBADDR(TT_HUB_ADDR) |
-                 QH_PORTNUM(g_tt_mode == TT_MODE_PORT0 ? 0u : 1u);
-    return periodic ? (w | QH_SMASK_C | QH_CMASK_C) : w;
+    /* HubAddr = 0, PortNum = 0 for a root-port device, exactly as the firmware does. */
+    return QH_MULT1 | QH_CMASK_FW | (periodic ? QH_SMASK_FW : 0u);
 }
 
 /* Async schedule stop/start handshake.
@@ -375,8 +381,8 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
     g_qh[0] = pa(g_qh) | (1u << 1);        /* horizontal link, Typ=QH(01)   */
     /* control endpoint: speed from the port, and the C bit is required for a
      * low/full-speed control endpoint on this core */
-    g_qh[1] = (uint32_t)g_dev_addr | g_eps | QH_DTC | QH_H | QH_MPS(g_mps0)
-              | ((g_isls && g_ctrl_c) ? QH_C : 0u);
+    g_qh[1] = (uint32_t)g_dev_addr | g_eps | QH_DTC | QH_H | QH_RL8 | QH_MPS(g_mps0)
+              | (g_isls ? QH_C : 0u);   /* C bit: non-high-speed control endpoint */
     g_qh[2] = qh_word2(0);
     g_qh[3] = 0;                            /* current qTD                    */
     g_qh[4] = pa(ts);                       /* overlay: next qTD -> SETUP     */
@@ -413,7 +419,7 @@ static int int_in_poll(uint8_t *out, int budget) {
 
     g_qh[0] = pa(g_qh) | (1u << 1);
     g_qh[1] = (uint32_t)g_dev_addr | (1u << 8) /* ep 1 */ |
-              g_eps | QH_DTC | QH_H | QH_MPS(8);
+              g_eps | QH_DTC | QH_H | QH_RL8 | QH_MPS(8);   /* interrupt IN: no C bit */
     g_qh[2] = qh_word2(1);
     g_qh[3] = 0;
     g_qh[4] = pa(td);
@@ -487,8 +493,8 @@ static uint32_t probe_bare_in(void)
     td[4] = td[5] = td[6] = td[7] = 0;
 
     g_qh[0] = pa(g_qh) | (1u << 1);
-    g_qh[1] = g_eps | QH_DTC | QH_H | QH_MPS(8) |
-              ((g_isls && g_ctrl_c) ? QH_C : 0u);
+    g_qh[1] = g_eps | QH_DTC | QH_H | QH_RL8 | QH_MPS(8) |
+              (g_isls ? QH_C : 0u);
     g_qh[2] = qh_word2(0);
     g_qh[3] = 0;
     g_qh[4] = pa(td);
@@ -505,10 +511,10 @@ static uint32_t probe_bare_in(void)
  * Returns 1 on success, 0 if no device / enumeration failed. Plain C so both
  * the Python module and the C REPL stdin path can call it. */
 int usb_kbd_bringup(void) {
-    static int attempt_no = 0;
-    /* Alternate the force-full-speed quirk between attempts so both are covered without
-     * another flash cycle; PORTSC bit 24 in the reported P= says which one was in use. */
-    g_pfsc = (attempt_no++ & 1);
+    /* Force-full-speed (PORTSC bit 24) is OFF: the firmware's board flag at 0x40040f0c
+     * read back 0 (f=00 on hardware), so the stock stack does NOT force it on this board,
+     * and the earlier attempt that did set it changed nothing. Match the firmware. */
+    g_pfsc = 0;
     g_ready = 0; g_dev_addr = 0; g_int_toggle = 0; g_failstep = 0;
     dma_view_init();   /* uncached views before any DMA structure is touched */
 
@@ -619,25 +625,14 @@ int usb_kbd_bringup(void) {
      * and the DATA-stage status of each is recorded for the on-screen summary. */
     /* Sweep the split-transaction configuration. The three fields that decide whether
      * a low-speed control endpoint is reached through the embedded TT are the QH's hub
-     * address, its endpoint speed, and its C (control) bit; the qTD status cannot tell a
-     * device STALL from a TT that was handed a transaction it will not translate, so let
-     * the device decide which combination is right. Six combinations, DATA-stage status
-     * of each recorded, first one that returns a descriptor wins. */
-    static const struct { int tt; uint32_t eps; int c; } combos[6] = {
-        { TT_MODE_PORT1, QH_EPS_LS, 1 },   /* TT, low-speed endpoint, control bit  */
-        { TT_MODE_PORT1, QH_EPS_LS, 0 },   /* TT, no control bit                   */
-        { TT_MODE_PORT1, QH_EPS_FS, 1 },   /* TT, endpoint declared full-speed     */
-        { TT_MODE_NONE,  QH_EPS_LS, 1 },   /* no TT fields at all                  */
-        { TT_MODE_NONE,  QH_EPS_LS, 0 },
-        { TT_MODE_NONE,  QH_EPS_FS, 1 },
-    };
-    uint32_t eps_detected = g_eps;
-    for (int ci = 0; ci < 6; ci++) {
-        g_tt_mode = combos[ci].tt;
-        g_ctrl_c  = combos[ci].c;
-        g_eps     = g_isls ? combos[ci].eps : eps_detected;
+     * address, its endpoint speed, and its C bit. Those are no longer swept: the stock
+     * firmware's own QH builder settled them (HubAddr=0, PortNum=0, CMASK=0x08, RL=8, C
+     * for a non-high-speed control endpoint), and qh_word2()/g_qh[1] now match it. Just
+     * retry the read a few times, since the first control transfer after a reset may fail,
+     * and record each attempt's DATA-stage status for the summary. */
+    for (int ci = 0; ci < 4; ci++) {
         got = ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 8);
-        g_dbg_dv[ci] = g_td_p[1][2];
+        if (ci < 6) g_dbg_dv[ci] = g_td_p[1][2];
         if (got >= 8) {
             break;
         }
@@ -647,20 +642,12 @@ int usb_kbd_bringup(void) {
         g_dbg_usbsts  = EHCI_USBSTS;
         g_dbg_frindex = OPREG(0x0C);       /* FRINDEX: is the controller running? */
         g_dbg_qh3     = g_qh[6];           /* QH overlay token   */
-        /* What the controller actually fetched as the SETUP packet, and whatever landed
-         * in the IN buffer. The buffer is cleared before each IN, so a non-zero value
-         * here means bytes really did arrive before the halt. */
         for (int b = 0; b < 8; b++) {
             g_dbg_sbytes[b] = g_setup[b];
         }
         g_dbg_rx = ((uint32_t)g_data[0] << 24) | ((uint32_t)g_data[1] << 16) |
                    ((uint32_t)g_data[2] << 8)  | (uint32_t)g_data[3];
         hc_delay_ms(10);
-    }
-    if (got < 8) {
-        g_tt_mode = TT_MODE_PORT1;
-        g_ctrl_c  = 1;
-        g_eps     = eps_detected;
     }
     if (got < 8) {
         /* Last discriminator before giving up: does the device reject EVERYTHING, or
@@ -670,7 +657,6 @@ int usb_kbd_bringup(void) {
          * specific to the data phase (toggle / packet size / split completion). A
          * halted status stage says the device rejects us outright, i.e. it is not in
          * Default state and the reset still is not taking. */
-        g_tt_mode = TT_MODE_PORT1;
         ctrl_xfer(0x00, REQ_SET_ADDRESS, 0, 0, 0);
         g_dbg_dv[7] = g_td_p[2][2];   /* slots 0..5 hold the combination sweep */
         /* CONTROL EXPERIMENT. Address 7 cannot exist -- no address has been assigned

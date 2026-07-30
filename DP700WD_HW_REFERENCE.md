@@ -6722,3 +6722,49 @@ not model them), which is precisely why this has to be read on the frame.
 
 Also confirms the window writes take effect: the emulator run reported back
 `SZ=003802D0` (height 0x038 = 56) and `POS=004E0066` (y=78, x=102).
+
+### 10.26 The 292-vs-308 pitch EXPLAINED (line-buffer offset), and vertical scaling found
+
+MicroPython ran on the frame with no keyboard and printed these live values (this
+is the payoff of the on-screen console: registers the emulator does not model can
+now be read off real silicon):
+
+| reg | value | decode |
+|---|---|---|
+| IC (0x28C8) | `00000003` | |
+| H_REQ (0x1A08) | `000400B4` | 180 DRAM accesses per line |
+| REDUNDANT (0x1A18) | `00040008` | 8 |
+| **VSCALE_CR (0x1A1C)** | **`08003BBB`** | **DISP_VSCALE_EN SET**, factor 0x3BBB |
+| HU_SCALE (0x1A20) | `00008000` | unity, NEAREST_EN clear |
+| HD_SCALE (0x1A24) | `00008000` | unity, **HD_EN clear** |
+| **LB_CR1 (0x1A28)** | **`00300010`** | **low = 16**, high = 48 |
+| LB_CR2 (0x1A2C) | `000002D0` | 720 (line-buffer width in px) |
+| VCR25 (0xD94) | `00000000` | OSD upscaling off |
+| MEM_LINE (0x1A68) | `00000000` | |
+| OSD_SIZE | `10380268` | enable, height **56**, width 616 -- our write |
+| OSD_POS | `004E0066` | y **78**, x 102 -- our write |
+
+**1. The pitch discrepancy is accounted for exactly: `308 - 16 = 292`.** `LB_CR1`'s
+low field is **16**, and the OSD's effective line advance is the VCR23 stride (308)
+minus that 16. Horizontal scaling is ruled out as the cause -- both HU and HD read
+unity with their enable bits clear, and VCR25 (OSD upscaling) is 0. This is a
+numerically exact match rather than a proof; the decisive test is to alter LB_CR1's
+low field and confirm the required drawing pitch moves with it. Until then, treat
+292 as `VCR23_stride - LB_CR1_low` rather than a magic constant -- and note that any
+firmware that programs LB_CR1 differently will need a different pitch.
+
+**2. Vertical scaling is ON and was invisible until now.** `VSCALE_EN` (0x08000000)
+is set with factor 0x3BBB = 15291. Reading 0x4000 as unity gives **0.9333**, so the
+78-row window renders as ~72.8 panel lines -- which matches the ~74 lines measured
+from the row-ruler photo. So OSD rows are NOT 1:1 with panel lines, and any future
+vertical arithmetic (the 157-line repeat period, the ~139-line shear limit) must be
+done in PANEL lines and converted, not assumed equal.
+
+**3. Our two window writes are confirmed live on hardware:** OSD_SIZE height = 56
+and OSD_POS = (78,102), exactly as programmed, with the enable bit and width
+preserved.
+
+Still open: the mechanism of the 157-line duplication, and the ~139-line shear
+limit. `LB_CR1` high = 48 and `LB_CR2` = 720 are the remaining line-buffer knobs and
+the natural place to look next, since a line-buffer limit is the most plausible
+cause of a hard vertical cutoff.

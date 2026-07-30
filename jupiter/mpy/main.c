@@ -232,6 +232,8 @@ int pyapp_main(void) {
         {
             extern uint32_t usb_kbd_setupbyte(int);
             extern uint32_t usb_kbd_dv(int);
+            extern uint32_t usb_kbd_nodev(void);
+            extern uint32_t usb_kbd_portsc(void);
             char line[24];
             static const char hex[] = "0123456789abcdef";
             line[0] = 'S'; line[1] = '=';
@@ -240,42 +242,30 @@ int pyapp_main(void) {
                 line[2 + i * 2]     = hex[(b >> 4) & 0xF];
                 line[2 + i * 2 + 1] = hex[b & 0xF];
             }
-            line[18] = '\n';
-            mp_hal_stdout_tx_strn(line, 19);
+            line[18] = '\0';
             /* DATA-stage status per split routing (TT/port1, TT/port0, no TT) and the
              * status stage of a zero-length SET_ADDRESS(0) probe: z=00 means the device
              * answers a request with no data stage, so it IS in Default state and only
              * the data phase is broken. */
-            mp_printf(&mp_plat_print, "d=%02x %02x %02x z=%02x\n",
+            mp_printf(&mp_plat_print, "S=%s d=%02x %02x %02x\n", line + 2,
                       (unsigned)(usb_kbd_dv(0) & 0xFF), (unsigned)(usb_kbd_dv(1) & 0xFF),
-                      (unsigned)(usb_kbd_dv(2) & 0xFF), (unsigned)(usb_kbd_dv(3) & 0xFF));
+                      (unsigned)(usb_kbd_dv(2) & 0xFF));
+            /* LAST line, because only the last one is reliably readable on a 7-row
+             * console: the no-device control experiment first (0x48/0x68 = the bus
+             * really times out when nobody answers, so 0x40 elsewhere is a genuine
+             * device STALL; 0x40 here means the controller halts regardless of any
+             * device), then the zero-length probe and the port state. */
+            mp_printf(&mp_plat_print, "n=%02x z=%02x P=%08x\n",
+                      (unsigned)(usb_kbd_nodev() & 0xFF),
+                      (unsigned)(usb_kbd_dv(3) & 0xFF),
+                      (unsigned)usb_kbd_portsc());
         }
     }
-    /* Decisive values printed LAST so they survive on a 7-line scrolling console
-     * (the first attempt buried them above the REPL banner).
-     *   PORTSC bits 11:10 = line status; 01 => a LOW-SPEED device is attached, which
-     *     an EHCI-only driver cannot address.
-     *   oREV = OHCI HcRevision at 0xA0001000; 0x10 => an OHCI companion exists and
-     *     is the correct route for a keyboard.
-     * That the splash screen takes visibly longer with USB connected shows the
-     * FIRMWARE does enumerate this keyboard, so the chip supports it -- the gap is
-     * in our driver, not the silicon. */
-    do_str("import ct952\n"
-           "D='0123456789ABCDEF'\n"
-           "def h(a):\n"
-           "    v=ct952.peek32(a)\n"
-           "    s=''\n"
-           "    for i in range(8):\n"
-           "        s=D[v&15]+s\n"
-           "        v>>=4\n"
-           "    return s\n"
-           /* Read the REAL ChipIdea registers (op base 0xA0000140), not the
-            * 0x30-too-low EHCI guesses that made PORTSC read as 0. */
-           "p=ct952.peek32(0xA0000184)\n"
-           "print('PORTSC=' + h(0xA0000184) + ' LS=' + str((p>>10)&3))\n"
-           "print('CAP=' + h(0xA0000100) + ' MODE=' + h(0xA00001A8))\n"
-           "print('CLK=' + h(0x80000300) + ' RST=' + h(0x80000324))\n",
-           MP_PARSE_FILE_INPUT);
+    /* The register dump that used to run here has been REMOVED, and that matters for
+     * the diagnostics above: it printed three more lines after them, which on a 7-row
+     * scrolling console is what left only a single line of USB state readable. PORTSC
+     * is now reported inside that summary as P=, and CAP/MODE/CLK/RST are already
+     * recorded in the hardware reference (10.31-10.33). */
     for (;;) {
         if (pyexec_friendly_repl() != 0) break;
     }

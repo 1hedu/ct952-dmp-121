@@ -7382,3 +7382,55 @@ Emulator check: the modelled controller enumerates on the first routing (it repo
 high-speed device, which needs no TT fields), and the failure path prints
 `s=00 d=00 k=00 Q=00000000 / S=0000000000000000 / d=00 00 00 z=00` with no keyboard
 attached, so the new diagnostics are safe on both paths.
+
+### 10.39 Why all three variants agreed: the QH was never re-fetched
+
+Hardware returned `d=40 40 40  z=40` — all three split routings *and* the zero-length
+`SET_ADDRESS(0)` probe identical. That uniformity is the finding. Three genuinely
+different bus configurations producing bit-identical status, including one request with
+no data stage at all, is not three experiments; it is one stale result reported three
+times.
+
+**The driver was rewriting the Queue Head underneath a running async schedule.** EHCI
+forbids this: with ASE set, the controller may hold a cached copy of the QH — overlay,
+data toggle and **Halted bit** included — and `ASYNCLISTADDR` must not be touched while
+`USBSTS.AS` is set. So once the first transfer halted the queue, every later transfer
+saw the cached halted overlay and reported Halted immediately, without the controller
+ever fetching the new QH. The three routings were never actually tried.
+
+The handshake is now spec-correct, in `async_stop()` / `async_start()`:
+
+1. clear `USBCMD.ASE`, poll `USBSTS.AS` (bit 15) until it follows down,
+2. clear the write-1-to-clear bits in `USBSTS`,
+3. build the QH/qTDs,
+4. write `ASYNCLISTADDR`, set `ASE`, poll `AS` until it comes back up.
+
+`async_stop()` runs *before* the descriptors are built, in both `ctrl_xfer()` and
+`int_in_poll()`.
+
+**The control experiment.** Everything so far has assumed 0x40 means the device stalled
+us, because bare Halted is the EHCI signature of a STALL. That assumption has never been
+tested. A control transfer is now issued to **device address 7**, which cannot exist (no
+address has been assigned yet), and its SETUP-stage token is reported as `n=`:
+
+| `n=` | meaning |
+|---|---|
+| `0x48` / `0x68` (XactErr, CERR=0) | the bus really times out when nobody answers, so the controller *can* tell no-response from STALL — 0x40 elsewhere is then a genuine device STALL |
+| `0x40` (same as everything else) | the controller halts the queue regardless of any device: nothing is reaching the wire and every protocol theory so far is void |
+
+**Two more spec timings fixed.** After applying VBUS a port must settle ≥100ms before a
+connect means anything, and the connection must be debounced 100ms (TATTDB) before
+reset; a cheap HID also needs that long to boot its own microcontroller. The previous
+wait was 600000 spin iterations, ~90ms *in total* — the port was being reset while the
+keyboard was still powering up. Now: 150ms settle, up to 1s waiting for CCS, 120ms
+debounce.
+
+**Console fix.** A three-line register dump (`PORTSC=`/`CAP=`/`CLK=`) ran *after* the USB
+diagnostics, which on a 7-row scrolling console is why only one line of USB state was
+readable. It is gone; PORTSC is folded into the summary as `P=`, and the rest is already
+recorded in 10.31-10.33. The last line printed is now
+`n=<no-device> z=<zero-length> P=<PORTSC>`.
+
+Emulator check: the modelled keyboard still enumerates through the new handshake and the
+REPL evaluated `2*21` from it, so stopping and restarting the schedule per transfer did
+not break the working path; with no keyboard the failure summary prints zeros.

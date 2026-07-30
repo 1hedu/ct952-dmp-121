@@ -102,6 +102,9 @@ static uint32_t g_dbg_setup, g_dbg_data, g_dbg_status, g_dbg_usbsts, g_dbg_frind
 /* SETUP bytes read back out of DMA memory after a failed transfer, and the DATA-stage
  * status recorded for each split-routing variant tried. */
 static uint8_t  g_dbg_sbytes[8];
+static uint32_t g_dbg_nodev, g_dbg_portsc;
+uint32_t usb_kbd_nodev(void)  { return g_dbg_nodev; }
+uint32_t usb_kbd_portsc(void) { return g_dbg_portsc; }
 static uint32_t g_dbg_dv[4];   /* [0..2] per routing, [3] the zero-length probe */
 uint32_t usb_kbd_dv(int i)       { return g_dbg_dv[i & 3]; }
 uint32_t usb_kbd_setupbyte(int i){ return g_dbg_sbytes[i & 7]; }
@@ -203,6 +206,25 @@ static inline uint32_t pa(volatile void *p)
     return ((uint32_t)(uintptr_t)p & 0x0FFFFFFFu) | 0x40000000u;
 }
 
+/* Real-time delay, in milliseconds. The CPU clock is unknown, so spin-count delays
+ * are guesswork; FRINDEX is a hardware timebase that ticks once per 125us microframe
+ * (8 ticks per 1ms frame) whenever the controller is running, so derive the delay
+ * from it. If FRINDEX is not advancing -- the controller is halted, or it counts
+ * whole frames on this core -- the iteration guard still bounds the wait. The guard
+ * is sized from measured hardware behaviour: ~2.7M spin iterations elapsed while
+ * FRINDEX advanced 3352 counts, i.e. roughly 6.5 iterations per microsecond. */
+static void hc_delay_ms(int ms)
+{
+    uint32_t f0 = OPREG(0x0C) & 0x3FFFu;
+    long guard = (long)ms * 20000L;          /* ~3x the expected time, as a backstop */
+    for (long i = 0; i < guard; i++) {
+        uint32_t d = (OPREG(0x0C) - f0) & 0x3FFFu;
+        if ((int)(d >> 3) >= ms) {
+            return;
+        }
+    }
+}
+
 /* QH word 2 (endpoint capabilities). A high-speed device needs no TT fields at all;
  * a low-speed one needs them only if we are routing through the embedded TT. `periodic`
  * adds the split start/complete masks, which apply to interrupt endpoints only. */
@@ -214,6 +236,38 @@ static uint32_t qh_word2(int periodic)
     uint32_t w = QH_MULT1 | QH_HUBADDR(TT_HUB_ADDR) |
                  QH_PORTNUM(g_tt_mode == TT_MODE_PORT0 ? 0u : 1u);
     return periodic ? (w | QH_SMASK_C | QH_CMASK_C) : w;
+}
+
+/* Async schedule stop/start handshake.
+ *
+ * THIS IS WHY EVERY VARIANT REPORTED THE SAME THING. The old code left ASE set and
+ * rewrote ASYNCLISTADDR and the Queue Head underneath a running schedule, which EHCI
+ * forbids: the controller may hold a cached copy of the QH, including its overlay and
+ * its Halted bit. Once the first transfer halted the queue, every later transfer
+ * re-read that cached halted overlay and reported Halted immediately without ever
+ * fetching the new QH -- so three different split routings and a zero-length probe all
+ * came back 0x40, which is exactly what the hardware showed (d=40 40 40 z=40).
+ *
+ * The correct sequence is: clear ASE, wait for USBSTS.AS to follow it down, only then
+ * publish the new list, then set ASE and wait for AS to come back up. */
+#define USBSTS_AS        0x00008000u   /* Async Schedule Status (follows ASE) */
+
+static void async_stop(void)
+{
+    EHCI_USBCMD = EHCI_USBCMD & ~USBCMD_ASE;
+    for (int i = 0; i < 50 && (EHCI_USBSTS & USBSTS_AS); i++) {
+        hc_delay_ms(1);
+    }
+    EHCI_USBSTS = EHCI_USBSTS;      /* clear the write-1-to-clear status bits */
+}
+
+static void async_start(uint32_t list)
+{
+    EHCI_ASYNCLB = list;
+    EHCI_USBCMD  = EHCI_USBCMD | USBCMD_RS | USBCMD_ASE;
+    for (int i = 0; i < 50 && !(EHCI_USBSTS & USBSTS_AS); i++) {
+        hc_delay_ms(1);
+    }
 }
 
 /* Spin until a qTD's Active bit clears, or a bounded budget elapses. Returns 1
@@ -234,6 +288,8 @@ static int qtd_wait(volatile uint32_t *td, int budget) {
 static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
                      uint16_t wValue, uint16_t wIndex, uint16_t wLength) {
     int dir_in = (bmRequestType & 0x80) != 0;
+    /* Detach the schedule BEFORE touching the QH the controller may be caching. */
+    async_stop();
     /* Build the 8-byte SETUP packet (USB fields are little-endian). */
     g_setup[0] = bmRequestType;
     g_setup[1] = bRequest;
@@ -282,8 +338,7 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
     g_qh[6] = 0;                            /* overlay: token (idle)          */
     for (int i = 7; i < 12; i++) g_qh[i] = 0;
 
-    EHCI_ASYNCLB = pa(g_qh);
-    EHCI_USBCMD  = USBCMD_RS | USBCMD_ASE;
+    async_start(pa(g_qh));
 
     /* Wait for the status stage to retire (whole transfer complete). */
     if (!qtd_wait(tk, 2000000)) {
@@ -302,6 +357,7 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
  * endpoint NAKed (no key change) within the budget. */
 static int int_in_poll(uint8_t *out, int budget) {
     volatile uint32_t *td = g_td_p[0];
+    async_stop();
     td[0] = QTD_T;
     td[1] = QTD_T;
     td[2] = QTD_ACTIVE | QTD_PID_IN | QTD_CERR | QTD_BYTES(8) |
@@ -319,8 +375,7 @@ static int int_in_poll(uint8_t *out, int budget) {
     g_qh[6] = 0;
     for (int i = 7; i < 12; i++) g_qh[i] = 0;
 
-    EHCI_ASYNCLB = pa(g_qh);
-    EHCI_USBCMD  = USBCMD_RS | USBCMD_ASE;
+    async_start(pa(g_qh));
 
     if (!qtd_wait(td, budget)) {
         td[2] = 0;                 /* cancel the pending qTD (NAK / no key) */
@@ -357,25 +412,6 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
     case 0x37: return shift ? '>' : '.';
     case 0x38: return shift ? '?' : '/';
     default:   return 0;
-    }
-}
-
-/* Real-time delay, in milliseconds. The CPU clock is unknown, so spin-count delays
- * are guesswork; FRINDEX is a hardware timebase that ticks once per 125us microframe
- * (8 ticks per 1ms frame) whenever the controller is running, so derive the delay
- * from it. If FRINDEX is not advancing -- the controller is halted, or it counts
- * whole frames on this core -- the iteration guard still bounds the wait. The guard
- * is sized from measured hardware behaviour: ~2.7M spin iterations elapsed while
- * FRINDEX advanced 3352 counts, i.e. roughly 6.5 iterations per microsecond. */
-static void hc_delay_ms(int ms)
-{
-    uint32_t f0 = OPREG(0x0C) & 0x3FFFu;
-    long guard = (long)ms * 20000L;          /* ~3x the expected time, as a backstop */
-    for (long i = 0; i < guard; i++) {
-        uint32_t d = (OPREG(0x0C) - f0) & 0x3FFFu;
-        if ((int)(d >> 3) >= ms) {
-            return;
-        }
     }
 }
 
@@ -422,7 +458,16 @@ int usb_kbd_bringup(void) {
      * device is on the wire) but PP=0 and CCS=0 -- the port was never powered, so
      * the connect could not latch. Set PP and give VBUS time to come up. */
     EHCI_PORTSC0 = EHCI_PORTSC0 | PORTSC_PP;
-    for (volatile int i = 0; i < 600000; i++) { }
+    /* USB 2.0 timing after applying VBUS: a port must settle for >=100ms before a
+     * connect means anything, and the connection must then be debounced for 100ms
+     * (TATTDB) before reset. A cheap HID also needs that long just to boot its own
+     * microcontroller. The old 600000-iteration wait was ~90ms in total, i.e. we were
+     * resetting the port while the keyboard was still powering up. */
+    hc_delay_ms(150);
+    for (int i = 0; i < 100 && !(EHCI_PORTSC0 & PORTSC_CCS); i++) {
+        hc_delay_ms(10);            /* up to 1s for the connect to appear */
+    }
+    hc_delay_ms(120);               /* attach debounce */
 
 
     /* Take the device speed from the line-status field rather than assuming
@@ -514,6 +559,18 @@ int usb_kbd_bringup(void) {
         g_tt_mode = TT_MODE_PORT1;
         ctrl_xfer(0x00, REQ_SET_ADDRESS, 0, 0, 0);
         g_dbg_dv[3] = g_td_p[2][2];
+        /* CONTROL EXPERIMENT. Address 7 cannot exist -- no address has been assigned
+         * yet, so nothing on the wire will answer. A working bus MUST fail differently
+         * here: three attempts, CERR counted down to 0, XactErr (bit 3) set, i.e. 0x48
+         * or 0x68. If this returns the SAME bare Halted 0x40 as every real request,
+         * then 0x40 is not the device stalling us -- the controller is halting the
+         * queue by itself and every protocol theory is void. This is the one reading
+         * that separates "the keyboard refuses us" from "we never reached the wire". */
+        g_dev_addr = 7;
+        ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 8);
+        g_dbg_nodev = g_td_p[0][2];   /* SETUP token: no device should even ACK it */
+        g_dev_addr = 0;
+        g_dbg_portsc = EHCI_PORTSC0;  /* is the port still connected+enabled by now? */
         g_failstep = 3; return 0;
     }
     /* Adopt the device's real endpoint-0 packet size for every later transfer. */

@@ -198,6 +198,7 @@ static void dma_view_init(void)
 static uint8_t g_dev_addr;     /* address we assigned to the keyboard */
 static uint8_t g_int_toggle;   /* interrupt-IN data toggle            */
 static uint8_t g_ready;        /* enumeration succeeded               */
+int usb_kbd_is_ready(void) { return g_ready; }
 
 /* Physical address for the controller. Accepts either a cached (0x4xxxxxxx) or a
  * bypass-alias (0xCxxxxxxx) pointer and always yields the DRAM physical address. */

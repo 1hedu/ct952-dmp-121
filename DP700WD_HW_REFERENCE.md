@@ -7943,3 +7943,26 @@ firmware's menu code), so the fix is confirmed on the frame.
 Note: with the firmware's interrupts masked and PROC2 halted, the app is now closer to
 sole owner of the machine -- a cleaner base for anything that was fighting the firmware
 for the display or input.
+
+### 10.53 The crosstalk was UART, not the framebuffer: gate UART stdin off
+
+10.52's quiesce (PROC2 halt + interrupt mask) did NOT stop the crosstalk -- the frame
+showed the firmware's language-select menu (CUSTOM, CLOCK, FRENCH, GERMAN, ITALIAN,
+POLISH, SPANISH, PORTUGUESE, DUTCH, COPYRIGHT, with `%d` placeholders) as a `SyntaxError`,
+and crucially the user's own keystrokes never appeared -- mashing the keyboard typed
+nothing. That rules out a framebuffer write and points at STDIN: the still-running firmware
+floods UART1 with its debug/menu strings, and `mp_hal_stdin_rx_chr` read UART1 RX as a
+second input source. Every ~12ms keyboard poll was followed by grabbing a queued UART
+byte, so the firmware's flood was fed straight into readline (painting the garbage and
+raising SyntaxError) while the keyboard's characters were lost between polls. It surfaced
+"after Enter" because readline accumulates the line silently and only submits/echoes the
+whole garbage line on Enter, then immediately re-reads the ongoing flood.
+
+Fix: read UART1 RX for stdin ONLY when no USB keyboard is present. With a keyboard attached
+the UART is pure firmware noise on this board, so it is ignored and the keyboard is the
+sole input; without a keyboard it remains the fallback console. One flag
+(`usb_kbd_is_ready`) gates it.
+
+This is the actual cure for the "OS crosstalk"; 10.52's PROC2 halt + interrupt mask are
+kept (harmless, and they close the direct-framebuffer path) but were not what was feeding
+the garbage -- it came in through the serial input the whole time.

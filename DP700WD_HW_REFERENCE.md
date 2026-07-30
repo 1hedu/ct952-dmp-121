@@ -6768,3 +6768,24 @@ Still open: the mechanism of the 157-line duplication, and the ~139-line shear
 limit. `LB_CR1` high = 48 and `LB_CR2` = 720 are the remaining line-buffer knobs and
 the natural place to look next, since a line-buffer limit is the most plausible
 cause of a hard vertical cutoff.
+
+**RETRACTION: the LB_CR1 explanation of the 292 pitch is FALSIFIED.** Clearing
+LB_CR1's low field (16 -> 0) predicted the effective pitch would become 308. On
+hardware the legible number was still **"292"**, so the pitch did NOT follow
+LB_CR1. `308 - 16 = 292` was a coincidence. The pitch stays an EMPIRICAL constant;
+do not present it as derived.
+
+One caveat this test does not separate, and it should be closed cheaply rather than
+assumed: the run proves "pitch unchanged after writing LB_CR1", which is consistent
+with either (a) LB_CR1 not affecting the pitch, or (b) the write to LB_CR1 not
+sticking at all (write-protected, shadowed, or re-driven by the DISP block). The
+disambiguation is a one-line READBACK of LB_CR1 after writing it -- cheap enough to
+ride along with any future on-frame script rather than costing its own flash.
+
+So the 292-vs-308 gap remains unexplained. What IS excluded so far: horizontal
+scaling (HU/HD unity, enables clear), OSD upscaling (VCR25 = 0), and now LB_CR1's
+low field. Remaining candidates: H_REQ (0x1A08, = 180 DRAM accesses per line),
+REDUNDANT (0x1A18, = 8), LB_CR1's HIGH field (48), LB_CR2 (720), or a fixed
+hardware offset between the OSD read channel's fetch width (VCR22 low = 77 units =
+308 B) and its line advance (measured 292 B = 73 units -- exactly 4 units less,
+which may itself be the clue).

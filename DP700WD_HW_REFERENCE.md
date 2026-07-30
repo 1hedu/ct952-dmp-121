@@ -7048,3 +7048,48 @@ reports `CLK=` and `RST=` (0x80000324) so a failure stays diagnosable.
 Useful general rule for this platform: **anything an AP wants to use, other than the
 six blocks in that keep-list, must be brought out of reset first.** That applies to
 any future peripheral work (card reader, IR, audio), not just USB.
+
+### 10.33 Port power (PP) was off -- and the keyboard's own LEDs proved it
+
+With the reset released, the frame reported:
+```
+    CAP =01000040    -> USB block ALIVE (reset release worked)
+    MODE=00000003    -> USBMODE.CM = 3, HOST mode (worked)
+    PORTSC=1C000400  -> LS=01, PP=0, CCS=0
+```
+Decoding PORTSC:
+
+| field | value | meaning |
+|---|---|---|
+| LS (11:10) | **01** | a **LOW-SPEED** device is on the wire -- the keyboard |
+| **PP (12)** | **0** | **PORT POWER OFF** -- no VBUS |
+| CCS (0) | 0 | connect never latched (it cannot, with no VBUS) |
+| PSPD (27:26) | 3 | |
+| PTS (30:28) | 1 | |
+
+Independently corroborated by the owner: **"the keyboard never lit up"** -- its LEDs
+never came on, i.e. it was never powered. A register bit and a physical observation
+agreeing is as solid as diagnosis gets here. (The USB3 hub *did* light up, which is
+unsurprising: hubs commonly have their own supply or signal presence differently.)
+
+Two fixes, both following from that:
+1. **Set PP (bit 12)** and allow VBUS to rise before sampling CCS. Also do not bail
+   out on `CCS == 0` while the line-status field is non-zero -- a low-speed device
+   shows a valid line state before the connect latches; only give up if the wire is
+   idle.
+2. **Take the endpoint speed from the port instead of assuming high-speed.** The
+   queue head hardcoded `QH_EPS_HS`, so every transfer addressed a speed the keyboard
+   does not run at. It is now derived from line status (01 -> `QH_EPS_LS`, 10 -> FS),
+   with the QH **C bit** set for a low/full-speed control endpoint and MPS0 = 8
+   rather than 64 (low-speed control endpoints are 8 bytes).
+
+Cumulative picture -- four independent layers each masked the next, which is why no
+single fix ever helped:
+```
+    block held in RESET      -> registers read 0
+    controller in DEVICE mode-> port never reports
+    PORT POWER off           -> device unpowered, CCS cannot latch
+    wrong endpoint SPEED     -> transfers target the wrong speed
+```
+plus the register map itself having been 0x30 off (10.31). The emulator could not have
+surfaced any of the last three: its model has no PP, no VBUS and no device speed.

@@ -55,6 +55,7 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
 #define USBCMD_HCRESET   0x00000002u   /* Host Controller Reset   */
 #define USBCMD_ASE       0x00000020u   /* Async Schedule Enable   */
 
+#define PORTSC_PP        0x00001000u   /* port power                          */
 #define PORTSC_CCS       0x00000001u   /* Current Connect Status  */
 #define PORTSC_CSC       0x00000002u   /* Connect Status Change   */
 #define PORTSC_PED       0x00000004u   /* Port Enabled            */
@@ -72,7 +73,15 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
 #define QTD_BYTES(n)     (((uint32_t)(n) & 0x7FFF) << 16)
 
 /* ---- QH endpoint-characteristics bits (word 1) ------------------------------ */
+#define QH_EPS_FS        (0u << 12)    /* full-speed endpoint                 */
+#define QH_EPS_LS        (1u << 12)    /* LOW-speed endpoint                  */
 #define QH_EPS_HS        (2u << 12)    /* high-speed endpoint                 */
+#define QH_C             (1u << 27)    /* control endpoint (set for LS/FS)    */
+/* Endpoint speed actually detected on the port, filled in during bringup. A USB
+ * keyboard is LOW-speed, so hardcoding QH_EPS_HS made every transfer target a
+ * speed the device does not run at. */
+static uint32_t g_eps = QH_EPS_HS;
+static uint32_t g_isls = 0;
 #define QH_DTC           (1u << 14)    /* take data toggle from the qTD       */
 #define QH_H             (1u << 15)    /* head of reclamation list            */
 #define QH_MPS(n)        (((uint32_t)(n) & 0x7FF) << 16)
@@ -155,7 +164,10 @@ static int ctrl_xfer(uint8_t bmRequestType, uint8_t bRequest,
 
     /* Queue Head: single-element async ring (points at itself, H set). */
     g_qh[0] = pa(g_qh) | (1u << 1);        /* horizontal link, Typ=QH(01)   */
-    g_qh[1] = (uint32_t)g_dev_addr | QH_EPS_HS | QH_DTC | QH_H | QH_MPS(64);
+    /* control endpoint: speed from the port, and the C bit is required for a
+     * low/full-speed control endpoint on this core */
+    g_qh[1] = (uint32_t)g_dev_addr | g_eps | QH_DTC | QH_H | QH_MPS(g_isls ? 8 : 64)
+              | (g_isls ? QH_C : 0u);
     g_qh[2] = QH_MULT1;
     g_qh[3] = 0;                            /* current qTD                    */
     g_qh[4] = pa(ts);                       /* overlay: next qTD -> SETUP     */
@@ -192,7 +204,7 @@ static int int_in_poll(uint8_t *out, int budget) {
 
     g_qh[0] = pa(g_qh) | (1u << 1);
     g_qh[1] = (uint32_t)g_dev_addr | (1u << 8) /* ep 1 */ |
-              QH_EPS_HS | QH_DTC | QH_H | QH_MPS(8);
+              g_eps | QH_DTC | QH_H | QH_MPS(8);
     g_qh[2] = QH_MULT1;
     g_qh[3] = 0;
     g_qh[4] = pa(td);
@@ -275,10 +287,29 @@ int usb_kbd_bringup(void) {
      * EHCI alone cannot talk to a low- or full-speed device -- it needs either a
      * companion (OHCI/UHCI) or a high-speed hub's transaction translator -- and
      * virtually every USB keyboard, including a Gearhead KB1500U, is low-speed. */
+    /* PORT POWER. Hardware showed PORTSC=1C000400: line status 01 (a LOW-SPEED
+     * device is on the wire) but PP=0 and CCS=0 -- the port was never powered, so
+     * the connect could not latch. Set PP and give VBUS time to come up. */
+    EHCI_PORTSC0 = EHCI_PORTSC0 | PORTSC_PP;
+    for (volatile int i = 0; i < 600000; i++) { }
     mp_printf(&mp_plat_print, "usb1 PORTSC=%08x\n", (unsigned)EHCI_PORTSC0);
+
+    /* Take the device speed from the line-status field rather than assuming
+     * high-speed: 01 = low-speed, 10 = full-speed. */
+    {
+        uint32_t ls = (EHCI_PORTSC0 >> 10) & 3u;
+        g_isls = (ls == 1u);
+        g_eps  = g_isls ? QH_EPS_LS : QH_EPS_HS;
+    }
     if (!(EHCI_PORTSC0 & PORTSC_CCS)) {
-        mp_printf(&mp_plat_print, "usb FAIL: no CCS (nothing connected)\n");
-        return 0;
+        /* A low-speed device may show a valid line state before CCS latches; only
+         * give up if the wire is idle too. */
+        if (((EHCI_PORTSC0 >> 10) & 3u) == 0u) {
+            mp_printf(&mp_plat_print, "usb FAIL: no CCS, idle line\n");
+            return 0;
+        }
+        mp_printf(&mp_plat_print, "usb: no CCS but LS=%d, continuing\n",
+                  (int)((EHCI_PORTSC0 >> 10) & 3u));
     }
     /* Clear the connect-change latch, then reset the port. */
     EHCI_PORTSC0 = (EHCI_PORTSC0 & ~PORTSC_PED) | PORTSC_CSC;

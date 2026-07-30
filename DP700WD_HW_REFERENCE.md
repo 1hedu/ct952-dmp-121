@@ -7916,3 +7916,30 @@ word-swap delivers it correctly. Caps Lock also inverts letter case (shift XOR c
 Verified in the (now DMA-faithful) emulator: enumeration completes through the LED
 SET_REPORT without hanging and typing still evaluates. Arrow/LED behaviour itself is
 hardware-confirmed, since the emulator's key feed is ASCII-only.
+
+### 10.52 Quiesce the stock firmware to stop OSD crosstalk
+
+The REPL occasionally showed DVD language-menu strings (FRENCH, ...) painted over the
+console -- "crosstalk from the OS". The AP coexists with the still-running stock firmware,
+which has two ways to touch the OSD plane underneath us:
+
+1. **The second processor (PROC2).** The CT952 is dual-core; our AP runs on the main core
+   (PROC1) while PROC2 keeps running firmware that can write the OSD independently.
+2. **Firmware interrupt handlers on our own core** -- a timer/menu ISR redrawing the OSD.
+
+Both are shut down at the very start of `pyapp_main`, because the REPL needs neither (it
+polls USB and UART, and the OSD scans out from the framebuffer in hardware):
+
+* Halt PROC2 by asserting its reset: `REG_PLAT_RESET_CONTROL_ENABLE (0x80000324) = 0x1`
+  (PLAT_RESET_PROC2_ENABLE). The emulator models this as `proc2_halt`.
+* Mask this core's interrupts by raising `PSR.PIL` to 15 via `rd/wr %psr`. Only PIL is
+  changed; ET and S are preserved so the register-window overflow/underflow traps the C
+  runtime depends on keep working.
+
+Verified in the emulator that the quiesce does not break boot, USB enumeration or the
+REPL (`9*9` -> `81`). The crosstalk itself is hardware-only (the emulator does not run the
+firmware's menu code), so the fix is confirmed on the frame.
+
+Note: with the firmware's interrupts masked and PROC2 halted, the app is now closer to
+sole owner of the machine -- a cleaner base for anything that was fighting the firmware
+for the display or input.

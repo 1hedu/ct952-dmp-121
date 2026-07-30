@@ -108,6 +108,24 @@ int pyapp_main(void) {
      * emulator has no watchdog on this path, which is why it never showed up. */
     ct952_watchdog_off();
 
+    /* Silence the stock firmware so it cannot repaint the OSD underneath us -- the
+     * "crosstalk" where DVD language-menu strings (FRENCH, ...) flashed onto the REPL.
+     * There are two independent sources and we shut down both, because we need neither:
+     * the REPL polls USB and UART, and the OSD scans out from the framebuffer in hardware.
+     *   1. The SECOND PROCESSOR (PROC2) still running firmware -- halt it by asserting its
+     *      reset (REG_PLAT_RESET_CONTROL_ENABLE 0x80000324, PLAT_RESET_PROC2_ENABLE bit 0).
+     *      Our AP runs on the main core (PROC1), so this stops the other core only.
+     *   2. Firmware interrupt handlers on THIS core -- mask them by raising the SPARC PSR
+     *      interrupt level to 15. Only PIL is touched; ET/S are preserved so the register
+     *      window overflow/underflow traps the C code depends on keep working. */
+    *(volatile uint32_t *)0x80000324u = 0x00000001u;   /* halt PROC2 */
+    {
+        uint32_t psr;
+        __asm__ volatile ("rd %%psr, %0" : "=r"(psr));
+        psr |= 0x00000F00u;                            /* PSR.PIL = 15 */
+        __asm__ volatile ("wr %0, 0, %%psr; nop; nop; nop" :: "r"(psr));
+    }
+
     mp_hal_stdout_tx_strn("\n[pyapp] MicroPython launched inside the firmware\n", 49);
 
     #if MICROPY_ENABLE_GC

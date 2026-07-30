@@ -7890,3 +7890,29 @@ keyboard (`VID=ceeb PID=0952`, `configured, polling ep 0x81`) and the REPL evalu
 line typed through it. The USB path is emulator-validated again, and the emulator now
 exercises the same byte-order compensation the hardware requires -- so a regression in
 that compensation would show up in the emulator instead of only on a flash.
+
+### 10.51 REPL polish: arrow keys, history, and lock LEDs
+
+Three usability features on the keyboard driver, all confirmed against the readline build.
+
+**Arrow keys + history + line nav.** MicroPython's readline parses VT100 escape sequences
+from stdin, and its handling of `ESC [ A/B/C/D`, `ESC [ H/F`, and `ESC [ 3~` is NOT gated
+by MICROPY_REPL_EMACS_KEYS (that flag only adds Ctrl-key aliases) -- so Up/Down history,
+Left/Right cursor, Home/End and Delete all work at ROM_LEVEL_MINIMUM as long as the
+keyboard emits the sequences, and the history ring (size 8) is already present. The driver
+now translates the navigation HID usages into those sequences: Up 0x52 -> `ESC[A`, Down
+0x51 -> `ESC[B`, Right 0x4F -> `ESC[C`, Left 0x50 -> `ESC[D`, Home 0x4A -> `ESC[H`, End
+0x4D -> `ESC[F`, Delete 0x4C -> `ESC[3~`. The queue-based key path (10.??) makes multi-byte
+emission trivial. No firmware config change was needed.
+
+**Lock LEDs.** Per keyboard_spec_MI00.md §4 the keyboard has no OUT endpoint, so the LED
+report goes over the control pipe: SET_REPORT (bmRequestType 0x21, bRequest 0x09, wValue
+0x0200 Output report, wIndex 0 interface, one data byte, bit0 Num / bit1 Caps / bit2
+Scroll). Pressing Caps/Num/Scroll Lock (usages 0x39/0x53/0x47) toggles the state and issues
+the SET_REPORT; the LED byte is byte-swapped like every other data buffer so the DMA
+word-swap delivers it correctly. Caps Lock also inverts letter case (shift XOR caps).
+`usb_kbd.leds(mask)` exposes it to Python. LEDs are initialised off at the end of bringup.
+
+Verified in the (now DMA-faithful) emulator: enumeration completes through the LED
+SET_REPORT without hanging and typing still evaluates. Arrow/LED behaviour itself is
+hardware-confirmed, since the emulator's key feed is ASCII-only.

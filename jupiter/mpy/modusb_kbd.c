@@ -449,16 +449,22 @@ static int int_in_poll(uint8_t *out, int ms) {
     return 1;
 }
 
+/* Keyboard LED / lock state, bit0 Num, bit1 Caps, bit2 Scroll (matches the HID LED
+ * report and the SET_REPORT payload in keyboard_spec_MI00.md §4). */
+static uint8_t g_leds;
+void usb_kbd_set_leds(uint8_t leds);   /* fwd: control-OUT SET_REPORT, defined below */
+
 /* ---- HID usage -> ASCII (US layout) ----------------------------------------- */
 static char usage_to_ascii(uint8_t mod, uint8_t u) {
     int shift = (mod & 0x22) != 0;   /* left/right shift */
     int ctrl  = (mod & 0x11) != 0;   /* left/right ctrl  */
+    int caps  = (g_leds & 0x02) != 0;
     if (u >= 0x04 && u <= 0x1D) {    /* a..z */
         if (ctrl) {
             return (char)(u - 0x04 + 1);  /* Ctrl-A..Ctrl-Z -> 0x01..0x1A */
         }
         char c = (char)('a' + (u - 0x04));
-        return shift ? (char)(c - 32) : c;
+        return (shift ^ caps) ? (char)(c - 32) : c;  /* caps lock inverts letter case */
     }
     if (u >= 0x1E && u <= 0x26) {    /* 1..9 */
         static const char *s = "!@#$%^&*(";
@@ -482,7 +488,6 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
     case 0x36: return shift ? '<' : ',';
     case 0x37: return shift ? '>' : '.';
     case 0x38: return shift ? '?' : '/';
-    case 0x4C: return 0x7F;   /* Delete Forward -> DEL */
     default:   return 0;
     }
 }
@@ -513,7 +518,31 @@ static int key_was_down(uint8_t k) {
     for (int i = 0; i < 6; i++) if (g_prev_keys[i] == k) return 1;
     return 0;
 }
-/* Turn one 8-byte report into queued characters for the keys that are newly down. */
+/* Queue everything one newly-pressed usage produces. Lock keys toggle their LED and
+ * emit nothing; navigation keys emit the VT100 escape sequences MicroPython's readline
+ * understands (arrows = history / cursor move, Home/End/Delete); everything else emits
+ * its ASCII byte. */
+static void kbd_emit(uint8_t mod, uint8_t u) {
+    switch (u) {
+    case 0x39: g_leds ^= 0x02; usb_kbd_set_leds(g_leds); return;   /* Caps Lock   */
+    case 0x53: g_leds ^= 0x01; usb_kbd_set_leds(g_leds); return;   /* Num Lock    */
+    case 0x47: g_leds ^= 0x04; usb_kbd_set_leds(g_leds); return;   /* Scroll Lock */
+    }
+    const char *seq = 0;
+    switch (u) {
+    case 0x52: seq = "\x1b[A"; break;   /* Up    -> history back    */
+    case 0x51: seq = "\x1b[B"; break;   /* Down  -> history forward */
+    case 0x4F: seq = "\x1b[C"; break;   /* Right -> cursor right    */
+    case 0x50: seq = "\x1b[D"; break;   /* Left  -> cursor left     */
+    case 0x4A: seq = "\x1b[H"; break;   /* Home                     */
+    case 0x4D: seq = "\x1b[F"; break;   /* End                      */
+    case 0x4C: seq = "\x1b[3~"; break;  /* Delete Forward           */
+    }
+    if (seq) { while (*seq) keyq_push(*seq++); return; }
+    char c = usage_to_ascii(mod, u);
+    if (c) keyq_push(c);
+}
+/* Turn one 8-byte report into queued input for the keys that are newly down. */
 static void process_report(const uint8_t *rep) {
     const uint8_t *cur = rep + 2;     /* the six key slots */
     /* ErrorRollOver: all six slots 0x01 -> discard, it is not six keypresses. */
@@ -524,8 +553,7 @@ static void process_report(const uint8_t *rep) {
         uint8_t k = cur[i];
         if (k == 0 || k >= 0xE0) continue;   /* empty slot / modifier usage */
         if (!key_was_down(k)) {              /* newly pressed this report */
-            char c = usage_to_ascii(rep[0], k);
-            if (c) keyq_push(c);
+            kbd_emit(rep[0], k);
         }
     }
     for (int i = 0; i < 6; i++) g_prev_keys[i] = cur[i];
@@ -540,6 +568,20 @@ static int kbd_next_char(int poll_ms) {
     return keyq_pop();
 }
 
+/* Set the keyboard LEDs (bit0 Num, bit1 Caps, bit2 Scroll) via a control-OUT
+ * SET_REPORT on endpoint 0, per keyboard_spec_MI00.md §4: there is no OUT endpoint, so
+ * this MUST go over the control pipe. bmRequestType 0x21, SET_REPORT (0x09), wValue
+ * 0x0200 (Output report, id 0), wIndex 0 (interface), one data byte. The byte is placed
+ * in g_data and byte-swapped so the SoC's hardware DMA word-swap delivers it right (same
+ * compensation as every other data buffer). */
+void usb_kbd_set_leds(uint8_t leds) {
+    if (!g_ready) return;
+    g_data[0] = (uint8_t)(leds & 0x07);
+    g_data[1] = g_data[2] = g_data[3] = 0;
+    bswap32_buf(g_data, 4);
+    ctrl_xfer(0x21, 0x09, 0x0200, 0x0000, 1);
+}
+
 /* Reset the controller + root-hub port, enumerate and configure the keyboard.
  * Returns 1 on success, 0 if no device / enumeration failed. Plain C so both
  * the Python module and the C REPL stdin path can call it. */
@@ -547,6 +589,7 @@ int usb_kbd_bringup(void) {
     g_ready = 0; g_dev_addr = 0; g_int_toggle = 0; g_failstep = 0;
     for (int i = 0; i < 6; i++) g_prev_keys[i] = 0;   /* reset edge-detect state */
     g_keyq_head = g_keyq_tail = 0;
+    g_leds = 0;
     dma_view_init();   /* uncached views before any DMA structure is touched */
 
     /* Controller reset, then take ownership of all ports and run. */
@@ -689,6 +732,7 @@ int usb_kbd_bringup(void) {
     ctrl_xfer(0x21, HID_SET_IDLE, 0, 0, 0);
 
     g_ready = 1;
+    usb_kbd_set_leds(0);   /* known LED state (all off) now that EP0 is usable */
     mp_printf(&mp_plat_print, "usb_kbd: configured, polling ep 0x81\n");
     return 1;
 }
@@ -746,11 +790,24 @@ static mp_obj_t usb_kbd_getchar(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(usb_kbd_getchar_obj, usb_kbd_getchar);
 
+/* usb_kbd.leds(mask) -- set the lock LEDs directly (bit0 Num, bit1 Caps, bit2 Scroll).
+ * Also updates the internal lock state so Caps affects letter case consistently. */
+static mp_obj_t usb_kbd_leds(mp_obj_t mask_obj) {
+    if (!g_ready) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("usb_kbd not initialised"));
+    }
+    g_leds = (uint8_t)(mp_obj_get_int(mask_obj) & 0x07);
+    usb_kbd_set_leds(g_leds);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(usb_kbd_leds_obj, usb_kbd_leds);
+
 static const mp_rom_map_elem_t usb_kbd_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_usb_kbd) },
     { MP_ROM_QSTR(MP_QSTR_init),    MP_ROM_PTR(&usb_kbd_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_poll),    MP_ROM_PTR(&usb_kbd_poll_obj) },
     { MP_ROM_QSTR(MP_QSTR_getchar), MP_ROM_PTR(&usb_kbd_getchar_obj) },
+    { MP_ROM_QSTR(MP_QSTR_leds),    MP_ROM_PTR(&usb_kbd_leds_obj) },
 };
 static MP_DEFINE_CONST_DICT(usb_kbd_module_globals, usb_kbd_module_globals_table);
 

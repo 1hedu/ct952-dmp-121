@@ -7011,3 +7011,40 @@ HID enumerated, `>>> print(6*7)` -> `42`, `PORTSC=00000005`, `CAP=01000040`.
 Method note: the winning move was reading three register addresses out of the
 firmware's own instruction stream and asking which single documented layout explains
 all three -- not probing candidate bases.
+
+### 10.32 THE actual reason USB is dead in an AP: the loader holds it in RESET
+
+With the corrected ChipIdea register map the frame reported **all zeros** -- `CAP=0`,
+`PORTSC=0`, `MODE=0`. A capability register reading 0 is not "empty port", it is
+"block not present", i.e. unclocked or held in reset.
+
+**Source-proven cause.** `aploader.c:471-473`, immediately before jumping to the AP:
+```c
+    REG_PLAT_RESET_CONTROL_ENABLE = (INT_SET_ALL &
+        (~(PLAT_RESET_DSU1_ENABLE | PLAT_RESET_TIMER_ENABLE | PLAT_RESET_SERVO_ENABLE |
+           PLAT_RESET_VOU_ENABLE  | PLAT_RESET_VOU2_ENABLE  | PLAT_RESET_PROM_ENABLE)));
+```
+It **asserts reset on every block except six**: DSU1, TIMER, SERVO, VOU, VOU2, PROM.
+USB is not among them, so an AP inherits the USB controller **in reset** -- hence the
+all-zero register block. The same line explains why the display keeps working
+throughout this project: **VOU and VOU2 are in the keep-list.** (The commented-out
+line just above it, `// REG_PLAT_RESET_CONTROL_ENABLE = (PLAT_RESET_USB_ENABLE|
+PLAT_RESET_USBCLKCKT_ENABLE);`, shows the author was explicitly thinking about
+resetting USB here.)
+
+**Release sequence** (the firmware's own idiom is to write the matching `*_DISABLE`
+bit to RESET_CONTROL_DISABLE -- input.c:1008-1009, gdi.c:3186-3187,
+hsystem.c:251-254):
+```
+    0x80000304 (RESET_CONTROL_DISABLE) = 0x0C000000
+              /* PLAT_RESET_USB_DISABLE 0x04000000 | USBCLKCKT_DISABLE 0x08000000 */
+    delay
+    0x80000300 (CLK_GENERATOR_CONTROL) &= ~0x01800000   /* ungate UCLK48M + HCLK */
+    delay, then USBMODE.CM = 3 (host), then the standard EHCI init
+```
+The AP now does reset-release, then clock-ungate, then host mode, then init -- and
+reports `CLK=` and `RST=` (0x80000324) so a failure stays diagnosable.
+
+Useful general rule for this platform: **anything an AP wants to use, other than the
+six blocks in that keep-list, must be brought out of reset first.** That applies to
+any future peripheral work (card reader, IR, audio), not just USB.

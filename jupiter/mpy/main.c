@@ -182,7 +182,24 @@ int pyapp_main(void) {
      * Clearing the two bits is the documented inverse of HAL_POWER_NORMAL, and is
      * harmless if they were already clear. */
     {
-        volatile uint32_t *clkgen = (volatile uint32_t *)0x80000300u;
+        volatile uint32_t *clkgen  = (volatile uint32_t *)0x80000300u; /* CLK_GENERATOR_CONTROL */
+        volatile uint32_t *rst_dis = (volatile uint32_t *)0x80000304u; /* RESET_CONTROL_DISABLE */
+
+        /* RELEASE USB FROM RESET -- this is why the whole USB register block read
+         * back as zeros on hardware. aploader.c:471-473, immediately before jumping
+         * to the AP, does:
+         *     REG_PLAT_RESET_CONTROL_ENABLE = INT_SET_ALL & ~(DSU1|TIMER|SERVO|
+         *                                                     VOU|VOU2|PROM)
+         * i.e. it ASSERTS reset on every block except those six. USB is not among
+         * them, so the controller is held in reset and reads 0 (that is also why the
+         * display keeps working: VOU/VOU2 ARE in the keep-list).
+         * The firmware's own idiom for bringing a block back is to write the
+         * matching *_DISABLE bit to RESET_CONTROL_DISABLE (see input.c:1008-1009,
+         * gdi.c:3186-3187, hsystem.c:251-254). */
+        *rst_dis = 0x0C000000u;   /* PLAT_RESET_USB_DISABLE | USBCLKCKT_DISABLE */
+        for (volatile int i = 0; i < 100000; i++) { }
+
+        /* then ungate the USB clocks (HAL_POWER_SAVE gated them, hsystem.c:562+) */
         *clkgen = *clkgen & ~0x01800000u;               /* UCLK48M + HCLK for USB */
         for (volatile int i = 0; i < 400000; i++) { }   /* let the clocks/PHY settle */
     }
@@ -225,7 +242,8 @@ int pyapp_main(void) {
             * 0x30-too-low EHCI guesses that made PORTSC read as 0. */
            "p=ct952.peek32(0xA0000184)\n"
            "print('PORTSC=' + h(0xA0000184) + ' LS=' + str((p>>10)&3))\n"
-           "print('CAP=' + h(0xA0000100) + ' MODE=' + h(0xA00001A8))\n",
+           "print('CAP=' + h(0xA0000100) + ' MODE=' + h(0xA00001A8))\n"
+           "print('CLK=' + h(0x80000300) + ' RST=' + h(0x80000324))\n",
            MP_PARSE_FILE_INPUT);
     for (;;) {
         if (pyexec_friendly_repl() != 0) break;

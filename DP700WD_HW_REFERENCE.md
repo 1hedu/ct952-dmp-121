@@ -7554,3 +7554,61 @@ TTCTRL readback — so we can see whether TTHA actually stuck, replacing the `f=
 has served its purpose.
 
 Emulator: still enumerates and the REPL evaluated `8*5+2` from the modelled keyboard.
+
+### 10.42 The clock the firmware's USB init sets and we never did
+
+`T=7f000000` — TTHA stuck at the right register — and the result was unchanged. So the
+mis-addressed TTCTRL of 10.41 was a real bug but not the blocker either. Time to question
+the assumption every recent conclusion has rested on.
+
+**`s=00` was only ever the low byte.** A qTD's `TotalBytes` lives in bits 30:16, and it is
+the number that says whether the SETUP packet actually went out. A SETUP qTD that retires
+with `TotalBytes` still 8 transferred *nothing* — in which case the bus never carried a
+packet, the keyboard never ACKed anything, and every protocol inference drawn from "the
+device accepts SETUP but stalls IN" is void. That number was never printed. It is now:
+`A=` is the full SETUP token and `B=` the full DATA token; `A=xx00xxxx` means the eight
+bytes really went out.
+
+#### Two clock writes the stock firmware makes
+
+`USB_HCInit` is declared in the SDK header we have (`usb/Host_Device/usbwrap.h`):
+`void USB_HCInit(BYTE bUSBMode, BYTE bPort, DWORD dwUSBBufferAddr, DWORD dwSize)`. Its
+register-init half is at 0xad64c:
+
+```
+    call  0xb0174(bufaddr, size)     ; memory pool
+    stb   mode, [0x4002414c]
+    o3 = 0x80000308                  ; REG_PLAT_CLK_FREQ_CONTROL1
+    o0 = [o3];  o0 |= 0x04008000;  [o3] = o0      ; <-- bits 26 and 15
+    if (mode == 2) 0x80000320 |= 0x00200000        ; SYSTEM_CONFIGURATION2
+```
+
+and its caller finishes with `TXFILLTUNING |= 0x7f0000` after a 500 ms settle, plus
+`0x80004110 |= 4` when the mode argument is 3.
+
+`0x80000308` is `REG_PLAT_CLK_FREQ_CONTROL1` (`ctkav_platform.h:251`). Bits 26 and 15 are
+not audio dividers — `hadac.c:158` preserves exactly those in its `0xC7C08000` mask while
+rewriting the audio fields — and bit 24 is the video clock (`hsystem.c`, `MODE_CLKCTL_VIDEO`).
+So these two bits are the USB side of that register, and **we have never written it.**
+
+This matters because of who ran last. The firmware enumerates this keyboard during boot
+(the splash visibly takes longer with USB attached), but `aploader.c:134-139` calls
+`HAL_PowerControl(HAL_POWER_USB, HAL_POWER_SAVE)` **and `USB_HCExit()`** before jumping to
+the AP, so that working setup is torn down before our payload gets the CPU. We restored the
+two gate bits in `0x80000300` and released the block reset in `0x80000304`, but not this.
+
+The PHY clock itself comes from UPLL — `hsystem.c` `MODE_UPLL` programs
+`REG_PLAT_UPLL_CONTROL` (0x80000318) as `(0<<20)+(0<<18)+(1<<11)+14` with the comment
+"Fout = 288", and 288/6 = the 48 MHz a USB PHY needs. If UPLL is not running the PHY has no
+clock, which would make "transmits but never receives" moot: nothing would work, and a
+SETUP qTD could retire having sent nothing.
+
+Shipped: set `0x80000308 |= 0x04008000` exactly as the firmware does, program UPLL to the
+SDK's 288 MHz value **only if it reads back 0**, and report both as `K=` and `U=` rather
+than assuming either. The now-confirmed `S=8006000100000800` line was dropped to keep the
+decisive lines on a 7-row console.
+
+Reading it: `A=xx00xxxx` means the SETUP really transferred and the device genuinely is
+answering — the protocol reasoning stands and the fault is downstream. `A=xx08xxxx` means
+nothing was ever transmitted and 10.36-10.41's entire protocol analysis was built on a
+status byte that did not mean what it appeared to.

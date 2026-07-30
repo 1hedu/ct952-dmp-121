@@ -199,6 +199,28 @@ int pyapp_main(void) {
      * after the clocks come back (and after USB_HCExit() tore the controller down),
      * so a single attempt can lose the race even with a keyboard plugged in. Each
      * attempt does a full HCRESET, so retrying is safe. */
+    /* The clock setup the STOCK FIRMWARE's USB init does and we never did. Its
+     * USB_HCInit path (0xad64c) runs, for every mode:
+     *     REG_PLAT_CLK_FREQ_CONTROL1 (0x80000308) |= 0x04008000
+     * i.e. bits 26 and 15. Neither is an audio divider (hadac.c preserves both in its
+     * 0xC7C08000 mask) and bit 24 is the video clock, so these are the USB side. The AP
+     * loader calls USB_HCExit() before jumping to us, so whatever the firmware set up
+     * while enumerating during boot has been torn down again.
+     *
+     * The USB PHY runs off UPLL: hsystem.c MODE_UPLL programs it as
+     *     (0 << 20) + (0 << 18) + (1 << 11) + 14   -> "Fout = 288" (288/6 = 48MHz)
+     * so if UPLL reads back 0 it is not running and the PHY has no clock at all. Both
+     * values are reported below rather than assumed. */
+    {
+        volatile uint32_t *clkfreq1 = (volatile uint32_t *)0x80000308u;
+        volatile uint32_t *upll     = (volatile uint32_t *)0x80000318u;
+        *clkfreq1 = *clkfreq1 | 0x04008000u;
+        if (*upll == 0u) {
+            *upll = (0u << 20) | (0u << 18) | (1u << 11) | 14u;   /* Fout = 288MHz */
+            for (volatile int i = 0; i < 200000; i++) { }         /* let it lock */
+        }
+    }
+
     int kbd_ok = 0;
     extern int usb_kbd_failstep(void);
     extern uint32_t usb_kbd_dbg(int);
@@ -222,37 +244,32 @@ int pyapp_main(void) {
          * halted is the discriminator -- a halted SETUP means the device rejected
          * the request outright, whereas a good SETUP with a halted DATA stage means
          * it accepted the request and then refused to return the descriptor. */
-        mp_printf(&mp_plat_print, "s=%02x d=%02x k=%02x Q=%08x\n",
-                  (unsigned)(usb_kbd_dbg(0) & 0xFF), (unsigned)(usb_kbd_dbg(5) & 0xFF),
-                  (unsigned)(usb_kbd_dbg(1) & 0xFF), (unsigned)usb_kbd_dbg(4));
+        /* FULL tokens, not just the status byte. TotalBytes lives in bits 30:16, and it
+         * is the number that decides whether "the device ACKed our SETUP" was ever true:
+         * a SETUP qTD that retires with TotalBytes still 8 sent NOTHING, which would mean
+         * the bus never carried a packet and every protocol conclusion drawn from s=00 is
+         * void. A=SETUP token, B=DATA token. A=xx00xxxx means the 8 bytes went out. */
+        mp_printf(&mp_plat_print, "A=%08x B=%08x\n",
+                  (unsigned)usb_kbd_dbg(0), (unsigned)usb_kbd_dbg(5));
+        /* K = REG_PLAT_CLK_FREQ_CONTROL1, U = UPLL. If K is missing bits 26/15 the write
+         * above did not stick; if U is 0 the USB PHY has no 48MHz clock. */
+        mp_printf(&mp_plat_print, "K=%08x U=%08x\n",
+                  (unsigned)*(volatile uint32_t *)0x80000308u,
+                  (unsigned)*(volatile uint32_t *)0x80000318u);
         /* The SETUP packet as the controller actually fetched it from DMA memory. A
          * device ACKs any well-formed packet and then STALLs a request it cannot
          * parse, so garbage here produces exactly the s=00 d=40 we are chasing.
          * Expect 8006000100000800. */
         {
-            extern uint32_t usb_kbd_setupbyte(int);
             extern uint32_t usb_kbd_dv(int);
             extern uint32_t usb_kbd_nodev(void);
             extern uint32_t usb_kbd_portsc(void);
             extern uint32_t usb_kbd_barein(void);
             extern uint32_t usb_kbd_rx(void);
             extern uint32_t usb_kbd_ttctrl(void);
-            char line[24];
-            static const char hex[] = "0123456789abcdef";
-            line[0] = 'S'; line[1] = '=';
-            for (int i = 0; i < 8; i++) {
-                uint32_t b = usb_kbd_setupbyte(i);
-                line[2 + i * 2]     = hex[(b >> 4) & 0xF];
-                line[2 + i * 2 + 1] = hex[b & 0xF];
-            }
-            line[18] = '\0';
-            /* DATA-stage status per split routing (TT/port1, TT/port0, no TT) and the
-             * status stage of a zero-length SET_ADDRESS(0) probe: z=00 means the device
-             * answers a request with no data stage, so it IS in Default state and only
-             * the data phase is broken. */
-            /* DATA-stage status of all six split configurations tried, in the order
-             * TT+LS+C, TT+LS, TT+FS+C, LS+C, LS, FS+C -- anything other than 40 in a
-             * slot is the combination that got further. */
+            /* The SETUP bytes read back correct (8006000100000800) on hardware, so that
+             * line is gone; V= keeps the six-configuration sweep and R= whatever landed in
+             * the IN buffer. */
             mp_printf(&mp_plat_print, "V=%02x%02x%02x%02x%02x%02x R=%08x\n",
                       (unsigned)(usb_kbd_dv(0) & 0xFF), (unsigned)(usb_kbd_dv(1) & 0xFF),
                       (unsigned)(usb_kbd_dv(2) & 0xFF), (unsigned)(usb_kbd_dv(3) & 0xFF),

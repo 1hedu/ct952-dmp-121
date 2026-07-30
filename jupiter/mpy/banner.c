@@ -28,7 +28,7 @@
 /* Usable height is the OSD WINDOW height (OSD_SIZE height field = 78), not the
  * region capacity (24576/292 = 84): the hardware displays only 78 lines, proven by
  * the row-ruler photo (labels 0..72 visible, 80 outside the window). */
-#define ROWS     78u
+#define ROWS     56u   /* window height we program; see the shear limit below */
 #define VIS_W    480                  /* panel's visible width */
 
 #define REG_CACHE   (*(volatile uint32_t *)0x80000014u)
@@ -121,51 +121,60 @@ static void text(int x0, int y0, const char *str, uint8_t fg, int s){
     for (int i = 0; str[i]; i++) glyph(x0 + i*8*s, y0, (uint8_t)str[i], fg, s);
 }
 
-/* --- final banner: single copy, repeat pushed off-screen --------------------
- * The row-index ruler settled the repeat. The 78-line OSD window is painted TWICE
- * on the panel, 157 lines apart: with the loader's OSD_POS y=28, copy 1 lands on
- * panel lines 28..105 and copy 2 on 185..262, of which 185..233 is visible (which
- * is exactly the "bottom band 0..48" that was observed). The duplicate is NOT
- * interlace (PSCAN_EN is set), NOT a dual-field split (VCR21 == VCR20), and NOT a
- * too-tall window (the window is 616x78) -- all three were checked and ruled out
- * by reading the live registers (10.22).
+/* --- final banner: single clean copy, within the OSD's vertical limit --------
+ * Two independent hardware limits, both measured on the panel, and they conflict
+ * at the loader's window height:
  *
- * Both copies derive from the same window and so move together with OSD_POS.
- * Raising y puts copy 2 past the panel's last line (233) while copy 1 stays on
- * screen. y=95 worked for the repeat but SHEARED the window's lower rows (rows
- * 44+; the identical drawing was clean at the loader's y=28), so pushing the
- * window that far down evidently exceeds some OSD/line-buffer limit. Use the
- * MINIMUM y that still hides the duplicate instead: y=80 -> window 80..157,
- * copy 2 at 237, off-screen by 4 lines, and only 52 lines below the loader's
- * original position rather than 67.
+ *  1) THE DUPLICATE. The OSD window is painted twice, 157 panel lines apart (row
+ *     ruler, 10.23). Both copies move with OSD_POS, so hiding the second one needs
+ *     y + 157 > 233, i.e. **y >= 77**.
  *
- * The right-hand vertical bar is a built-in shear detector: it spans all 78 rows,
- * so it is straight only if the pitch holds for the whole window. If the lower
- * rows shear again, the bar shows exactly where it starts.
+ *  2) THE SHEAR LIMIT. The OSD only renders correctly ABOVE panel line ~139 --
+ *     an ABSOLUTE limit, not a window-relative one. Proof: with y=95 the shear
+ *     began at buffer row ~44 (panel 139) and with y=80 it began at row ~60
+ *     (panel 140) -- the same panel line both times. It is also why the loader's
+ *     y=28 was clean for all 78 rows: window 28..105 sits entirely above it.
+ *     So we need y + height - 1 < ~139.
  *
- * This is the ONE display register we write, and it is the narrowest possible
- * change: position only, no base/stride/size/timing, and trivially reversible
- * (the loader's value is 0x001C0066). */
-#define REG_OSD_POS (*(volatile uint32_t *)0x80001A50u)
+ * With the loader's 78-line window those cannot both hold (77+77 = 154 > 139), so
+ * the window must ALSO be made shorter. y=78 with height 56 satisfies both:
+ * window 78..133 (comfortably above the limit) and the duplicate at 235,
+ * off-screen. Cost: 56 usable rows instead of 78.
+ *
+ * At 56 rows we use 1x text (8 px) for 7 lines of 60 columns. 1x is known legible
+ * on this panel -- the row-ruler labels were read off a photo at 1x.
+ *
+ * Two register writes only, both narrow and reversible (loader values:
+ * OSD_POS = 0x001C0066, OSD_SIZE = 0x104E0268): the window's POSITION and its
+ * HEIGHT field. Base, stride, width, palette and all timing are left untouched. */
+#define REG_OSD_POS  (*(volatile uint32_t *)0x80001A50u)
+#define REG_OSD_SIZE (*(volatile uint32_t *)0x80001A54u)
 
 int pyapp_main(void){
+    uint32_t sz;
     REG_SYSCFG1 &= ~0x10000000u;               /* keep the watchdog dead */
+
+    /* shrink the window to 56 lines (preserve enable bit + width), then move it
+     * down so the duplicate falls off the bottom edge */
+    sz = REG_OSD_SIZE;
+    REG_OSD_SIZE = (sz & ~0x0FFF0000u) | (ROWS << 16);
+    REG_OSD_POS  = (78u << 16) | 102u;         /* y=78, keep the loader's x=102 */
 
     for (uint32_t i = 0; i < REGION; i++) FB[i] = 0;   /* transparent */
 
-    /* 78 usable lines: 3x title (24px) + three 2x lines (16px each). */
-    text(8,  0,  "CT952A LIVE", C_HI,  3);
-    text(8,  26, "PITCH 292  WINDOW 616X78", C_TXT, 2);
-    text(8,  44, "SINGLE COPY - REPEAT FIXED", C_TXT, 2);
-    text(8,  60, "NEXT: MICROPYTHON REPL", C_HI,  2);
-    /* full-height shear detector: straight iff the pitch holds over all 78 rows */
+    text(4,  0,  "CT952A LIVE - BARE METAL ON SILICON", C_HI,  1);
+    text(4,  8,  "PITCH 292  4BPP @0x40084000  60 COLS", C_TXT, 1);
+    text(4,  16, "WINDOW 616X56 @ Y=78  ONE COPY", C_TXT, 1);
+    text(4,  24, "SHEAR LIMIT: PANEL LINE 139", C_TXT, 1);
+    text(4,  32, "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789", C_TXT, 1);
+    text(4,  40, "the quick brown fox jumps over a dog", C_TXT, 1);
+    text(4,  48, "NEXT: MICROPYTHON REPL ON THIS SCREEN", C_HI,  1);
+
+    /* full-height shear detector: straight iff the pitch holds over every row */
     for (uint32_t y = 0; y < ROWS; y++)
-        for (int x = 440; x < 462; x++) px(x, (int)y, C_TXT);
+        for (int x = 452; x < 472; x++) px(x, (int)y, C_TXT);
+
     flush();
-
-    /* move the window down so the duplicate falls off the bottom edge */
-    REG_OSD_POS = (80u << 16) | 102u;          /* y=80, keep the loader's x=102 */
-
     for (;;){}
     return 0;
 }

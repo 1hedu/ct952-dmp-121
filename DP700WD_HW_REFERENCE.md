@@ -6644,3 +6644,43 @@ Also worth building into any probe: a **full-height vertical bar** as a shear
 detector. It is straight only if the pitch holds across every row of the window, so
 it reveals both the presence and the starting row of any shear without needing text
 to be legible.
+
+### 10.24 The OSD's ABSOLUTE vertical limit: panel line ~139
+
+Measured, and it explains everything seen so far. Two runs of the identical drawing
+at different window positions sheared at the same **absolute panel line**:
+
+| OSD_POS y | shear began at buffer row | = panel line |
+|---|---|---|
+| 95 | ~44 | 139 |
+| 80 | ~60 | 140 |
+| 28 (loader) | never (all 78 rows clean) | window ends at 105, above the limit |
+
+So the OSD plane renders correctly only **above panel line ~139**; below it the
+fetch shears progressively. This is an absolute limit in the display path, not a
+window-relative effect, and it retro-explains why the loader's own y=28 window was
+always clean and why "just move the window down" broke the lower rows.
+
+**The two constraints conflict at the loader's window height:**
+```
+    hide the duplicate  ->  y + 157 > 233   ->  y >= 77
+    stay above the limit ->  y + height - 1 < ~139
+    with height = 78:   77 + 77 = 154  >  139   -> IMPOSSIBLE
+```
+Both hold only if the window is also made SHORTER. **y = 78 with height = 56**
+gives window 78..133 (clear of the limit) and the duplicate at 235 (off-screen).
+Cost: 56 usable rows instead of 78 -- which at 1x is still 7 lines x 60 columns,
+and 1x is known legible here (the row-ruler labels were read off a photo at 1x).
+
+Final AP display recipe, superseding 10.23's position advice:
+```
+    base 0x40084000, pitch 292, 4bpp, off = y*292 + (x>>1), clamp to 24576 B
+    palette: 0 = transparent, 1 = yellow, 2 = white; visible width 480 px
+    OSD_SIZE (0x1A54) = (old & ~0x0FFF0000) | (56 << 16)   /* keep enable+width */
+    OSD_POS  (0x1A50) = (78 << 16) | 102
+    rows 0..55 usable; touch no other display register
+    (loader values to restore: OSD_POS 0x001C0066, OSD_SIZE 0x104E0268)
+```
+Cause of the ~139-line limit is not established (OSD line-buffer depth at
+REG_DISP_LB_CR1/CR2 0x1A28/0x1A2C, or a DRAM-bandwidth/H_REQ budget, are the
+candidates). Recorded as an empirical limit; not needed for a working console.

@@ -18,15 +18,38 @@
 #include "py/obj.h"
 #include "py/mphal.h"
 
-/* ---- EHCI registers (base 0xA0000100; operational regs at +CAPLENGTH=0x10) -- */
-#define EHCI_BASE        0xA0000100u
-#define EHCI_CAPLENGTH   (*(volatile uint32_t *)(EHCI_BASE + 0x00))  /* +HCIVERSION */
-#define EHCI_USBCMD      (*(volatile uint32_t *)(EHCI_BASE + 0x10))
-#define EHCI_USBSTS      (*(volatile uint32_t *)(EHCI_BASE + 0x14))
-#define EHCI_PERIODICLB  (*(volatile uint32_t *)(EHCI_BASE + 0x24))
-#define EHCI_ASYNCLB     (*(volatile uint32_t *)(EHCI_BASE + 0x28))
-#define EHCI_CONFIGFLAG  (*(volatile uint32_t *)(EHCI_BASE + 0x50))
-#define EHCI_PORTSC0     (*(volatile uint32_t *)(EHCI_BASE + 0x54))
+/* ---- USB host registers -------------------------------------------------------
+ * This is a ChipIdea/Freescale-style USB 2.0 OTG core, NOT a bare EHCI with a
+ * 0x10-byte capability block. Proven from the firmware's own accesses:
+ *   0xA0000184  read + "btst 1"   -> PORTSC1, bit 0 = CCS (device connected)
+ *   0xA00001A4  read + "and 0x200"-> OTGSC, VBUS-valid check
+ *   0xA0000164  |= 0x7f0000       -> TXFILLTUNING
+ * Those are exactly OP+0x44, OP+0x64 and OP+0x24 for an operational base of
+ * 0xA0000140, i.e. HCCAPBASE at 0xA0000100 with **CAPLENGTH = 0x40**.
+ *
+ * The previous code assumed CAPLENGTH = 0x10 and so had every operational
+ * register 0x30 too low: it polled 0xA0000154 as PORTSC, which is really
+ * PERIODICLISTBASE and reads 0 -- hence "no CCS (nothing connected)" on hardware
+ * with a keyboard plugged in. Derive the base from CAPLENGTH now instead of
+ * assuming it.
+ *
+ * Corollary: a ChipIdea core drives FULL and LOW speed devices itself, with no
+ * companion controller and no hub transaction translator, so a low-speed keyboard
+ * is fine once the right registers are used. (The earlier "EHCI cannot do
+ * low-speed" reasoning is true of discrete EHCI but not of this core.) */
+#define EHCI_CAP_BASE    0xA0000100u
+#define EHCI_CAPLENGTH   (*(volatile uint32_t *)(EHCI_CAP_BASE + 0x00))
+static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
+#define OPREG(o)         (*(volatile uint32_t *)(uintptr_t)(g_op + (o)))
+#define EHCI_USBCMD      OPREG(0x00)
+#define EHCI_USBSTS      OPREG(0x04)
+#define EHCI_PERIODICLB  OPREG(0x14)
+#define EHCI_ASYNCLB     OPREG(0x18)
+#define EHCI_CONFIGFLAG  OPREG(0x40)
+#define EHCI_PORTSC0     OPREG(0x44)
+#define EHCI_OTGSC       OPREG(0x64)
+#define EHCI_USBMODE     OPREG(0x68)
+#define USBMODE_CM_HOST  0x00000003u     /* controller mode = host */
 
 #define USBCMD_RS        0x00000001u   /* Run/Stop                */
 #define USBCMD_HCRESET   0x00000002u   /* Host Controller Reset   */
@@ -225,10 +248,26 @@ int usb_kbd_bringup(void) {
     g_ready = 0; g_dev_addr = 0; g_int_toggle = 0;
 
     /* Controller reset, then take ownership of all ports and run. */
+    /* Derive the operational base from the capability register rather than
+     * assuming it (that assumption is what broke this on real silicon). */
+    {
+        uint32_t cap = EHCI_CAPLENGTH;
+        uint32_t caplen = cap & 0xFFu;
+        if (caplen >= 0x10u && caplen <= 0x80u)
+            g_op = EHCI_CAP_BASE + caplen;
+        mp_printf(&mp_plat_print, "usb HCCAP=%08x caplen=%02x op=%08x\n",
+                  (unsigned)cap, (unsigned)caplen, (unsigned)g_op);
+    }
+
     EHCI_USBCMD = USBCMD_HCRESET;
     for (volatile int i = 0; i < 10000; i++) { }
-    EHCI_CONFIGFLAG = 1;                 /* route ports to EHCI */
+    /* A ChipIdea core comes out of reset in device mode; it must be told to be a
+     * HOST before the port will report a connection. The firmware does this via
+     * USB_HCInit, which we are replacing, so we must do it ourselves. */
+    EHCI_USBMODE = (EHCI_USBMODE & ~0x00000003u) | USBMODE_CM_HOST;
+    EHCI_CONFIGFLAG = 1;                 /* route ports to the host controller */
     EHCI_USBCMD = USBCMD_RS;
+    for (volatile int i = 0; i < 50000; i++) { }   /* let the port sample D+/D- */
 
     /* Staged diagnostics. On hardware this failed silently, so report WHICH step
      * fails and the PORTSC value, rather than inferring it. PORTSC line status

@@ -6955,3 +6955,59 @@ Two consequences worth testing in one flash, both now instrumented:
 Cheap workaround if OHCI is absent: plug the keyboard in through a **USB 2.0 hub**.
 The hub enumerates at high speed and its transaction translator lets the existing
 EHCI driver reach the low-speed keyboard behind it.
+
+### 10.31 ROOT CAUSE of the keyboard failure: wrong USB register map (ChipIdea, not bare EHCI)
+
+Hardware readout that cracked it, with a keyboard plugged in:
+```
+    usb FAIL: no CCS (nothing connected)
+    PORTSC=00000000 LS=0
+    oREV=0e6facda oPRT=000122ff        <- garbage, so no OHCI at 0xA0001000
+```
+`PORTSC` reading 0 while the firmware demonstrably enumerates the same keyboard (the
+splash screen takes visibly longer whenever USB is connected) meant we were reading
+the wrong register, not that the port was empty.
+
+**The USB core is a ChipIdea/Freescale-style USB 2.0 OTG controller, NOT a bare EHCI
+with a 0x10-byte capability block.** Proven from the firmware's own accesses -- the
+only three the disassembler could resolve, and all three fit exactly one layout:
+
+| firmware access | ChipIdea meaning | offset from OP base 0xA0000140 |
+|---|---|---|
+| `0xA0000184` read + `btst 1` | **PORTSC1**, bit 0 = CCS | +0x44 |
+| `0xA00001A4` read + `and 0x200` | **OTGSC**, VBUS valid | +0x64 |
+| `0xA0000164` `\|= 0x7f0000` | **TXFILLTUNING** | +0x24 |
+
+So HCCAPBASE is at 0xA0000100 with **CAPLENGTH = 0x40**, putting the operational
+registers at **0xA0000140**, not 0xA0000110. Our driver assumed CAPLENGTH = 0x10 and
+had every operational register **0x30 too low** -- it polled 0xA0000154 as PORTSC,
+which is really PERIODICLISTBASE and reads 0. Hence "nothing connected" with a
+keyboard attached.
+
+Corrected map (verified: the AP now prints `HCCAP=01000040 caplen=40 op=a0000140`):
+```
+    0xA0000100 HCCAPBASE (CAPLENGTH=0x40)   0xA0000180 CONFIGFLAG
+    0xA0000140 USBCMD                       0xA0000184 PORTSC1
+    0xA0000144 USBSTS                       0xA00001A4 OTGSC
+    0xA0000154 PERIODICLISTBASE             0xA00001A8 USBMODE
+    0xA0000158 ASYNCLISTADDR
+```
+Two fixes in the driver: derive the operational base from CAPLENGTH instead of
+assuming it, and set **USBMODE.CM = 3 (host)** -- a ChipIdea core comes out of reset
+in DEVICE mode and will never report a connection until told to be a host, which
+`USB_HCInit` normally does and we were replacing.
+
+**The low-speed theory (10.30) was wrong and is retracted.** A ChipIdea core drives
+full- and low-speed devices itself, with no companion controller and no hub
+transaction translator. `oREV=0e6facda` also confirms there is no OHCI at
+0xA0001000. So no hub is needed -- that advice was a red herring.
+
+**The emulator was validating the bug.** Its EHCI model also used CAPLENGTH = 0x10,
+so it agreed with the wrong driver and reported success. Both are now on the real
+layout (CAPLENGTH 0x40, operational registers at +0x40..+0x84), so the emulator can
+catch this class of error instead of confirming it. Verified after the change:
+HID enumerated, `>>> print(6*7)` -> `42`, `PORTSC=00000005`, `CAP=01000040`.
+
+Method note: the winning move was reading three register addresses out of the
+firmware's own instruction stream and asking which single documented layout explains
+all three -- not probing candidate bases.

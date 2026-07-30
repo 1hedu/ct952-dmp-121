@@ -1060,22 +1060,27 @@ static uint8_t proc2_ack_of(uint8_t cmd)
 static uint32_t ehci_read(machine_t *m, uint32_t off)
 {
     switch (off) {
-    case 0x00: return 0x01000010u;              /* HCIVERSION<<16 | rsvd | CAPLENGTH */
+    case 0x00: return 0x01000040u;              /* HCIVERSION<<16 | CAPLENGTH=0x40   */
     case 0x04: return EHCI_NPORTS;              /* HCSPARAMS: N_PORTS in [3:0]        */
     case 0x08: return 0x00000000u;              /* HCCPARAMS: 32-bit, no EECP         */
     case 0x0C: return 0x00000000u;              /* HCSP_PORTROUTE                     */
-    /* operational registers at base+CAPLENGTH (0x10) */
-    case 0x10: return m->ehci_usbcmd & ~0x2u;   /* USBCMD (HCRESET self-clears)       */
-    case 0x14:                                  /* USBSTS: HCHalted(0x1000)=!running  */
+    /* Operational registers at base+CAPLENGTH. This is a ChipIdea-style core with
+     * CAPLENGTH = 0x40, so they live at 0xA0000140+, NOT 0xA0000110+. Confirmed from
+     * the firmware itself, which touches PORTSC1 at 0xA0000184 (read + "btst 1" =
+     * CCS), OTGSC at 0xA00001A4 and TXFILLTUNING at 0xA0000164. The model previously
+     * used 0x10, which agreed with a driver that was WRONG on silicon -- so the
+     * emulator validated the bug instead of catching it. */
+    case 0x40: return m->ehci_usbcmd & ~0x2u;   /* USBCMD (HCRESET self-clears)       */
+    case 0x44:                                  /* USBSTS: HCHalted(0x1000)=!running  */
         return (m->ehci_usbcmd & 1u) ? (m->ehci_usbsts & ~0x1000u)
                                      : (m->ehci_usbsts | 0x1000u);
-    case 0x18: return m->ehci_usbintr;          /* USBINTR                            */
-    case 0x1C: return (uint32_t)((m->cycles >> 10) & 0x3FFFu); /* FRINDEX advancing   */
-    case 0x20: return m->ehci_ctrldss;          /* CTRLDSSEGMENT                      */
-    case 0x24: return m->ehci_periodic;         /* PERIODICLISTBASE                   */
-    case 0x28: return m->ehci_async;            /* ASYNCLISTADDR                      */
-    case 0x50: return m->ehci_configflag;       /* CONFIGFLAG                         */
-    case 0x54:                                  /* PORTSC[0]                          */
+    case 0x48: return m->ehci_usbintr;          /* USBINTR                            */
+    case 0x4C: return (uint32_t)((m->cycles >> 10) & 0x3FFFu); /* FRINDEX advancing   */
+    case 0x50: return m->ehci_ctrldss;          /* CTRLDSSEGMENT                      */
+    case 0x54: return m->ehci_periodic;         /* PERIODICLISTBASE                   */
+    case 0x58: return m->ehci_async;            /* ASYNCLISTADDR                      */
+    case 0x80: return m->ehci_configflag;       /* CONFIGFLAG                         */
+    case 0x84:                                  /* PORTSC[0]                          */
         return m->usb_kbd_present ? (m->ehci_portsc[0] | 0x1u)  /* CCS: device present */
                                   : m->ehci_portsc[0];          /* no connect -> 0     */
     default:   return 0;
@@ -1085,15 +1090,15 @@ static uint32_t ehci_read(machine_t *m, uint32_t off)
 static void ehci_write(machine_t *m, uint32_t off, uint32_t val)
 {
     switch (off) {
-    case 0x10: m->ehci_usbcmd = val & ~0x2u; break;      /* reset completes instantly */
-    case 0x14: m->ehci_usbsts &= ~(val & 0x3Fu); break;  /* W1C interrupt bits         */
-    case 0x18: m->ehci_usbintr = val; break;
-    case 0x1C: m->ehci_frindex = val; break;
-    case 0x20: m->ehci_ctrldss = val; break;
-    case 0x24: m->ehci_periodic = val; break;
-    case 0x28: m->ehci_async = val; break;
-    case 0x50: m->ehci_configflag = val; break;
-    case 0x54: {                                         /* PORTSC[0] */
+    case 0x40: m->ehci_usbcmd = val & ~0x2u; break;      /* reset completes instantly */
+    case 0x44: m->ehci_usbsts &= ~(val & 0x3Fu); break;  /* W1C interrupt bits         */
+    case 0x48: m->ehci_usbintr = val; break;
+    case 0x4C: m->ehci_frindex = val; break;
+    case 0x50: m->ehci_ctrldss = val; break;
+    case 0x54: m->ehci_periodic = val; break;
+    case 0x58: m->ehci_async = val; break;
+    case 0x80: m->ehci_configflag = val; break;
+    case 0x84: {                                         /* PORTSC[0] */
         if (!m->usb_kbd_present) { m->ehci_portsc[0] = val & ~0x2Au; break; }
         /* Device present: keep CCS(bit0) set, honour W1C change bits (CSC bit1,
          * PEDC bit3, OCC bit5), and model the port-reset -> high-speed-enable

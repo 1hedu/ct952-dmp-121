@@ -221,9 +221,11 @@ int pyapp_main(void) {
            "        s=D[v&15]+s\n"
            "        v>>=4\n"
            "    return s\n"
-           "p=ct952.peek32(0xA0000154)\n"
-           "print('PORTSC=' + h(0xA0000154) + ' LS=' + str((p>>10)&3))\n"
-           "print('oREV=' + h(0xA0001000) + ' oPRT=' + h(0xA0001054))\n",
+           /* Read the REAL ChipIdea registers (op base 0xA0000140), not the
+            * 0x30-too-low EHCI guesses that made PORTSC read as 0. */
+           "p=ct952.peek32(0xA0000184)\n"
+           "print('PORTSC=' + h(0xA0000184) + ' LS=' + str((p>>10)&3))\n"
+           "print('CAP=' + h(0xA0000100) + ' MODE=' + h(0xA00001A8))\n",
            MP_PARSE_FILE_INPUT);
     for (;;) {
         if (pyexec_friendly_repl() != 0) break;

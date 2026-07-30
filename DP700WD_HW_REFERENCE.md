@@ -6873,3 +6873,53 @@ silicon.
 (PYAPP base, npc, %sp) silently disabled or broke a working feature after the DRAM
 size was corrected. When a capability regresses, grep the harness for absolute
 addresses before doubting the model.
+
+### 10.29 USB keyboard on the AP path: it was a HARNESS bug (machine_call froze devices)
+
+Question that prompted this: "we have to run the usb init... why should it work?" --
+correctly refusing a hardware test that had no positive evidence behind it.
+
+Instead of guessing, the embedded script was made to READ the controller. Both paths
+reported IDENTICAL EHCI state before any bringup attempt:
+```
+    CAP =01000010   (controller responds; HCIVERSION 1.0, CAPLENGTH 0x10)
+    CMD =00000000   (not running yet -- expected, we reset it ourselves)
+    STS =00001000   (HCHalted)
+    PORT=00000003   (bit0 CCS = device CONNECTED, bit1 CSC = connect change)
+    CLK =00000000   (USB clock gates clear)
+```
+So the controller was alive and a device was connected on the failing path too --
+meaning the difference was never hardware state, USB power, or the firmware's USB
+init.
+
+**Root cause: `machine_call()` never called `machine_cycle()`.** Its loop was
+`sparc_run(c, 1)` only, so for the entire duration of a machine_call every device
+model was FROZEN -- the EHCI async schedule, VSYNC, the watchdog. The `--apload`
+path runs the AP inside machine_call, so the emulated host controller never
+processed a single transfer descriptor and `usb_kbd_bringup()` failed at its first
+control transfer. Real silicon obviously does not stop its peripherals while the CPU
+is inside a subroutine, so this was plain unfaithfulness.
+
+Fixed: machine_call now steps `machine_cycle(m)` per instruction
+(`CT952_CALL_NOCYCLE` restores the old behaviour as an escape hatch). Verified no
+regression: the flash-write path produces byte-identical results with and without
+the change.
+
+**Result -- the keyboard now works on the SAME path that gets flashed:**
+```
+    usb_kbd: device VID=ceeb PID=0952 class=0 MPS0=64
+    usb_kbd: configured, polling ep 0x81
+    [pyapp] USB keyboard ready
+    >>> print(6*7)
+    42
+```
+So `USB_HCInit` does NOT need to be called: our driver's own EHCI init (HCRESET,
+CONFIGFLAG, port reset, enumerate, SET_PROTOCOL boot) is sufficient, which is the
+answer to "don't we have to run the USB init?" -- no, provided the clocks are
+ungated (10.27), and that part is real and still required.
+
+**Fourth harness artifact in a row** (8 MB base, npc, %sp, and now frozen devices in
+machine_call). Every one of them looked like a hardware or firmware mystery. The
+standing rule is now: before theorising about silicon, check whether the emulator is
+even modelling the thing under test -- and prefer reading state off the device to
+reasoning about it.

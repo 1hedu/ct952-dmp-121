@@ -3667,10 +3667,25 @@ int machine_call(machine_t *m, uint32_t entry,
     sparc_set_reg(c, 14, sp);         /* %o6 / %sp */
     sparc_set_reg(c, 15, CALL_SENTINEL - 8); /* %o7: retl -> sentinel */
 
+    static int call_nocycle = -1;
+    if (call_nocycle < 0) call_nocycle = getenv("CT952_CALL_NOCYCLE") ? 1 : 0;
     for (i = 0; i < budget; i++) {
         if (c->pc == CALL_SENTINEL) return 0;
         if (c->halted) return -1;
         sparc_run(c, 1);
+        /* Step the device models too. Without this, everything modelled in
+         * machine_cycle() -- the EHCI async schedule, VSYNC, the watchdog -- is
+         * FROZEN for the whole duration of a machine_call. Real silicon does not
+         * stop its peripherals while the CPU is in a subroutine, so omitting this
+         * was simply unfaithful, and it silently broke USB on the --apload path:
+         * the AP runs inside machine_call, the host controller never processed a
+         * transfer descriptor, and usb_kbd_bringup() failed even though the
+         * controller was alive and a device was connected (identical EHCI
+         * registers to the working CT952_PYAPP path -- CAP=01000010, PORT=...3).
+         * That looked like a hardware question when it was a harness artifact.
+         * CT952_CALL_NOCYCLE restores the old frozen-devices behaviour, as an
+         * escape hatch if some firmware call turns out to depend on it. */
+        if (!call_nocycle) machine_cycle(m);
     }
     return -2;
 }

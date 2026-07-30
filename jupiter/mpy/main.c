@@ -163,7 +163,16 @@ int pyapp_main(void) {
         "print('HREQ=' + h(0x80001A08) + ' RED=' + h(0x80001A18))\n"
         "print('VSCL=' + h(0x80001A1C) + ' LB2=' + h(0x80001A2C))\n"
         "print('V22 =' + h(0x80000D88) + ' V23=' + h(0x80000D8C))\n"
-        "print('keyboard: type at the >>> prompt')\n";
+        /* EHCI state, read BEFORE any bringup attempt. The keyboard works on the
+         * CT952_PYAPP path but not on --apload, and rather than guess why, look at
+         * the controller: CAPLENGTH/HCIVERSION says whether the block responds at
+         * all, PORTSC0 bit0 (CCS) says whether a device is seen, and USBCMD bit0
+         * (RS) whether it is running. On hardware this also answers the only
+         * question that matters -- is the controller alive after the loader's
+         * USB_HCExit() + power-down, once the clocks are restored. */
+        "print('CAP=' + h(0xA0000100) + ' CMD=' + h(0xA0000110))\n"
+        "print('STS=' + h(0xA0000114) + ' CFG=' + h(0xA0000150))\n"
+        "print('PORT=' + h(0xA0000154) + ' CLK=' + h(0x80000300))\n";
     mp_hal_stdout_tx_strn("[pyapp] embedded investigate script\n", 36);
     do_str(investigate, MP_PARSE_FILE_INPUT);
 

@@ -314,10 +314,36 @@ static void osd_scroll(void) {
     memmove((void *)g_osd_fb, (void *)(g_osd_fb + 8 * OSD_STRIDE), (size_t)keep);
     memset((void *)(g_osd_fb + keep), BG_FILL_BYTE, 8u * OSD_STRIDE);
 }
+/* Minimal VT100/ANSI escape handling. MicroPython's readline (MICROPY_HAL_HAS_VT100)
+ * redraws line edits with escape sequences, so the console has to interpret the few it
+ * emits instead of printing them as glyphs -- which is why backspace left a literal "[K"
+ * on screen. Only three are needed:
+ *   ESC [ n D   move cursor back n columns (readline's move_cursor_back for n>4)
+ *   ESC [ n C   move cursor forward n columns
+ *   ESC [ K     erase from the cursor to the end of the line
+ * and a bare BS (\b) means move-only, NOT move-and-erase -- readline pairs it with ESC[K
+ * or a reprint. The old \b handler erased a glyph too, which corrupted mid-line edits. */
+static int con_esc;      /* 0 normal, 1 saw ESC, 2 saw CSI '[' */
+static int con_esc_num;
 static void osd_putc(char c) {
-    if (c == '\n')      { con_col = 0; con_row++; }
+    if (con_esc == 1) {                       /* after ESC */
+        con_esc = (c == '[') ? 2 : 0;
+        if (con_esc == 2) con_esc_num = 0;
+        return;
+    }
+    if (con_esc == 2) {                       /* inside CSI */
+        if (c >= '0' && c <= '9') { con_esc_num = con_esc_num * 10 + (c - '0'); return; }
+        int n = con_esc_num ? con_esc_num : 1;
+        if (c == 'D')      { con_col -= n; if (con_col < 0) con_col = 0; }
+        else if (c == 'C') { con_col += n; if (con_col > g_cols) con_col = g_cols; }
+        else if (c == 'K') { for (int x = con_col; x < g_cols; x++) osd_glyph(x, con_row, ' '); }
+        con_esc = 0;
+        return;
+    }
+    if (c == 0x1B)      { con_esc = 1; }
+    else if (c == '\n') { con_col = 0; con_row++; }
     else if (c == '\r') { con_col = 0; }
-    else if (c == '\b') { if (con_col > 0) { con_col--; osd_glyph(con_col, con_row, ' '); } }
+    else if (c == '\b') { if (con_col > 0) con_col--; }   /* move-only */
     else if (c == '\t') { con_col = (con_col + 4) & ~3; }
     else {
         if (con_col >= g_cols) { con_col = 0; con_row++; }

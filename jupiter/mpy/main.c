@@ -183,9 +183,21 @@ int pyapp_main(void) {
     {
         volatile uint32_t *clkgen = (volatile uint32_t *)0x80000300u;
         *clkgen = *clkgen & ~0x01800000u;               /* UCLK48M + HCLK for USB */
-        for (volatile int i = 0; i < 200000; i++) { }   /* let the PHY settle */
+        for (volatile int i = 0; i < 400000; i++) { }   /* let the clocks/PHY settle */
     }
-    if (usb_kbd_bringup()) {
+    /* Retry bringup: on real silicon the port takes time to report a connection
+     * after the clocks come back (and after USB_HCExit() tore the controller down),
+     * so a single attempt can lose the race even with a keyboard plugged in. Each
+     * attempt does a full HCRESET, so retrying is safe. */
+    int kbd_ok = 0;
+    {
+        int tries;
+        for (tries = 0; tries < 8 && !kbd_ok; tries++) {
+            kbd_ok = usb_kbd_bringup();
+            if (!kbd_ok) for (volatile int i = 0; i < 600000; i++) { }
+        }
+    }
+    if (kbd_ok) {
         mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
     } else {
         mp_hal_stdout_tx_strn("[pyapp] no USB kbd; REPL on UART1 RX\n", 37);

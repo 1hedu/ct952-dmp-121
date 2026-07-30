@@ -7747,3 +7747,34 @@ The emulator still enumerates (it models a high-speed device, so the split field
 inert there) and the REPL evaluated `7*6` typed through it. This is the first hardware fix
 in the sequence taken verbatim from the frame's own working driver rather than reasoned
 from the spec, so it is the strongest candidate yet.
+
+### 10.46 The failure is HOST-side: a USB stick stalls the IN identically to the keyboard
+
+Control test (10.45's plan): a **USB flash drive** in place of the keyboard reported
+```
+    A=80000e00  B=80080d40  V=404040400000  R=00000000
+    i=40  n=48  z=40  T=7f000000  P=18001205
+```
+`P=18001205` decodes to **PSPD=10 (high speed)** with PED=1: the drive connected at high
+speed, and the controller reset *and enabled* it. Yet `A`/`B` are **byte-identical** to the
+low-speed keyboard: SETUP transmits (TotalBytes 8->0, clean), the IN halts with TotalBytes
+still 8, CERR=3, no error bits.
+
+That identity is the finding. A low-speed keyboard and a high-speed flash drive cannot
+independently produce the same stall token to the bit. **The stall originates in the host,
+not the device** -- and a high-speed device uses no transaction translator at all, so this
+was never the TT, never low-speed, never the QH hub address (all necessary fixes, but not
+this). Transmit works; reception is broken, device-independently.
+
+The ChipIdea/TDI signature for "OUT works, every IN retires Halted with no error bits,
+regardless of device" is **stream mode left enabled in host mode**. In stream mode the
+controller prefetches and reorders the schedule and corrupts transactions. The fix is
+**USBMODE.SDIS (Stream Disable, bit 4)**, set together with the host-mode bits before the
+schedule runs. We set `CM=3` but never SDIS.
+
+Shipped: `USBMODE = CM_HOST | SDIS` (0x13). The `T=` slot now reports USBMODE so SDIS can be
+confirmed stuck (expect `T=00000013`); TTHA's stick was already confirmed and that slot was
+free. This is a documented, core-level requirement rather than a spec-reasoned guess, and it
+is the first cause consistent with the device-independence of the failure.
+
+Emulator still enumerates (it does not model stream mode) and the REPL evaluated `5+37`.

@@ -64,6 +64,7 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
 #define TTCTRL_TTHA(a)   (((uint32_t)(a) & 0x7Fu) << 24)
 #define EHCI_USBMODE     OPREG(0x68)
 #define USBMODE_CM_HOST  0x00000003u     /* controller mode = host */
+#define USBMODE_SDIS     0x00000010u     /* Stream Disable Mode (bit 4)         */
 
 #define USBCMD_RS        0x00000001u   /* Run/Stop                */
 #define USBCMD_HCRESET   0x00000002u   /* Host Controller Reset   */
@@ -533,8 +534,17 @@ int usb_kbd_bringup(void) {
     for (volatile int i = 0; i < 10000; i++) { }
     /* A ChipIdea core comes out of reset in device mode; it must be told to be a
      * HOST before the port will report a connection. The firmware does this via
-     * USB_HCInit, which we are replacing, so we must do it ourselves. */
-    EHCI_USBMODE = (EHCI_USBMODE & ~0x00000003u) | USBMODE_CM_HOST;
+     * USB_HCInit, which we are replacing, so we must do it ourselves.
+     *
+     * SDIS (Stream Disable, bit 4) is set together with host mode. On a ChipIdea/TDI
+     * core, leaving stream mode enabled in host mode lets the controller prefetch and
+     * reorder the schedule in a way that corrupts transactions -- the classic symptom is
+     * that OUT/SETUP works but every IN retires Halted with no error bits, DEVICE
+     * INDEPENDENT. That is exactly what hardware showed: a low-speed keyboard and a
+     * high-speed flash drive both stalled the IN with the identical token (B=80080d40),
+     * which cannot be two devices coincidentally -- it is the host. Stream Disable is the
+     * documented fix and must be set before the schedule runs. */
+    EHCI_USBMODE = (EHCI_USBMODE & ~0x00000003u) | USBMODE_CM_HOST | USBMODE_SDIS;
     /* Point the embedded TT at hub address 0x7F, exactly as the firmware does
      * (TTCTRL |= 0x7f0000). Transfers whose QH carries this hub address are routed
      * through the TT, which is how a directly attached low/full-speed device is
@@ -671,7 +681,7 @@ int usb_kbd_bringup(void) {
         g_dbg_nodev = g_td_p[0][2];   /* SETUP token: no device should even ACK it */
         g_dev_addr = 0;
         g_dbg_bare_in = probe_bare_in();
-        g_dbg_ttctrl  = EHCI_TTCTRL;   /* did TTHA actually stick at +0x1C? */
+        g_dbg_ttctrl  = EHCI_USBMODE;  /* T= now reports USBMODE: bit4 SDIS, bits1:0 host */
         g_dbg_portsc = EHCI_PORTSC0;  /* is the port still connected+enabled by now? */
         g_failstep = 3; return 0;
     }

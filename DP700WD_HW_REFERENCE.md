@@ -7093,3 +7093,46 @@ single fix ever helped:
 ```
 plus the register map itself having been 0x30 off (10.31). The emulator could not have
 surfaced any of the last three: its model has no PP, no VBUS and no device speed.
+
+### 10.34 Port is fully up on hardware; failure is now inside enumeration
+
+Hardware after the port-power fix:
+```
+    PORTSC=14001405  ->  CCS=1  PE=1  PP=1  LS=01  PSPD=01
+    CAP =01000040        MODE=00000003
+```
+Decoded: the port is **POWERED (PP=1), CONNECTED (CCS=1), ENABLED (PE=1)**, and the
+controller itself reports **PSPD=01 = LOW-SPEED**. Every layer from 10.31-10.33 is
+therefore confirmed working on silicon: register map, reset release, host mode, port
+power, and speed detection.
+
+**"No LEDs lit" is no longer evidence of anything.** Most keyboards only light
+Num/Caps once the HOST sends an LED output report (SET_REPORT); they draw power
+silently otherwise. PP=1 together with CCS=1 and PSPD=01 proves VBUS is live and the
+device responded electrically -- the earlier inference from dark LEDs was valid only
+while PP read 0.
+
+Remaining failure is inside **enumeration** -- a control transfer to a low-speed
+device -- not the port. Because the per-attempt lines scroll off a 7-row console, the
+reason is now recorded in a persistent code and printed in the surviving summary as
+`FAILSTEP=n`:
+
+| n | step that failed |
+|---|---|
+| 1 | no CCS and the line was idle |
+| 2 | port not enabled after reset |
+| 3 | **GET_DESCRIPTOR** (the first control transfer) |
+| 4 | SET_ADDRESS |
+| 5 | GET_DESCRIPTOR(config) |
+| 6 | SET_CONFIGURATION |
+| 0 | success |
+
+Retries were also cut to 1 so the output fits the console.
+
+Expectation: `FAILSTEP=3`, i.e. the very first control transfer. That would point at
+the qTD/QH setup for a low-speed endpoint rather than anything about the port -- the
+likely culprits being the queue head's speed/C-bit combination, the 8-byte MPS0, and
+whether this core needs the transfer described differently for a directly attached
+low-speed device. The emulator cannot arbitrate any of that: its model has no notion
+of device speed, so it enumerates a "low-speed" device with high-speed descriptors
+and reports success either way.

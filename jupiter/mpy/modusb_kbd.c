@@ -82,6 +82,13 @@ static uint32_t g_op = 0xA0000140u;      /* set from CAPLENGTH in bringup */
  * speed the device does not run at. */
 static uint32_t g_eps = QH_EPS_HS;
 static uint32_t g_isls = 0;
+/* Which bringup step failed, kept for the final on-screen summary: the per-attempt
+ * lines scroll off a 7-row console, so the reason has to persist.
+ * 1 idle line  2 port not enabled  3 GET_DESCRIPTOR  4 SET_ADDRESS
+ * 5 GET_CONFIG  6 SET_CONFIGURATION  0 success */
+static int g_failstep = 0;
+int usb_kbd_failstep(void) { return g_failstep; }
+int usb_kbd_lastxfer(void);
 #define QH_DTC           (1u << 14)    /* take data toggle from the qTD       */
 #define QH_H             (1u << 15)    /* head of reclamation list            */
 #define QH_MPS(n)        (((uint32_t)(n) & 0x7FF) << 16)
@@ -257,7 +264,7 @@ static char usage_to_ascii(uint8_t mod, uint8_t u) {
  * Returns 1 on success, 0 if no device / enumeration failed. Plain C so both
  * the Python module and the C REPL stdin path can call it. */
 int usb_kbd_bringup(void) {
-    g_ready = 0; g_dev_addr = 0; g_int_toggle = 0;
+    g_ready = 0; g_dev_addr = 0; g_int_toggle = 0; g_failstep = 0;
 
     /* Controller reset, then take ownership of all ports and run. */
     /* Derive the operational base from the capability register rather than
@@ -306,7 +313,7 @@ int usb_kbd_bringup(void) {
          * give up if the wire is idle too. */
         if (((EHCI_PORTSC0 >> 10) & 3u) == 0u) {
             mp_printf(&mp_plat_print, "usb FAIL: no CCS, idle line\n");
-            return 0;
+            g_failstep = 1; return 0;
         }
         mp_printf(&mp_plat_print, "usb: no CCS but LS=%d, continuing\n",
                   (int)((EHCI_PORTSC0 >> 10) & 3u));
@@ -321,14 +328,14 @@ int usb_kbd_bringup(void) {
               (int)((EHCI_PORTSC0 >> 10) & 3));
     if (!(EHCI_PORTSC0 & PORTSC_PED)) {
         mp_printf(&mp_plat_print, "usb FAIL: port not enabled after reset\n");
-        return 0;
+        g_failstep = 2; return 0;
     }
 
     /* Enumerate at address 0: read the 18-byte device descriptor. */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_DEVICE << 8), 0, 18) < 18) {
         mp_printf(&mp_plat_print, "usb FAIL: GET_DESCRIPTOR (PORTSC=%08x)\n",
                   (unsigned)EHCI_PORTSC0);
-        return 0;
+        g_failstep = 3; return 0;
     }
     mp_printf(&mp_plat_print,
         "usb_kbd: device VID=%04x PID=%04x class=%d MPS0=%d\n",
@@ -337,17 +344,17 @@ int usb_kbd_bringup(void) {
 
     /* Assign address 1 and adopt it. */
     if (ctrl_xfer(0x00, REQ_SET_ADDRESS, 1, 0, 0) < 0) {
-        return 0;
+        g_failstep = 4; return 0;
     }
     g_dev_addr = 1;
 
     /* Read the configuration descriptor set (config+iface+HID+endpoint). */
     if (ctrl_xfer(0x80, REQ_GET_DESCRIPTOR, (DESC_CONFIG << 8), 0, 34) < 9) {
-        return 0;
+        g_failstep = 5; return 0;
     }
     /* Select the (only) configuration. */
     if (ctrl_xfer(0x00, REQ_SET_CONFIGURATION, g_data[5], 0, 0) < 0) {
-        return 0;
+        g_failstep = 6; return 0;
     }
     /* HID: boot protocol + infinite idle (report only on change). */
     ctrl_xfer(0x21, HID_SET_PROTOCOL, 0 /* boot */, 0, 0);

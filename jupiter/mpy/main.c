@@ -208,9 +208,10 @@ int pyapp_main(void) {
      * so a single attempt can lose the race even with a keyboard plugged in. Each
      * attempt does a full HCRESET, so retrying is safe. */
     int kbd_ok = 0;
+    extern int usb_kbd_failstep(void);
     {
         int tries;
-        for (tries = 0; tries < 2 && !kbd_ok; tries++) {
+        for (tries = 0; tries < 1 && !kbd_ok; tries++) {
             kbd_ok = usb_kbd_bringup();
             if (!kbd_ok) for (volatile int i = 0; i < 600000; i++) { }
         }
@@ -218,7 +219,9 @@ int pyapp_main(void) {
     if (kbd_ok) {
         mp_hal_stdout_tx_strn("[pyapp] USB keyboard ready\n", 27);
     } else {
-        mp_hal_stdout_tx_strn("[pyapp] no USB kbd\n", 19);
+        /* name the failing step; the per-attempt lines scroll off the 7-row console */
+        mp_printf(&mp_plat_print, "[pyapp] no USB kbd  FAILSTEP=%d\n",
+                  usb_kbd_failstep());
     }
     /* Decisive values printed LAST so they survive on a 7-line scrolling console
      * (the first attempt buried them above the REPL banner).

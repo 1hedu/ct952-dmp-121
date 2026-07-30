@@ -91,6 +91,7 @@ static void portsc_rmw(uint32_t set, uint32_t clr)
 /* ---- qTD token bits --------------------------------------------------------- */
 #define QTD_T            0x00000001u   /* terminate (invalid pointer)         */
 #define QTD_ACTIVE       0x00000080u
+#define QTD_HALTED       0x00000040u   /* qTD retired with an error / STALL   */
 #define QTD_PID_OUT      (0u << 8)
 #define QTD_PID_IN       (1u << 8)
 #define QTD_PID_SETUP    (2u << 8)
@@ -440,17 +441,20 @@ static int int_in_poll(uint8_t *out, int ms) {
 
     async_start(pa(g_qh));
 
-    /* Close the cancel race: qtd_wait_ms may time out in the same microsecond the
-     * controller completes the transfer. Cancelling then (td[2]=0) would drop a report
-     * the device DID send AND leave our data toggle one step behind the device's, so
-     * every later report reads with the wrong toggle -- the source of occasional garbled
-     * input (phantom shift -> capitals/symbols). So only treat it as a NAK if the qTD is
-     * genuinely still Active; otherwise it really completed, so consume it. */
-    if (!qtd_wait_ms(td, ms)) {
-        if (td[2] & QTD_ACTIVE) {
-            td[2] = 0;             /* genuine NAK / no key change */
-            return 0;
-        }
+    /* Consume the report ONLY on a CLEAN completion: Active clear AND Halted clear.
+     *
+     * A qTD that HALTED (a transaction error or STALL) also has Active clear, but it
+     * carries no valid report -- g_data still holds stale bytes. An earlier version fell
+     * through on any non-Active state and consumed those, byte-swapping and edge-decoding
+     * garbage into a stream of bogus characters; because the endpoint kept halting, every
+     * poll repeated it -- the "loops through what it prints" junk that looked like firmware
+     * text. So: on NAK (still Active), on halt, or on timeout, cancel and report no key.
+     * On a halt, drop the endpoint toggle back to 0 so a later transfer can resync. */
+    qtd_wait_ms(td, ms);
+    if (td[2] & (QTD_ACTIVE | QTD_HALTED)) {
+        if (td[2] & QTD_HALTED) g_int_toggle = 0;
+        td[2] = 0;
+        return 0;
     }
     bswap32_buf(g_data, 8);   /* undo the hardware DMA word-swap on the HID report */
     memcpy(out, g_data, 8);

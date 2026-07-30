@@ -234,6 +234,8 @@ int pyapp_main(void) {
             extern uint32_t usb_kbd_dv(int);
             extern uint32_t usb_kbd_nodev(void);
             extern uint32_t usb_kbd_portsc(void);
+            extern uint32_t usb_kbd_barein(void);
+            extern uint32_t usb_kbd_rx(void);
             char line[24];
             static const char hex[] = "0123456789abcdef";
             line[0] = 'S'; line[1] = '=';
@@ -247,17 +249,32 @@ int pyapp_main(void) {
              * status stage of a zero-length SET_ADDRESS(0) probe: z=00 means the device
              * answers a request with no data stage, so it IS in Default state and only
              * the data phase is broken. */
-            mp_printf(&mp_plat_print, "S=%s d=%02x %02x %02x\n", line + 2,
+            /* DATA-stage status of all six split configurations tried, in the order
+             * TT+LS+C, TT+LS, TT+FS+C, LS+C, LS, FS+C -- anything other than 40 in a
+             * slot is the combination that got further. */
+            mp_printf(&mp_plat_print, "V=%02x%02x%02x%02x%02x%02x R=%08x\n",
                       (unsigned)(usb_kbd_dv(0) & 0xFF), (unsigned)(usb_kbd_dv(1) & 0xFF),
-                      (unsigned)(usb_kbd_dv(2) & 0xFF));
+                      (unsigned)(usb_kbd_dv(2) & 0xFF), (unsigned)(usb_kbd_dv(3) & 0xFF),
+                      (unsigned)(usb_kbd_dv(4) & 0xFF), (unsigned)(usb_kbd_dv(5) & 0xFF),
+                      (unsigned)usb_kbd_rx());
             /* LAST line, because only the last one is reliably readable on a 7-row
              * console: the no-device control experiment first (0x48/0x68 = the bus
              * really times out when nobody answers, so 0x40 elsewhere is a genuine
              * device STALL; 0x40 here means the controller halts regardless of any
              * device), then the zero-length probe and the port state. */
-            mp_printf(&mp_plat_print, "n=%02x z=%02x P=%08x\n",
+            /* i= is the decisive one: a lone IN to endpoint 0 with nothing pending.
+             * A device answers that with NAK, which is invisible in the status, so the
+             * qTD should stay ACTIVE (0x80) and time out. 0x40 instead means every IN
+             * halts no matter what the device says, i.e. IN completion itself is
+             * broken rather than the device rejecting our requests. */
+            /* f= is the stock firmware's own board flag at 0x40040f0c: non-zero means
+             * its EHCI stack forces this port to connect as full speed (PORTSC bit 24),
+             * i.e. the quirk is required on this hardware. */
+            mp_printf(&mp_plat_print, "i=%02x n=%02x z=%02x f=%02x P=%08x\n",
+                      (unsigned)(usb_kbd_barein() & 0xFF),
                       (unsigned)(usb_kbd_nodev() & 0xFF),
-                      (unsigned)(usb_kbd_dv(3) & 0xFF),
+                      (unsigned)(usb_kbd_dv(7) & 0xFF),
+                      (unsigned)(*(volatile uint8_t *)0x40040f0cu),
                       (unsigned)usb_kbd_portsc());
         }
     }

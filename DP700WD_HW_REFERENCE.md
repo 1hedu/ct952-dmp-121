@@ -7434,3 +7434,72 @@ recorded in 10.31-10.33. The last line printed is now
 Emulator check: the modelled keyboard still enumerates through the new handshake and the
 REPL evaluated `2*21` from it, so stopping and restarting the schedule per transfer did
 not break the working path; with no keyboard the failure summary prints zeros.
+
+### 10.40 `n=48`: the device really does answer, and the stock firmware's own EHCI stack
+
+`n=48` — XactErr with CERR counted down to 0 — for the nonexistent device address 7,
+against bare Halted with CERR intact for the real device. **The controller can tell
+silence from a stall.** Packets reach the wire, and the keyboard genuinely rejects us.
+Two side benefits: address 7 behaving differently proves the QH is now being re-fetched
+(so 10.39's handshake fix took effect and the variant sweep is finally meaningful), and
+`S=8006000100000800` proves the SETUP packet in DMA memory is byte-for-byte correct.
+
+The failing stages line up exactly one way:
+
+| stage | direction | result |
+|---|---|---|
+| SETUP (GET_DESCRIPTOR) | OUT-type | `s=00` clean |
+| DATA | **IN** | `40` halted, 0 bytes |
+| SETUP (SET_ADDRESS(0)) | OUT-type | clean |
+| STATUS | **IN** | `z=40` halted |
+
+Every failing stage is an IN; every succeeding one is a SETUP/OUT. In a split
+transaction a SETUP/OUT completes on the start-split alone, while an IN needs a
+**complete-split** to collect the response — so "OUT works, IN never returns a byte" is
+the shape of a broken complete-split, and a mishandled CSPLIT is precisely the case
+where the TT can answer in a way indistinguishable from a device STALL.
+
+`probe_bare_in()` settles it: a lone IN to endpoint 0 with no control transfer pending.
+A device answers that with NAK, and NAK is invisible in the qTD status (the controller
+just retries), so the qTD must stay ACTIVE and time out. `i=80` means INs work at the
+bus level and the halts are real protocol responses; `i=40` means every IN halts
+regardless of the device, i.e. IN completion itself is broken.
+
+#### The stock firmware contains a full BSD-derived EHCI driver
+
+Strings in flash: `TDI EHCI OTG Controller`, `%s: EHCI version %x.%x, with %d ports`,
+`ehci_open: bad device speed %d`, `ehci_idone: need toggle update status=%08x`,
+`ehci_rem_qh: ED not found`, `ehci_init: forcing host to connect as full speed`. "TDI"
+is Transdimension, the original vendor of this core (later ChipIdea), which independently
+corroborates the embedded-TT design. This is ground truth we can read for free instead of
+guessing, and it produced two concrete fixes.
+
+**1. PORTSC bit 24 (PFSC), a board quirk.** `ehci_init` at 0xb04e8:
+
+```
+    call  0xad73c            ; predicate: byte at 0x40040f0c (a board flag in DRAM)
+    be    skip
+    ...  print "ehci_init: forcing host to connect as full speed"
+    l1 = softc[0x250]        ; register handle
+    l0 = softc[0x25c] + 0x44 ; PORTSC  <-- independently confirms operational base + 0x44
+    call  0xaf1b0            ; read32
+    and   %o0, -43           ; = & 0xFFFFFFD5: preserve all but the RW1C change bits
+    or    %o0, 0x1000000     ; bit 24 = Port Force Full Speed Connect
+    call  0xaf1c0            ; write32
+```
+
+Forcing full-speed connect skips the high-speed chirp, which on some PHYs is required
+before a low-speed device works at all. The driver now alternates the quirk between
+bringup attempts, and the reported `P=` shows bit 24 so we know which attempt was in
+effect. The firmware's own flag is printed as `f=`: non-zero means the stock stack
+considers the quirk mandatory on this board.
+
+**2. PORTSC read-modify-write discipline.** The firmware masks `CSC|PEC|OCC` out before
+writing back; our plain `PORTSC |= x` wrote 1s straight back into whichever change bits
+happened to be set, silently acknowledging events we never handled. All PORTSC writes now
+go through `portsc_rmw(set, clr)`, which drops the RW1C bits — except the one place a 1
+*should* be written, deliberately clearing the connect-change latch. Port reset also now
+explicitly writes PE=0 alongside PR, as EHCI requires.
+
+Emulator: keyboard still enumerates and the REPL evaluated `6*7` typed through it; with no
+keyboard the summary prints zeros.

@@ -1300,6 +1300,25 @@ static void usb_wr32(machine_t *m, uint32_t a, uint32_t v)
     p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16); p[2]=(uint8_t)(v>>8); p[3]=(uint8_t)v;
 }
 
+/* Copy `n` bytes applying the SoC's hardware DMA byte-swap: each aligned 32-bit word is
+ * byte-reversed (whole words, rounding up like the driver does). This models the real
+ * silicon, whose DMA swaps 32-bit words to feed the little-endian controller -- see
+ * DP700WD_HW_REFERENCE 10.48. The descriptor DWORDs (qTD/QH) are read via usb_rd32/wr32
+ * as big-endian, which already matches "native BE store + hardware swap = correct value",
+ * so only the DATA buffers (SETUP payload read, IN data written) need this treatment. A
+ * driver that byte-swaps its buffers to cancel the hardware swap only enumerates once the
+ * model applies the same swap; without it the emulator diverged from hardware. */
+static void usb_dma_swap_copy(uint8_t *dst, const uint8_t *src, int n)
+{
+    int w = (n + 3) & ~3;
+    for (int i = 0; i < w; i += 4) {
+        dst[i + 0] = src[i + 3];
+        dst[i + 1] = src[i + 2];
+        dst[i + 2] = src[i + 1];
+        dst[i + 3] = src[i + 0];
+    }
+}
+
 /* Execute one qTD at `addr` against device endpoint `ep`. Returns 1 if the qTD
  * retired (status written back, Active cleared), 0 if it NAKed (left Active). */
 static int ehci_exec_qtd(machine_t *m, uint32_t addr, uint8_t ep)
@@ -1313,7 +1332,7 @@ static int ehci_exec_qtd(machine_t *m, uint32_t addr, uint8_t ep)
 
     if (pid == 2) {                 /* SETUP */
         uint8_t sp[8]; uint8_t *b = machine_dram_ptr(m, buf0);
-        if (b) memcpy(sp, b, 8); else memset(sp, 0, 8);
+        if (b) usb_dma_swap_copy(sp, b, 8); else memset(sp, 0, 8);
         usb_dev_setup(m, sp);
         remaining = 0;
     } else if (pid == 1) {          /* IN */
@@ -1322,7 +1341,7 @@ static int ehci_exec_qtd(machine_t *m, uint32_t addr, uint8_t ep)
         int n = usb_dev_in(m, ep, tmp, cap);
         if (n < 0) return 0;        /* NAK: leave the qTD Active for the next poll */
         uint8_t *b = machine_dram_ptr(m, buf0);
-        if (b && n > 0) memcpy(b, tmp, n);
+        if (b && n > 0) usb_dma_swap_copy(b, tmp, n);
         remaining = total - n;
     } else {                        /* OUT (data/status) -- accept and drop */
         remaining = 0;

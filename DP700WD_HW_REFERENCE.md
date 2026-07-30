@@ -7869,3 +7869,24 @@ rounds sooner.
 compensation in the driver, the emulator (no modelled swap) fails to enumerate. To restore
 it as a validation tool, ct952emu's EHCI DMA must byte-swap 32-bit words the way the silicon
 does. Until then, the USB path is hardware-validated only.
+
+### 10.50 Emulator made faithful to the DMA word-swap
+
+10.49 left the emulator diverging from hardware: once the driver byte-swapped its data
+buffers to cancel the SoC's hardware DMA word-swap (10.48), the emulator -- which copied
+those buffers raw -- fed the modelled device a swapped SETUP and failed to enumerate.
+
+Fixed in ct952emu's EHCI model (machine.c, `usb_dma_swap_copy`). The descriptor DWORDs
+(qTD/QH) are read through `usb_rd32`/`usb_wr32` as big-endian, which already models "CPU
+native-BE store + hardware swap = correct value to the LE controller", so they are left
+alone. Only the DATA buffers needed the swap: the SETUP payload is byte-swapped by 32-bit
+word when read from DRAM, and IN data is byte-swapped when written to DRAM, whole words
+rounded up exactly as the driver's `bswap32_buf` does. That is the real silicon's
+behaviour, so the driver's compensation now cancels the model's swap the same way it
+cancels the hardware's.
+
+Verified: with the unchanged byte-swapping driver, the emulator enumerates the modelled
+keyboard (`VID=ceeb PID=0952`, `configured, polling ep 0x81`) and the REPL evaluates a
+line typed through it. The USB path is emulator-validated again, and the emulator now
+exercises the same byte-order compensation the hardware requires -- so a regression in
+that compensation would show up in the emulator instead of only on a flash.

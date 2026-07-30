@@ -439,9 +439,17 @@ static int int_in_poll(uint8_t *out, int ms) {
 
     async_start(pa(g_qh));
 
+    /* Close the cancel race: qtd_wait_ms may time out in the same microsecond the
+     * controller completes the transfer. Cancelling then (td[2]=0) would drop a report
+     * the device DID send AND leave our data toggle one step behind the device's, so
+     * every later report reads with the wrong toggle -- the source of occasional garbled
+     * input (phantom shift -> capitals/symbols). So only treat it as a NAK if the qTD is
+     * genuinely still Active; otherwise it really completed, so consume it. */
     if (!qtd_wait_ms(td, ms)) {
-        td[2] = 0;                 /* cancel the pending qTD (NAK / no key) */
-        return 0;
+        if (td[2] & QTD_ACTIVE) {
+            td[2] = 0;             /* genuine NAK / no key change */
+            return 0;
+        }
     }
     bswap32_buf(g_data, 8);   /* undo the hardware DMA word-swap on the HID report */
     memcpy(out, g_data, 8);

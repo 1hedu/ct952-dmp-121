@@ -108,15 +108,31 @@ int pyapp_main(void) {
      * emulator has no watchdog on this path, which is why it never showed up. */
     ct952_watchdog_off();
 
-    /* NOTE: an earlier build tried to "quiesce" the firmware here by halting PROC2
-     * (0x80000324=1) and masking interrupts with rd/wr %psr. That BACKFIRED: rd/wr %psr
-     * are privileged SPARC instructions, and this AP does not run privileged, so they
-     * trapped into the STILL-INSTALLED firmware trap handler, which dumps a panic trace
-     * (section names like RODATA, register state) straight onto the OSD -- making the
-     * "crosstalk" far worse. Removed. The real crosstalk cure is gating UART stdin
-     * (uart_core.c): the firmware floods UART1 with debug text and we simply stop reading
-     * it as input while a keyboard is attached. Do NOT reintroduce privileged ops here
-     * without first installing our own trap table. */
+    /* Take over the interrupt controller so the stock firmware's RTOS stops running
+     * underneath us. Its timer interrupt drives the scheduler that keeps the photo-frame
+     * / slideshow / menu thread alive, and that thread is what painted DVD language-menu
+     * text over the REPL ("crosstalk") and stole keystrokes -- worst of all with an image
+     * on the card, which sends the firmware into its decode/display path. Mask every
+     * source and no firmware ISR fires on this core, so the scheduler never preempts us
+     * and the UI thread never runs again.
+     *
+     * This is exactly what the stock AP loader does to seize the machine
+     * (aploader.c:474-482), and -- crucially -- it is all plain memory-mapped register
+     * writes at REG_PLATFORM_ON_CHIP_BASE (0x80000000). NO privileged instructions: an
+     * earlier build used rd/wr %psr, which trapped into the firmware handler (this AP is
+     * unprivileged) and dumped a panic trace (RODATA, ...) onto the screen. Masking a
+     * source at the controller deasserts its line, so the CPU never sees it regardless of
+     * the PSR interrupt level -- the controller writes alone are sufficient. */
+    {
+        volatile uint32_t *P = (volatile uint32_t *)0x80000000u;
+        P[0x090 / 4] = 0x00000000u;   /* INT_MASK_PRIORITY          */
+        P[0x0B0 / 4] = 0xFFFFFFFFu;   /* PROC1_1ST_INT_MASK_ENABLE  -> mask all 1st-level */
+        P[0x0B4 / 4] = 0x00000000u;   /* PROC1_1ST_INT_PENDING      */
+        P[0x0B8 / 4] = 0xFFFFFFFFu;   /* PROC1_1ST_INT_CLEAR        */
+        P[0x0D0 / 4] = 0xFFFFFFFFu;   /* PROC1_2ND_INT_MASK_ENABLE  -> mask all 2nd-level */
+        P[0x0D4 / 4] = 0x00000000u;   /* PROC1_2ND_INT_PENDING      */
+        P[0x0D8 / 4] = 0xFFFFFFFFu;   /* PROC1_2ND_INT_CLEAR        */
+    }
 
     mp_hal_stdout_tx_strn("\n[pyapp] MicroPython launched inside the firmware\n", 49);
 

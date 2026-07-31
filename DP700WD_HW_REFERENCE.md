@@ -7966,3 +7966,41 @@ sole input; without a keyboard it remains the fallback console. One flag
 This is the actual cure for the "OS crosstalk"; 10.52's PROC2 halt + interrupt mask are
 kept (harmless, and they close the direct-framebuffer path) but were not what was feeding
 the garbage -- it came in through the serial input the whole time.
+
+### 10.54 The crosstalk is the firmware RTOS: mask interrupts like the stock AP loader
+
+The decisive clue: with an image file on the SD card the AP will not boot at all, and even
+renamed to an extension the firmware can't decode -- only removing it lets the AP run. That
+is the stock firmware's photo-frame application still alive: it probes the card, enters its
+decode/slideshow path, and its UI thread paints the OSD (DVD language-menu text: CUSTOM,
+CLOCK, FRENCH...) and consumes input. "Holds for one Enter but not two" is a firmware timer
+firing between keypresses and its thread grabbing the screen. So the "crosstalk" was never
+our input path (the halted-qTD fix in 10.53b was still correct, but not the cause) -- it is
+the firmware RTOS running underneath our AP.
+
+The fix is what the stock AP loader itself does to seize the machine (aploader.c:474-482):
+mask every interrupt source at the platform interrupt controller. Its timer interrupt is
+what drives the RTOS scheduler, so with all sources masked no ISR fires on this core, the
+scheduler never preempts us, and the UI thread never runs again. Done at the top of
+`pyapp_main` with plain memory-mapped writes at 0x80000000:
+
+```
+    0x090 INT_MASK_PRIORITY         = 0
+    0x0B0 PROC1_1ST_INT_MASK_ENABLE = 0xFFFFFFFF   ; mask all 1st-level
+    0x0B4 PROC1_1ST_INT_PENDING     = 0
+    0x0B8 PROC1_1ST_INT_CLEAR       = 0xFFFFFFFF
+    0x0D0 PROC1_2ND_INT_MASK_ENABLE = 0xFFFFFFFF   ; mask all 2nd-level
+    0x0D4 PROC1_2ND_INT_PENDING     = 0
+    0x0D8 PROC1_2ND_INT_CLEAR       = 0xFFFFFFFF
+```
+
+CRITICAL difference from the failed 10.52 attempt: these are memory-mapped register writes,
+NOT privileged instructions. The earlier build masked with rd/wr %psr, which this
+unprivileged AP cannot execute -- they trapped into the firmware handler and dumped a panic
+(RODATA, register state) onto the OSD, making things worse. Masking a source at the
+controller deasserts its line, so the CPU never sees the interrupt regardless of PSR.PIL;
+the controller writes alone suffice and need no privilege.
+
+Note: this stops crosstalk once our AP is RUNNING. It cannot fix the boot-time symptom (an
+image on the card sends the firmware down a path that never loads the AP) -- removing the
+file before flashing/booting is still required until the AP is reached.

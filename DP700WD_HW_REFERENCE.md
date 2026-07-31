@@ -8069,3 +8069,78 @@ the two sectors the ~700-byte dump needs. Reading the flushed image back off dis
 full formatted dump landing correctly at DUMP.TXT's data offset, zero-padded tail, and sector
 163 (one past the write) still holding the original filler dots untouched -- the chain walk
 stopped exactly where it should.
+
+### 10.56 ★ Why extra files on the card block AP boot: .TXT is a SUBTITLE extension
+
+Symptom (hardware): `UPG952A.AP` alone on the card boots the AP reliably, but adding a
+64 KB `DUMP.TXT` placeholder stops the AP from loading at all. Earlier the same was seen with
+a JPG. The open question was whether the blocker is file SIZE or file TYPE. It is **type**,
+and the mechanism is exact.
+
+**The gate (ROM 0x254a4).** Exactly one instruction pair in the whole ROM references the
+string `"UPG952A.AP"` (0xe7658): at 0x2554c, inside the function at 0x254a4. That function
+does NOT start by looking for the AP. It first calls the card scan at 0x25d58 with two
+out-params (`%fp-12`, `%fp-16`):
+
+```
+254f4  add %fp,-12,%o1        ; &A
+254f8  add %fp,-16,%o2        ; &B
+254fc  clr %o4                ; mask hi = 0
+25500  call 0x25d58
+25504  mov -1,%o5             ; mask lo = 0xFFFFFFFF
+25508  ld [%fp-16],%o0 ; cmp 0 ; bne -> return FALSE      <-- B must be 0
+25518  ld [%fp-12],%o0 ; cmp 0 ; bne -> return FALSE      <-- A must be 0
+25528  ...build "/" + "UPG952A.AP", open it...
+```
+
+Only if **both** come back zero does it build the path and open the AP. Otherwise it returns
+FALSE and the AP is never even looked for -- which presents exactly as "the frame ignores the
+AP and boots normally".
+
+**What the two counts are (0x12e18, called via the 0x25d58 wrapper).** The scan fills a
+per-category stats array (base `[0x40021db8]`, 12-byte stride):
+
+```
+12e5c  ld [%o1+8],%l4                  ; l4 = entry[0]                -> stored to *B
+loop i = 1..0x2a (42):
+12e74    call 0xdd904                  ; bit = 1 << (i-1)  (64-bit)
+12e7c    and %i4,hi ; and %i5,lo       ; test bit against the caller's mask
+12e98    ld [%l2 + i*12],%o1
+12e9c    add %l1,%o1,%l1               ; l1 += entry[i]  (only if bit set)
+12f00  st %l4,[%i2]                    ; *B = entry[0]
+12f04  st %l1,[%i1]                    ; *A = sum of selected entries
+```
+
+With the caller's mask `hi=0, lo=0xFFFFFFFF`, `A` sums categories 1..32 and `B` is category 0
+-- i.e. **the gate requires zero files across categories 0..32**. Categories 33+ are outside
+the mask and are not counted at all.
+
+**The category list is an extension table at 0xe6a80** -- 40 entries, 8-byte stride, matching
+the loop bound of 42:
+
+```
+ 0 PSB   1 SMI   2 SUB   3 TXT   4 ASS   5 SSA   6 SRT      <-- subtitle formats
+ 7 MP3   8 MP2   9 WMA  10 JPG  11 JPEG 12 JPE  13 DAT
+14 VOB  15 AVI  16 MPG  17 MPEG 18 MPE  19 AMR  20 AWB
+21 BMP  22 GIF  23 GIFF 24 TIF  25 TIFF 26 OGG  27 AAC
+28 MP4  29 MOV  30 3GP  31 3G2  32 WAV
+33 PNG  34 HDP  35 WDP  36 DIVX 37 DIV  38 XVID 39 XVI      <-- outside the mask
+```
+
+**The answer.** The subtitle matcher at 0x1229c loops indices 1..6 over the first seven entries
+(`PSB, SMI, SUB, TXT, ASS, SSA, SRT`), strncmp'ing 3 chars each. **`.TXT` is not an inert text
+file to this firmware -- it is a subtitle format.** A `DUMP.TXT` on the card is therefore counted
+as a media file, the scan returns nonzero, and the AP gate bails before ever looking for
+`UPG952A.AP`. Size is irrelevant: a 512-byte `.TXT` blocks exactly as much as a 64 KB one.
+(The earlier "large file blocks it" reading was a confound -- the large file also happened to
+carry a counted extension.)
+
+This equally explains why `UPG952A.AP` never blocks *itself*: `AP` is absent from the table, so
+it is classified into no category and is invisible to the scan.
+
+**Consequence for the card-dump AP.** The placeholder must carry an extension absent from that
+40-entry table. `.BIN`, `.LOG`, `.RAW`, `.OUT`, `.CSV`, `.DMP`, `.REG` all qualify; `.TXT`,
+`.DAT`, `.JPG`, `.BMP`, `.SUB`, `.SRT` etc. do not. `carddump.c` therefore looks for **`DUMP.BIN`**.
+Verified in the emulator with BOTH files on one card (`UPG952A.AP` at sector 161, `DUMP.BIN` at
+169): the AP walks the FAT past its own clusters and writes the dump into sectors 169-170,
+leaving the AP untouched.

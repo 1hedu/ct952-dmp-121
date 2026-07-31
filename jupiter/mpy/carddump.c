@@ -14,15 +14,15 @@
  *
  * Because mm_file.c (the firmware's file layer) is read-only -- it can find
  * and read files but has no code path to create one or grow the FAT -- this
- * AP cannot create DUMP.TXT itself. It can only overwrite sectors already
+ * AP cannot create DUMP.BIN itself. It can only overwrite sectors already
  * belonging to a file the FAT already maps. The workflow is:
- *   1. From a PC, drop a placeholder DUMP.TXT onto the card (filler bytes,
+ *   1. From a PC, drop a placeholder DUMP.BIN onto the card (filler bytes,
  *      sized for the expected dump + slack -- see build_carddump.sh).
  *   2. Run this AP on the frame: it walks the card's own FAT (16 or 32,
- *      whichever the card actually uses) to find DUMP.TXT's data sectors,
+ *      whichever the card actually uses) to find DUMP.BIN's data sectors,
  *      formats a register dump, and writes it over the placeholder bytes
  *      via CARD_WriteSector-equivalent direct SDC commands.
- *   3. Pull the card, read DUMP.TXT on the PC.
+ *   3. Pull the card, read DUMP.BIN on the PC.
  */
 #include <stdint.h>
 
@@ -318,9 +318,19 @@ static uint32_t build_dump(void)
     return (uint32_t)((uint8_t *)p - g_dump);
 }
 
-/* "DUMP    TXT" -- 8.3 directory-entry name for the preseeded DUMP.TXT. */
+/* 8.3 directory-entry name for the preseeded placeholder: DUMP.BIN.
+ *
+ * The extension matters. The firmware's AP-discovery gate (ROM 0x254a4) only
+ * looks for UPG952A.AP if its card scan counts ZERO media files, and its
+ * extension table (ROM 0xe6a80, 40 entries) classifies .TXT as a SUBTITLE
+ * format -- it sits alongside PSB/SMI/SUB/ASS/SSA/SRT in the subtitle matcher
+ * at 0x1229c. So a .TXT placeholder counts as media, the scan returns nonzero,
+ * and the AP is never loaded at all. An extension absent from that table is
+ * invisible to the scan -- which is exactly why UPG952A.AP does not block
+ * itself. .BIN is absent, so it is safe. Do NOT use .TXT/.DAT/.JPG/.LOG-like
+ * names that appear in the table. §10.56. */
 static const uint8_t DUMP_NAME[11] = {
-    'D','U','M','P',' ',' ',' ',' ','T','X','T'
+    'D','U','M','P',' ',' ',' ',' ','B','I','N'
 };
 
 /* In-bounds scratch word on the real 2 MB frame (top of DRAM, below the AP

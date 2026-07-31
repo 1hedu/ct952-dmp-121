@@ -8144,3 +8144,36 @@ it is classified into no category and is invisible to the scan.
 Verified in the emulator with BOTH files on one card (`UPG952A.AP` at sector 161, `DUMP.BIN` at
 169): the AP walks the FAT past its own clusters and writes the dump into sectors 169-170,
 leaving the AP untouched.
+
+### 10.57 ★ The AP loader leaves the SD clock OFF (measured): CLK_CTRL = 0x0000
+
+The card-dump AP's first hardware run reported `FAIL STEP 0` (card read failed) with this
+pre-flight register readout, taken before issuing any SD command:
+
+```
+HV=00001000    SLOT_INT_STAT=0x0000, HOST_VER=0x1000 -> controller alive, SDHC spec v1.00
+CK=00000A00    CLK_CTRL(0x2c)=0x0000, TIMEOUT_CTRL(0x2e)=0x0A, SW_RESET(0x2f)=0x00
+ST=000F0000    CARD_INS|CARD_STAT_STABLE|CD_PIN|WP_PIN -- card present, stable, write-enabled,
+               and BOTH CMD_INHIBIT bits clear (controller ready to accept a command)
+IS=00030000    CMD_COMPLETE|TRAN_COMPLETE -- stale, left over from the loader's own AP read
+```
+
+**CLK_CTRL = 0x0000 is the whole story: `INCLK_ENABLE` and `SDCLK_ENABLE` are both clear.**
+The AP loader powers the SD clock down once it has finished reading the AP body off the card.
+The controller stays addressable and the card stays inserted and ready, but with no clock
+nothing can be shifted onto the bus, so every command times out. Any AP that wants to touch
+the card after being loaded from it MUST re-enable the clock first -- being loaded from the
+card is no guarantee the interface is still live.
+
+Bring-up order (SDHC spec, `sdc_clock_on` in carddump.c): set `PW_CTRL` = BUS_VOL_33V|BUS_PW_ON,
+write CLK_CTRL = 0 to stop the clock while the divider changes, write the divider together with
+`INCLK_ENABLE`, poll for `INCLK_STABLE`, and only then OR in `SDCLK_ENABLE`. The AP uses
+freq_sel 0x40 (base/128) -- deliberately slow, because re-identification has to happen at a low
+clock and a few hundred sectors is not worth tuning for.
+
+Note this is invisible in the emulator: its SDC model ignores CLK_CTRL entirely and answers
+commands regardless, so the whole class of "interface left powered down" bugs only appears on
+silicon. Two other real-silicon-only issues were fixed alongside (see 10.56 commit): SDMA
+buffers must be 512-aligned (the BLK_SIZE DMA-boundary field defaults to 4 KB and a straddling
+transfer stalls mid-flight), and polled drivers must set Interrupt Status Enable (0x34) or the
+status bits they poll are never permitted to latch.

@@ -128,6 +128,15 @@ static void osd_init(void)
 #define SDC_INT_STAT   SDC_R32(0x30)
 #define SDC_INT_STAT_EN SDC_R32(0x34)
 #define SDC_INT_EN      SDC_R32(0x38)
+#define SDC_R8(o)      (*(volatile uint8_t *)(SDC_BASE + (o)))
+#define SDC_PW_CTRL    SDC_R8(0x29)
+#define SDC_CLK_CTRL   SDC_R16(0x2c)
+#define SDC_TIMEOUT    SDC_R8(0x2e)
+#define SDC_CPBLT0     SDC_R32(0x40)
+
+#define CLK_INCLK_ENABLE (1u << 0)
+#define CLK_INCLK_STABLE (1u << 1)
+#define CLK_SDCLK_ENABLE (1u << 2)
 
 #define STAT_CMD_INHIBIT_CMD (1u << 0)
 #define STAT_CMD_INHIBIT_DAT (1u << 1)
@@ -200,6 +209,33 @@ static void sdc_prepare(void)
     SDC_INT_EN = 0;                  /* no CPU interrupt signalling */
     SDC_INT_STAT = 0xFFFFFFFFu;      /* clear anything stale (write-1-to-clear) */
     SDC_INT_STAT_EN = 0xFFFFFFFFu;   /* allow every status bit to latch */
+}
+
+/* Turn the SD clock back on.
+ *
+ * MEASURED on hardware: after the AP loader has finished reading the AP off the
+ * card it leaves CLK_CTRL (0x2c) = 0x0000 -- both the internal clock and SDCLK
+ * disabled -- while the controller itself stays alive (HOST_VER reads 0x1000)
+ * and the card stays inserted and ready (STAT = 0x000F0000, both CMD_INHIBIT
+ * bits clear). With no clock nothing can be shifted to the card, so every
+ * command times out. That is what made the first read fail.
+ *
+ * Bring it up in the order the SDHC spec requires: set the divider together
+ * with INCLK_ENABLE, wait for INCLK_STABLE, and only then gate SDCLK on.
+ * freq_sel is the 8-bit divided-clock selector (base / (2*freq_sel)); a large
+ * divider is deliberate here, since re-identification must happen at a low
+ * clock and a dump of a few hundred sectors is not worth tuning for. */
+static int sdc_clock_on(uint32_t freq_sel)
+{
+    long t;
+    SDC_PW_CTRL = 0x0Fu;                 /* BUS_VOL_33V (7<<1) | BUS_PW_ON */
+    SDC_CLK_CTRL = 0;                    /* stop the clock while the divider changes */
+    SDC_CLK_CTRL = (uint16_t)(((freq_sel & 0xFFu) << 8) | CLK_INCLK_ENABLE);
+    for (t = SDC_POLL; !(SDC_CLK_CTRL & CLK_INCLK_STABLE) && t; t--) { }
+    if (!t) return -1;                   /* internal clock never stabilised */
+    SDC_CLK_CTRL |= CLK_SDCLK_ENABLE;
+    SDC_TIMEOUT = 0x0E;                  /* near-max data timeout; we are not tuning */
+    return 0;
 }
 
 /* CMD0/8/ACMD41/2/3/7: the same init sequence the retail SDC driver uses
@@ -496,6 +532,7 @@ int pyapp_main(void)
     uint32_t sig = 0, s0hi = 0, s0lo = 0, ist = 0;
     int step = 0;              /* last step reached: 1 read, 2 mount, 3 find, 4 write */
     int reinit = 0;            /* did we have to re-run card identification? */
+    int clkrc = 0;             /* did the SD clock come up? */
     int ok;
     char *p;
 
@@ -510,6 +547,7 @@ int pyapp_main(void)
     ln_clear(); p = g_line;
     p = ln_str(p, "HV=");  p = ln_hex(p, SDC_R32(0xfc), 8);
     p = ln_str(p, " CK="); p = ln_hex(p, SDC_R32(0x2c), 8);
+    p = ln_str(p, " CP="); p = ln_hex(p, SDC_CPBLT0, 8);
     osd_text(1, g_line);
 
     ln_clear(); p = g_line;
@@ -522,6 +560,11 @@ int pyapp_main(void)
      * that if a stage stalls the last line standing says exactly where. */
     stage("PREPARE");
     sdc_prepare();
+
+    /* The loader leaves the SD clock off (see sdc_clock_on): without this every
+     * command below times out, which is exactly what "FAIL STEP 0" was. */
+    stage("SD CLOCK ON");
+    clkrc = sdc_clock_on(0x40);          /* base/128: safe for re-identification */
 
     /* The firmware already identified and read this card (it loaded us from
      * it), so try it in the state it was left in first. A blind CMD0 would
@@ -587,6 +630,8 @@ int pyapp_main(void)
     p = ln_str(p, "SIG=");   p = ln_hex(p, sig, 4);
     p = ln_str(p, " CL=");   p = ln_hex(p, clus, 4);
     p = ln_str(p, " SZ=");   p = ln_hex(p, fsize, 8);
+    p = ln_str(p, " CK2=");  p = ln_hex(p, SDC_CLK_CTRL, 4);
+    p = ln_str(p, clkrc == 0 ? " CLKOK" : " CLKBAD");
     osd_text(6, g_line);
 
     cache_flush();

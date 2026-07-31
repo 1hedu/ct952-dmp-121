@@ -30,6 +30,7 @@ void do_str(const char *src, mp_parse_input_kind_t input_kind) {
 #endif
 
 static char *stack_top;
+static uint32_t g_diag_mask1, g_diag_mask2, g_diag_clk;   /* startup register readback */
 #if MICROPY_ENABLE_GC
 static char heap[MICROPY_HEAP_SIZE];
 #endif
@@ -143,6 +144,12 @@ int pyapp_main(void) {
          * hardware so it does not need PROC2. (A full write to RESET_CONTROL_ENABLE would
          * disturb every other block's reset, so use the clock gate, not the reset.) */
         P[0x300 / 4] = P[0x300 / 4] | 0x00000001u;
+
+        /* DIAGNOSTIC: read the masks / clock gate straight back so we can see on screen
+         * whether the writes actually stuck (the firmware could be re-enabling them). */
+        g_diag_mask1 = P[0x0B0 / 4];
+        g_diag_mask2 = P[0x0D0 / 4];
+        g_diag_clk   = P[0x300 / 4];
     }
 
     mp_hal_stdout_tx_strn("\n[pyapp] MicroPython launched inside the firmware\n", 49);
@@ -218,8 +225,20 @@ int pyapp_main(void) {
         mp_printf(&mp_plat_print, "[pyapp] no USB keyboard (step %d); REPL reads UART1\n",
                   usb_kbd_failstep());
     }
+    /* ===== DIAGNOSTIC BUILD (temporary): do NOT start the REPL. =====
+     * Print the register readback once and spin, so the screen shows ONLY this plus
+     * whatever the FIRMWARE paints -- with no REPL running, nothing from our side can be
+     * mistaken for crosstalk. Reading it:
+     *   M1/M2 = FFFFFFFF and CLK bit0 = 1  -> our interrupt masks + PROC2 clock gate STUCK.
+     *   If firmware menu text (FREN/GERM/RODATA...) STILL appears over this static line,
+     *     the firmware is running despite the masks/gate -> it is not on PROC1 and the
+     *     clock gate did not stop it, so the next fix targets a different mechanism.
+     *   If the screen stays clean (just this line), the firmware was quiet and the garbage
+     *     came from our own input/REPL path, which is then where I look. */
+    mp_printf(&mp_plat_print, "DIAG M1=%08x M2=%08x CLK=%08x kbd=%d\n",
+              (unsigned)g_diag_mask1, (unsigned)g_diag_mask2,
+              (unsigned)g_diag_clk, kbd_ok);
     for (;;) {
-        if (pyexec_friendly_repl() != 0) break;
     }
     #endif
 

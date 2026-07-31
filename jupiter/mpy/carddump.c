@@ -145,21 +145,37 @@ static void osd_init(void)
 #define TM_DMA  (1u << 0)
 #define TM_READ (1u << 4)
 
-/* Issue one SD command and wait for completion (CMD, then DAT if present). */
+/* Poll budget per wait. Deliberately small: every wait here is a busy loop over
+ * an MMIO read, and this AP has no watchdog, no console and no way to be
+ * interrupted -- an over-long budget is indistinguishable from a hang. A few
+ * hundred thousand MMIO reads is already far longer than any healthy SD command
+ * takes, so anything that exhausts it is broken, not slow. */
+#define SDC_POLL 200000L
+
+/* Issue one SD command and wait for completion (CMD, then DAT if present).
+ * Returns 0 only on genuine completion; -1 on controller error OR timeout.
+ * (Timeout MUST be an error: leaving it as success made a dead controller look
+ * like a good read returning a zero-filled sector.) */
 static int sdc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t tran_mode,
                     uint32_t resp[4])
 {
     uint32_t st = 0;
     long t;
-    for (t = 2000000; (SDC_STAT & STAT_CMD_INHIBIT_CMD) && t; t--) { }
-    if (tran_mode)
-        for (t = 2000000; (SDC_STAT & STAT_CMD_INHIBIT_DAT) && t; t--) { }
+    for (t = SDC_POLL; (SDC_STAT & STAT_CMD_INHIBIT_CMD) && t; t--) { }
+    if (!t) return -1;                     /* controller never released the CMD line */
+    if (tran_mode) {
+        for (t = SDC_POLL; (SDC_STAT & STAT_CMD_INHIBIT_DAT) && t; t--) { }
+        if (!t) return -1;
+    }
     SDC_ARG = arg;
     SDC_TRAN_MODE = (uint16_t)tran_mode;
     SDC_CMD = (uint16_t)(((idx & 0x3fu) << 8) | flags);
-    for (t = 4000000; !((st = SDC_INT_STAT) & (INT_CMD_COMPLETE | INT_ERR)) && t; t--) { }
-    if (tran_mode && !(st & INT_ERR))
-        for (t = 8000000; !((st = SDC_INT_STAT) & (INT_TRAN_COMPLETE | INT_ERR)) && t; t--) { }
+    for (t = SDC_POLL; !((st = SDC_INT_STAT) & (INT_CMD_COMPLETE | INT_ERR)) && t; t--) { }
+    if (!t) { SDC_INT_STAT = 0xFFFFFFFFu; return -1; }      /* no command completion */
+    if (tran_mode && !(st & INT_ERR)) {
+        for (t = SDC_POLL; !((st = SDC_INT_STAT) & (INT_TRAN_COMPLETE | INT_ERR)) && t; t--) { }
+        if (!t) { SDC_INT_STAT = 0xFFFFFFFFu; return -1; }  /* no transfer completion */
+    }
     SDC_INT_STAT = st;                     /* write-1-to-clear */
     if (resp) { resp[0] = SDC_RESP0; resp[1] = SDC_RESP1; resp[2] = SDC_RESP2; resp[3] = SDC_RESP3; }
     return (st & INT_ERR) ? -1 : 0;
@@ -193,11 +209,15 @@ static int sdc_init(void)
 {
     uint32_t resp[4] = {0, 0, 0, 0};
     long tries;
-    sdc_cmd(0, 0, F_RESP_LEN_0, 0, 0);                      /* GO_IDLE_STATE */
-    sdc_cmd(8, 0x1AAu, F_RESP_LEN_48, 0, resp);              /* SEND_IF_COND */
-    for (tries = 0; tries < 200000; tries++) {
-        sdc_cmd(55, 0, F_RESP_LEN_48, 0, 0);                 /* APP_CMD */
-        sdc_cmd(41, 0x40FF8000u, F_RESP_LEN_48, 0, resp);     /* SD_SEND_OP_COND, HCS */
+    /* Bail immediately if the very first command cannot even be issued -- there
+     * is no point running an identification sequence against a controller that
+     * is not responding, and grinding through it is what previously looked like
+     * a hang (200000 retries x a multi-million-iteration poll each). */
+    if (sdc_cmd(0, 0, F_RESP_LEN_0, 0, 0) < 0) return -1;    /* GO_IDLE_STATE */
+    sdc_cmd(8, 0x1AAu, F_RESP_LEN_48, 0, resp);              /* SEND_IF_COND (may fail on v1) */
+    for (tries = 0; tries < 512; tries++) {                  /* ACMD41 busy-wait, bounded */
+        if (sdc_cmd(55, 0, F_RESP_LEN_48, 0, 0) < 0) return -1;   /* APP_CMD */
+        if (sdc_cmd(41, 0x40FF8000u, F_RESP_LEN_48, 0, resp) < 0) return -1; /* HCS */
         if (resp[0] & 0x80000000u) break;                     /* card done, not busy */
     }
     if (!(resp[0] & 0x80000000u)) return -1;
@@ -458,6 +478,17 @@ static char *ln_hex(char *p, uint32_t v, int digits)
     return p;
 }
 
+/* Name the stage in progress on row 3 and push it to the panel immediately.
+ * Whatever is showing when the AP stops IS the stage that failed. */
+static void stage(const char *s)
+{
+    int x, y;
+    for (y = 3 * 8; y < 3 * 8 + 8; y++)      /* clear pixels: a space GLYPH draws nothing */
+        for (x = 0; x < OSD_VIS_W; x++) px(x, y, 0);
+    osd_text(3, s);
+    cache_flush();
+}
+
 int pyapp_main(void)
 {
     fatinfo_t fi;
@@ -471,6 +502,25 @@ int pyapp_main(void)
     STATUS_WORD = 0x00000001u;
     osd_init();
     osd_text(0, "CT952 CARD DUMP AP");
+
+    /* Show the controller's raw state BEFORE issuing any command, and flush so
+     * it is on the panel even if everything after this stalls. If HV reads as
+     * 0x00000000 or 0xFFFFFFFF the controller is not even addressable (gated
+     * clock / powered down) and no amount of SD protocol will help. */
+    ln_clear(); p = g_line;
+    p = ln_str(p, "HV=");  p = ln_hex(p, SDC_R32(0xfc), 8);
+    p = ln_str(p, " CK="); p = ln_hex(p, SDC_R32(0x2c), 8);
+    osd_text(1, g_line);
+
+    ln_clear(); p = g_line;
+    p = ln_str(p, "ST=");  p = ln_hex(p, SDC_STAT, 8);
+    p = ln_str(p, " IS="); p = ln_hex(p, SDC_INT_STAT, 8);
+    osd_text(2, g_line);
+    cache_flush();
+
+    /* From here on, name the stage on screen BEFORE entering it and flush, so
+     * that if a stage stalls the last line standing says exactly where. */
+    stage("PREPARE");
     sdc_prepare();
 
     /* The firmware already identified and read this card (it loaded us from
@@ -478,14 +528,19 @@ int pyapp_main(void)
      * knock a working card back to idle and demand a full re-identification
      * at a clock rate we never programmed -- so only re-init if the plain
      * read actually fails. */
+    stage("READ SEC0");
     ok = (sdc_read_block(0, g_sector) == 0 &&
           g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
     if (!ok) {
         reinit = 1;
-        if (sdc_init() == 0)
+        stage("CARD INIT");
+        if (sdc_init() == 0) {
+            stage("READ SEC0 #2");
             ok = (sdc_read_block(0, g_sector) == 0 &&
                   g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
+        }
     }
+    stage("PARSE FAT");
 
     /* Capture what sector 0 actually looks like -- enough to tell a dead DMA
      * (zeros/0xFF) from a byte-order problem (recognisable bytes in the wrong
@@ -513,31 +568,26 @@ int pyapp_main(void)
     STATUS_WORD = (step == 4) ? (0x600D0000u | (len & 0xFFFFu))
                               : (0xBAD00000u | (uint32_t)step);
 
+    stage(step == 4 ? "DONE" : "STOPPED");
+
     ln_clear(); p = g_line;
-    p = ln_str(p, step == 4 ? "OK  WROTE " : "FAIL AT STEP ");
+    p = ln_str(p, step == 4 ? "OK WROTE " : "FAIL STEP ");
     p = ln_hex(p, step == 4 ? len : (uint32_t)step, step == 4 ? 4 : 1);
-    p = ln_str(p, reinit ? "  (REINIT)" : "  (ASIS)");
-    osd_text(2, g_line);
+    p = ln_str(p, reinit ? " REINIT" : " ASIS");
+    p = ln_str(p, " (0RD 1MNT 2FIND 3WR 4OK)");
+    osd_text(4, g_line);
 
     ln_clear(); p = g_line;
     p = ln_str(p, "SEC0=");  p = ln_hex(p, s0hi, 8);
     *p++ = ' ';              p = ln_hex(p, s0lo, 8);
-    osd_text(3, g_line);
+    p = ln_str(p, " IS=");   p = ln_hex(p, ist, 8);
+    osd_text(5, g_line);
 
     ln_clear(); p = g_line;
     p = ln_str(p, "SIG=");   p = ln_hex(p, sig, 4);
-    p = ln_str(p, " IST=");  p = ln_hex(p, ist, 8);
-    osd_text(4, g_line);
-
-    ln_clear(); p = g_line;
-    p = ln_str(p, "CLUS=");  p = ln_hex(p, clus, 4);
-    p = ln_str(p, " SIZE="); p = ln_hex(p, fsize, 8);
-    osd_text(5, g_line);
-
-    /* Legend, so the failure step is readable without the source at hand:
-     * 0 = card read failed, 1 = FAT mount failed, 2 = DUMP.BIN not found,
-     * 3 = write failed, 4 = success. */
-    osd_text(6, "0RD 1MNT 2FIND 3WR 4OK");
+    p = ln_str(p, " CL=");   p = ln_hex(p, clus, 4);
+    p = ln_str(p, " SZ=");   p = ln_hex(p, fsize, 8);
+    osd_text(6, g_line);
 
     cache_flush();
     for (;;) { }

@@ -49,7 +49,7 @@ void *memset(void *dst, int c, uint32_t n)
 #define OSD_BASE   0x40084000u
 #define OSD_PITCH  292u
 #define OSD_REGION 24576u
-#define OSD_ROWS   72u
+#define OSD_ROWS   56u
 #define OSD_VIS_W  480
 #define C_TXT      2
 
@@ -537,6 +537,50 @@ static void stage(const char *s)
     cache_flush();
 }
 
+
+/* ---- on-screen register grid (the actual deliverable) -------------------
+ * Writing the dump to the card was only ever a way to get these values OUT.
+ * The OSD is now a proven output channel on this frame -- the SD bring-up
+ * numbers were read straight off the panel -- so render the registers there
+ * directly and drop the dependency on the card working at all.
+ *
+ * Layout: 4 cells per row of "LLL=XXXXXXXX " (13 chars), 4*13 = 52 chars =
+ * 416 px, inside the 480 px visible width; 6 rows of registers plus one
+ * status row, inside the MEASURED-safe 56-row window (rows past that shear,
+ * observed on hardware). Labels are the low 3 hex digits of the address where
+ * no better mnemonic fits, so every value is traceable to its register. */
+typedef struct { const char *lbl; uint32_t addr; } regent_t;
+
+#define NREG 24
+static const regent_t REGS[NREG] = {
+    /* clock / interrupt / system */
+    {"T1C", 0x80000048u}, {"IMP", 0x80000090u}, {"M1E", 0x800000B0u}, {"M1P", 0x800000B4u},
+    {"M2E", 0x800000D0u}, {"M2P", 0x800000D4u}, {"CLK", 0x80000300u}, {"CFG", 0x8000031Cu},
+    /* cache + display */
+    {"CCH", 0x80000014u}, {"OPO", 0x80001A50u}, {"OSZ", 0x80001A54u}, {"LB1", 0x80001A28u},
+    /* USB (ChipIdea) */
+    {"UPS", 0xA0000184u}, {"UOT", 0xA00001A4u}, {"UMD", 0xA00001A8u},
+    /* card controller: FCR block + SDC block */
+    {"FFC", 0xA0001000u}, {"FCP", 0xA0001004u}, {"S24", 0xA0001124u},
+    {"S28", 0xA0001128u}, {"S2C", 0xA000112Cu}, {"S30", 0xA0001130u}, {"S34", 0xA0001134u},
+    {"S40", 0xA0001140u}, {"SFC", 0xA00011FCu},
+};
+
+static void draw_regs(void)
+{
+    int i, k;
+    for (i = 0; i < NREG; i++) {
+        int row = i / 4, col = i % 4;
+        char *q;
+        ln_clear(); q = g_line;
+        q = ln_str(q, REGS[i].lbl);
+        *q++ = '=';
+        q = ln_hex(q, *(volatile uint32_t *)REGS[i].addr, 8);
+        for (k = 0; g_line[k]; k++)
+            glyph((col * 13 + k) * 8, row * 8, (uint8_t)g_line[k]);
+    }
+}
+
 int pyapp_main(void)
 {
     fatinfo_t fi;
@@ -548,7 +592,7 @@ int pyapp_main(void)
     int rstrc = 0;             /* did the CMD/DAT line reset complete? */
     int rc0 = 0, rc1 = 0, rc2 = 0;   /* per-command return codes */
     uint32_t st2 = 0;          /* STAT after the read attempts */
-    int ok;
+    int ok, i;
     char *p;
 
     STATUS_WORD = 0x00000001u;
@@ -633,42 +677,22 @@ int pyapp_main(void)
     STATUS_WORD = (step == 4) ? (0x600D0000u | (len & 0xFFFFu))
                               : (0xBAD00000u | (uint32_t)step);
 
-    stage(step == 4 ? "DONE" : "STOPPED");
+    /* The registers are the point of this AP -- draw them regardless of whether
+     * the card write worked, since the OSD is the reliable channel. */
+    for (i = 0; i < (int)OSD_REGION; i++) FB[i] = 0;     /* clear the stage text */
+    draw_regs();
 
+    /* Row 6: how the card attempt went, compactly, so the SD bring-up stays
+     * diagnosable without costing a register row. */
     ln_clear(); p = g_line;
-    p = ln_str(p, step == 4 ? "OK WROTE " : "FAIL STEP ");
-    p = ln_hex(p, step == 4 ? len : (uint32_t)step, step == 4 ? 4 : 1);
-    p = ln_str(p, reinit ? " REINIT" : " ASIS");
-    p = ln_str(p, " (0RD 1MNT 2FIND 3WR 4OK)");
-    osd_text(4, g_line);
-
-    ln_clear(); p = g_line;
-    p = ln_str(p, "SEC0=");  p = ln_hex(p, s0hi, 8);
-    *p++ = ' ';              p = ln_hex(p, s0lo, 8);
-    p = ln_str(p, " SIG=");  p = ln_hex(p, sig, 4);
-    osd_text(5, g_line);
-
-    /* Controller state AFTER the attempts -- the datum that was missing: it
-     * separates "command refused / never issued" (CMD_INHIBIT stuck) from
-     * "command issued but never answered". */
-    ln_clear(); p = g_line;
-    p = ln_str(p, "ST2="); p = ln_hex(p, st2, 8);
-    p = ln_str(p, " IS2="); p = ln_hex(p, ist, 8);
+    p = ln_str(p, step == 4 ? "SD OK W=" : "SD FAIL S=");
+    p = ln_hex(p, step == 4 ? len : (uint32_t)step, 4);
+    p = ln_str(p, " RC="); p = ln_hex(p, (uint32_t)(rc0 & 0xF), 1);
+    *p++ = ',';            p = ln_hex(p, (uint32_t)(rc1 & 0xF), 1);
+    *p++ = ',';            p = ln_hex(p, (uint32_t)(rc2 & 0xF), 1);
+    p = ln_str(p, " ST2="); p = ln_hex(p, st2, 8);
+    p = ln_str(p, " SIG="); p = ln_hex(p, sig, 4);
     osd_text(6, g_line);
-
-    ln_clear(); p = g_line;
-    p = ln_str(p, "RC="); p = ln_hex(p, (uint32_t)(rc0 & 0xF), 1);
-    *p++ = ',';           p = ln_hex(p, (uint32_t)(rc1 & 0xF), 1);
-    *p++ = ',';           p = ln_hex(p, (uint32_t)(rc2 & 0xF), 1);
-    p = ln_str(p, " RST="); p = ln_hex(p, (uint32_t)(rstrc & 0xF), 1);
-    p = ln_str(p, " CK2="); p = ln_hex(p, SDC_CLK_CTRL, 4);
-    p = ln_str(p, clkrc == 0 ? " CLKOK" : " CLKBAD");
-    osd_text(7, g_line);
-
-    ln_clear(); p = g_line;
-    p = ln_str(p, "CL=");  p = ln_hex(p, clus, 4);
-    p = ln_str(p, " SZ="); p = ln_hex(p, fsize, 8);
-    osd_text(8, g_line);
 
     cache_flush();
     for (;;) { }

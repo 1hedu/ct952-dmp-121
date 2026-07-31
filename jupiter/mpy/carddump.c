@@ -49,7 +49,7 @@ void *memset(void *dst, int c, uint32_t n)
 #define OSD_BASE   0x40084000u
 #define OSD_PITCH  292u
 #define OSD_REGION 24576u
-#define OSD_ROWS   56u
+#define OSD_ROWS   72u
 #define OSD_VIS_W  480
 #define C_TXT      2
 
@@ -209,6 +209,18 @@ static void sdc_prepare(void)
     SDC_INT_EN = 0;                  /* no CPU interrupt signalling */
     SDC_INT_STAT = 0xFFFFFFFFu;      /* clear anything stale (write-1-to-clear) */
     SDC_INT_STAT_EN = 0xFFFFFFFFu;   /* allow every status bit to latch */
+}
+
+/* Reset the controller's CMD and DAT state machines (SW_RESET 0x2f, self-clearing).
+ * After the clock has been off, the sequencers can be left mid-transaction from
+ * the loader's last read: commands are then neither accepted nor rejected, which
+ * shows up as INT_STAT gaining no CMD_COMPLETE and no error bit at all. */
+static int sdc_reset_lines(void)
+{
+    long t;
+    SDC_R8(0x2f) = 0x06;                 /* SW_RESET_DAT_LINE | SW_RESET_CMD_LINE */
+    for (t = SDC_POLL; (SDC_R8(0x2f) & 0x06) && t; t--) { }
+    return t ? 0 : -1;
 }
 
 /* Turn the SD clock back on.
@@ -533,6 +545,9 @@ int pyapp_main(void)
     int step = 0;              /* last step reached: 1 read, 2 mount, 3 find, 4 write */
     int reinit = 0;            /* did we have to re-run card identification? */
     int clkrc = 0;             /* did the SD clock come up? */
+    int rstrc = 0;             /* did the CMD/DAT line reset complete? */
+    int rc0 = 0, rc1 = 0, rc2 = 0;   /* per-command return codes */
+    uint32_t st2 = 0;          /* STAT after the read attempts */
     int ok;
     char *p;
 
@@ -566,23 +581,30 @@ int pyapp_main(void)
     stage("SD CLOCK ON");
     clkrc = sdc_clock_on(0x40);          /* base/128: safe for re-identification */
 
-    /* The firmware already identified and read this card (it loaded us from
-     * it), so try it in the state it was left in first. A blind CMD0 would
-     * knock a working card back to idle and demand a full re-identification
-     * at a clock rate we never programmed -- so only re-init if the plain
-     * read actually fails. */
+    /* With the clock restored, clear out any half-finished transaction the
+     * loader left in the CMD/DAT sequencers. Symptom of skipping this: commands
+     * neither complete nor error -- INT_STAT simply never gains CMD_COMPLETE. */
+    stage("LINE RESET");
+    rstrc = sdc_reset_lines();
+    sdc_prepare();                       /* the reset clears the enables too */
+
+    /* Try the card in the state the firmware left it before re-identifying it.
+     * Record each return code separately: "it failed" is not enough to tell a
+     * refused command from a completed-but-wrong one. */
     stage("READ SEC0");
-    ok = (sdc_read_block(0, g_sector) == 0 &&
-          g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
+    rc0 = sdc_read_block(0, g_sector);
+    ok = (rc0 == 0 && g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
     if (!ok) {
         reinit = 1;
         stage("CARD INIT");
-        if (sdc_init() == 0) {
+        rc1 = sdc_init();
+        if (rc1 == 0) {
             stage("READ SEC0 #2");
-            ok = (sdc_read_block(0, g_sector) == 0 &&
-                  g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
+            rc2 = sdc_read_block(0, g_sector);
+            ok = (rc2 == 0 && g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
         }
     }
+    st2 = SDC_STAT;                      /* controller state AFTER the attempts */
     stage("PARSE FAT");
 
     /* Capture what sector 0 actually looks like -- enough to tell a dead DMA
@@ -623,16 +645,30 @@ int pyapp_main(void)
     ln_clear(); p = g_line;
     p = ln_str(p, "SEC0=");  p = ln_hex(p, s0hi, 8);
     *p++ = ' ';              p = ln_hex(p, s0lo, 8);
-    p = ln_str(p, " IS=");   p = ln_hex(p, ist, 8);
+    p = ln_str(p, " SIG=");  p = ln_hex(p, sig, 4);
     osd_text(5, g_line);
 
+    /* Controller state AFTER the attempts -- the datum that was missing: it
+     * separates "command refused / never issued" (CMD_INHIBIT stuck) from
+     * "command issued but never answered". */
     ln_clear(); p = g_line;
-    p = ln_str(p, "SIG=");   p = ln_hex(p, sig, 4);
-    p = ln_str(p, " CL=");   p = ln_hex(p, clus, 4);
-    p = ln_str(p, " SZ=");   p = ln_hex(p, fsize, 8);
-    p = ln_str(p, " CK2=");  p = ln_hex(p, SDC_CLK_CTRL, 4);
-    p = ln_str(p, clkrc == 0 ? " CLKOK" : " CLKBAD");
+    p = ln_str(p, "ST2="); p = ln_hex(p, st2, 8);
+    p = ln_str(p, " IS2="); p = ln_hex(p, ist, 8);
     osd_text(6, g_line);
+
+    ln_clear(); p = g_line;
+    p = ln_str(p, "RC="); p = ln_hex(p, (uint32_t)(rc0 & 0xF), 1);
+    *p++ = ',';           p = ln_hex(p, (uint32_t)(rc1 & 0xF), 1);
+    *p++ = ',';           p = ln_hex(p, (uint32_t)(rc2 & 0xF), 1);
+    p = ln_str(p, " RST="); p = ln_hex(p, (uint32_t)(rstrc & 0xF), 1);
+    p = ln_str(p, " CK2="); p = ln_hex(p, SDC_CLK_CTRL, 4);
+    p = ln_str(p, clkrc == 0 ? " CLKOK" : " CLKBAD");
+    osd_text(7, g_line);
+
+    ln_clear(); p = g_line;
+    p = ln_str(p, "CL=");  p = ln_hex(p, clus, 4);
+    p = ln_str(p, " SZ="); p = ln_hex(p, fsize, 8);
+    osd_text(8, g_line);
 
     cache_flush();
     for (;;) { }

@@ -132,6 +132,17 @@ int pyapp_main(void) {
         P[0x0D0 / 4] = 0xFFFFFFFFu;   /* PROC1_2ND_INT_MASK_ENABLE  -> mask all 2nd-level */
         P[0x0D4 / 4] = 0x00000000u;   /* PROC1_2ND_INT_PENDING      */
         P[0x0D8 / 4] = 0xFFFFFFFFu;   /* PROC1_2ND_INT_CLEAR        */
+
+        /* Halt the SECOND processor. The emulator confirms PROC2 is the firmware's
+         * secondary core (it defaults OFF there, which is why the emulator never shows
+         * the crosstalk); on real silicon it runs firmware, and masking PROC1's
+         * interrupts above does not reach it -- consistent with "no difference". Gate its
+         * clock via a read-modify-write that sets PLAT_MCLK_PROC2_DISABLE (0x80000300
+         * bit 0) without disturbing the other clock gates, which stops it dead. Our AP is
+         * on PROC1, so this halts the OTHER core only, and the display scans out in
+         * hardware so it does not need PROC2. (A full write to RESET_CONTROL_ENABLE would
+         * disturb every other block's reset, so use the clock gate, not the reset.) */
+        P[0x300 / 4] = P[0x300 / 4] | 0x00000001u;
     }
 
     mp_hal_stdout_tx_strn("\n[pyapp] MicroPython launched inside the firmware\n", 49);

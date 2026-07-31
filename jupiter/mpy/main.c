@@ -30,7 +30,6 @@ void do_str(const char *src, mp_parse_input_kind_t input_kind) {
 #endif
 
 static char *stack_top;
-static uint32_t g_diag_mask1, g_diag_mask2, g_diag_clk;   /* startup register readback */
 #if MICROPY_ENABLE_GC
 static char heap[MICROPY_HEAP_SIZE];
 #endif
@@ -126,30 +125,31 @@ int pyapp_main(void) {
      * the PSR interrupt level -- the controller writes alone are sufficient. */
     {
         volatile uint32_t *P = (volatile uint32_t *)0x80000000u;
-        P[0x090 / 4] = 0x00000000u;   /* INT_MASK_PRIORITY          */
-        P[0x0B0 / 4] = 0xFFFFFFFFu;   /* PROC1_1ST_INT_MASK_ENABLE  -> mask all 1st-level */
-        P[0x0B4 / 4] = 0x00000000u;   /* PROC1_1ST_INT_PENDING      */
-        P[0x0B8 / 4] = 0xFFFFFFFFu;   /* PROC1_1ST_INT_CLEAR        */
-        P[0x0D0 / 4] = 0xFFFFFFFFu;   /* PROC1_2ND_INT_MASK_ENABLE  -> mask all 2nd-level */
-        P[0x0D4 / 4] = 0x00000000u;   /* PROC1_2ND_INT_PENDING      */
-        P[0x0D8 / 4] = 0xFFFFFFFFu;   /* PROC1_2ND_INT_CLEAR        */
 
-        /* Halt the SECOND processor. The emulator confirms PROC2 is the firmware's
-         * secondary core (it defaults OFF there, which is why the emulator never shows
-         * the crosstalk); on real silicon it runs firmware, and masking PROC1's
-         * interrupts above does not reach it -- consistent with "no difference". Gate its
-         * clock via a read-modify-write that sets PLAT_MCLK_PROC2_DISABLE (0x80000300
-         * bit 0) without disturbing the other clock gates, which stops it dead. Our AP is
-         * on PROC1, so this halts the OTHER core only, and the display scans out in
-         * hardware so it does not need PROC2. (A full write to RESET_CONTROL_ENABLE would
-         * disturb every other block's reset, so use the clock gate, not the reset.) */
+        /* STOP THE SCHEDULER TICK. TIMER1 is the firmware RTOS system tick
+         * (hsystem.c:45 sets REG_PLAT_TIMER1_RELOAD = 1000*SYSTEM_TICK-1); its interrupt
+         * is what lets the scheduler preempt us and run the firmware's threads -- the
+         * photo-frame / menu / USB threads that painted crosstalk over the REPL and
+         * corrupted our USB polling (which is why it only broke WHILE typing). Writing 0
+         * to TIMER1_CONTROL (0x048) halts the tick, so no firmware thread ever runs again.
+         * We do not use this timer (our delays come from FRINDEX and busy loops), and the
+         * display scans out in hardware, so nothing of ours depends on it. */
+        P[0x048 / 4] = 0x00000000u;   /* TIMER1_CONTROL = 0 -> stop the RTOS tick */
+
+        /* Disable the 1st/2nd-level (display: VSYNC/OSD_END/...) interrupts. MASK_ENABLE
+         * is an ENABLE bitmap -- bit=1 means the source can fire (interrupt.c:141 ANDs it
+         * with PENDING) -- so writing 0 disables them all. (An earlier build wrote all-1s
+         * here, which was backwards.) Clear any pending/latched state too. */
+        P[0x090 / 4] = 0x00000000u;   /* INT_MASK_PRIORITY            */
+        P[0x0B0 / 4] = 0x00000000u;   /* PROC1_1ST_INT_MASK_ENABLE = disable all */
+        P[0x0B8 / 4] = 0xFFFFFFFFu;   /* PROC1_1ST_INT_CLEAR          */
+        P[0x0D0 / 4] = 0x00000000u;   /* PROC1_2ND_INT_MASK_ENABLE = disable all */
+        P[0x0D8 / 4] = 0xFFFFFFFFu;   /* PROC1_2ND_INT_CLEAR          */
+
+        /* Halt the SECOND processor (confirmed stuck: CLK bit0 read back set). Our AP is
+         * on PROC1, so gating PROC2's clock stops the other core without touching us; the
+         * display scans out in hardware and does not need PROC2. */
         P[0x300 / 4] = P[0x300 / 4] | 0x00000001u;
-
-        /* DIAGNOSTIC: read the masks / clock gate straight back so we can see on screen
-         * whether the writes actually stuck (the firmware could be re-enabling them). */
-        g_diag_mask1 = P[0x0B0 / 4];
-        g_diag_mask2 = P[0x0D0 / 4];
-        g_diag_clk   = P[0x300 / 4];
     }
 
     mp_hal_stdout_tx_strn("\n[pyapp] MicroPython launched inside the firmware\n", 49);
@@ -225,20 +225,8 @@ int pyapp_main(void) {
         mp_printf(&mp_plat_print, "[pyapp] no USB keyboard (step %d); REPL reads UART1\n",
                   usb_kbd_failstep());
     }
-    /* ===== DIAGNOSTIC BUILD (temporary): do NOT start the REPL. =====
-     * Print the register readback once and spin, so the screen shows ONLY this plus
-     * whatever the FIRMWARE paints -- with no REPL running, nothing from our side can be
-     * mistaken for crosstalk. Reading it:
-     *   M1/M2 = FFFFFFFF and CLK bit0 = 1  -> our interrupt masks + PROC2 clock gate STUCK.
-     *   If firmware menu text (FREN/GERM/RODATA...) STILL appears over this static line,
-     *     the firmware is running despite the masks/gate -> it is not on PROC1 and the
-     *     clock gate did not stop it, so the next fix targets a different mechanism.
-     *   If the screen stays clean (just this line), the firmware was quiet and the garbage
-     *     came from our own input/REPL path, which is then where I look. */
-    mp_printf(&mp_plat_print, "DIAG M1=%08x M2=%08x CLK=%08x kbd=%d\n",
-              (unsigned)g_diag_mask1, (unsigned)g_diag_mask2,
-              (unsigned)g_diag_clk, kbd_ok);
     for (;;) {
+        if (pyexec_friendly_repl() != 0) break;
     }
     #endif
 

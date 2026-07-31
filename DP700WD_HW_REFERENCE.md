@@ -8004,3 +8004,68 @@ the controller writes alone suffice and need no privilege.
 Note: this stops crosstalk once our AP is RUNNING. It cannot fix the boot-time symptom (an
 image on the card sends the firmware down a path that never loads the AP) -- removing the
 file before flashing/booting is still required until the AP is reached.
+
+### 10.55 Pivot: sidestep crosstalk entirely with a no-Python, no-display card-dump AP
+
+10.52-10.54 chased the REPL's crosstalk (the still-running firmware RTOS repainting the OSD /
+flooding UART) through several controller-write mitigations; TIMER1 stop was the last attempt
+and still gave nothing on hardware. Rather than keep fighting for a shared screen and UART, the
+next tool sidesteps the fight: a standalone AP that needs no interrupts, no display, no
+keyboard at all -- it reads/writes the SD card directly and halts. There is nothing left to
+crosstalk with.
+
+**Why this works where the REPL couldn't.** `start_banner.S`'s `_app_init` already does
+`wr %g1, %psr` with `PIL=15` (all interrupt levels masked) as its very first act, at a point
+where the AP still holds the loader's privileged context -- this is the same instruction that
+backfired in 10.52 when tried *later*, mid-REPL, after the CPU had dropped out of that
+privileged window. Done at entry, before anything else runs, it works cleanly (proven by every
+banner-AP test). The REPL needed interrupts live for vsync (OSD) and UART RX/USB polling, so it
+could never use this. A card-dump AP needs none of that -- SD host controller registers are
+polled synchronously -- so it inherits PIL=15 for free and the firmware RTOS never runs again
+once `pyapp_main` is entered.
+
+**The preseed constraint.** `mm_file.c` (the firmware's file layer) is read-only: it can find
+and read files but has no path to create one or grow a FAT. So the AP cannot create its own
+output file -- it can only overwrite sectors already mapped to a file the FAT already knows
+about. Workflow: drop a placeholder file (`DUMP.TXT`, filler bytes sized to the expected dump +
+slack) onto the card from a PC first; the AP parses the FAT to find that file's data sectors and
+overwrites them with the dump; pull the card and read the file back on the PC. This is true for
+the physical card exactly as much as the emulator's `CT952_SDCARD` image -- there is no
+FAT-write layer either place, so both need the same preseed.
+
+**Implementation (`jupiter/mpy/carddump.c`, built via `build_carddump.sh`, reusing
+`start_banner.S`/`ct952_app.ld` unmodified -- both are generic to any freestanding app in the
+0x400c0000 window, not banner-specific):**
+- Direct SDHC-standard command issuer (`sdc_cmd`) against the SD Host Controller at
+  0xA0001100 (ctkav_sdc.h layout): busy-polls STAT's CMD_INHIBIT_CMD/DAT bits before issuing,
+  then INT_STAT's CMD_COMPLETE/TRAN_COMPLETE/ERR bits after, write-1-to-clear when done.
+- Init sequence mirrors the retail SDC driver's own (`sdc_init`): CMD0, CMD8, ACMD41 (loop
+  until OCR busy-done, HCS+voltage window `0x40FF8000`), CMD2, CMD3 (capture RCA), CMD7 select.
+  No ACMD6/CMD6 bus-width/speed-class negotiation -- reading/writing 512-byte blocks needs
+  neither.
+- FAT16 **and** FAT32 (`fat_mount` distinguishes by FATSz16==0; real cards are almost always
+  FAT32, the `/tmp/card.img` emulator fixture is FAT16 -- both paths share the same directory
+  scanner and FAT-chain walker, differing only in root-dir location: fixed area for FAT16,
+  ordinary cluster chain for FAT32).
+- `fat_find`: linear 8.3-name scan (skips volume-label/subdirectory/LFN entries), returns first
+  cluster + logical size.
+- `fat_write_file`: walks the file's own cluster chain, writing the dump 512 bytes at a time,
+  zero-padding the last sector's tail; stops at end-of-chain, never touches another file's
+  sectors, never writes past what the placeholder actually allocated.
+- Register dump: clock/system (TIMER1, interrupt masks/pending/clear for both PROC1 1st/2nd
+  level, CLK_GATE, SYSCFG1, REG_CACHE), display (OSD_POS/SIZE, LB_CR1), USB (PORTSC/OTGSC/
+  USBMODE), SD host controller's own STAT/INT_STAT -- formatted with a hand-rolled hex/string
+  writer (no libc; `-nostdlib -ffreestanding`, plus a local `memset` since GCC still emits libc
+  calls for some array fills at `-Os` despite `-fno-builtin`).
+- Status word at 0x401f4000 (in-bounds scratch, below the AP unzip buffer) records progress for
+  probe-based inspection even with no screen/UART of its own: 1=started, 0xBAD0000n=failed at
+  step n, 0x600Dnnnn=success with nnnn = bytes written.
+
+**Emulator validation** (`CT952_SDCARD=/tmp/card.img ./ct952emu dp700wd.bin --rom-load --apload
+/tmp/carddump.AP`, card built by `/tmp/mkfat.py`: FAT16, `DUMP.TXT` preseeded at sector 161,
+64 KB of filler): SDC trace confirms CMD0/8/55/41/2/3/7 init, `READ17 sector=0` (boot sector),
+`READ17 sector=129` (FAT lookup), then `WRITE24 sector=161` and `WRITE24 sector=162` -- exactly
+the two sectors the ~700-byte dump needs. Reading the flushed image back off disk shows the
+full formatted dump landing correctly at DUMP.TXT's data offset, zero-padded tail, and sector
+163 (one past the write) still holding the original filler dots untouched -- the chain walk
+stopped exactly where it should.

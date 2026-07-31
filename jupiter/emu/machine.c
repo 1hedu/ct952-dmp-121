@@ -1600,6 +1600,30 @@ static void sdc_data_block(machine_t *m, const uint8_t *buf, uint32_t len,
     }
 }
 
+/* copy `len` bytes from DRAM at `src` into the card image at byte offset `dst`. */
+static void sdc_dma_from_dram(machine_t *m, uint32_t src, uint32_t dst, uint32_t len)
+{
+    uint8_t *s = machine_dram_ptr(m, src);
+    uint32_t i;
+    if (!s || !m->sd_img) return;
+    for (i = 0; i < len; i++)
+        if (dst + i < m->sd_size) m->sd_img[dst + i] = s[i];
+}
+
+/* Flush the (now-modified) card image back to the CT952_SDCARD file, so a write from
+ * the guest is visible on disk even though the run ends by spinning (timeout-killed).
+ * Reopened each time -- fine for a diagnostic write path. */
+static void sdc_flush(machine_t *m)
+{
+    const char *e = getenv("CT952_SDCARD");
+    FILE *f;
+    if (!e || !*e || !m->sd_img || !m->sd_size) return;
+    f = fopen(e, "r+b");
+    if (!f) return;
+    fwrite(m->sd_img, 1, m->sd_size, f);
+    fclose(f);
+}
+
 /* Execute an SD command written to REG_SDC_CMD. */
 static void sdc_do_cmd(machine_t *m, uint32_t cmd_reg, uint32_t tran_mode)
 {
@@ -1673,6 +1697,19 @@ static void sdc_do_cmd(machine_t *m, uint32_t cmd_reg, uint32_t tran_mode)
                   fprintf(stderr, " %08x", m->cpu.pc_ring[(m->cpu.pc_ri + k) & 63]);
               fprintf(stderr, "\n"); }
           } }
+        break; }
+    case 24: case 25: { /* WRITE_SINGLE/MULTIPLE_BLOCK: DMA from DRAM into the card image */
+        uint32_t blkcnt = (idx == 24) ? 1u : (m->sdc_reg[1] & 0xffff);   /* 0x06 BLK_COUNT */
+        uint32_t blksz  = (m->sdc_reg[1] >> 16) & 0xfff;                 /* 0x04 BLK_SIZE   */
+        uint32_t dma    = m->sdc_reg[0];                                 /* 0x00 DMA_ADDR   */
+        if (!blksz) blksz = 512;
+        if (!blkcnt) blkcnt = 1;
+        sdc_dma_from_dram(m, dma, arg * 512u, blkcnt * blksz);           /* CCS=1: ARG=block# */
+        sdc_flush(m);
+        m->sdc_int_stat |= SDCI_TRAN_COMPLETE;
+        if (getenv("CT952_SDCTRACE"))
+            fprintf(stderr, "[SDC] WRITE%d sector=%u count=%u <- dram=%08x pc=%08x icount=%llu\n",
+                    idx, arg, blkcnt, dma, m->cpu.pc, (unsigned long long)m->cpu.icount);
         break; }
     default: break;
     }

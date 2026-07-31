@@ -223,6 +223,44 @@ static int sdc_reset_lines(void)
     return t ? 0 : -1;
 }
 
+/* Full controller reset. CMD_INHIBIT_CMD was observed STUCK at 1 on hardware
+ * after the first command (pre-flight STAT 0x000F0000 -> 0x000F0001) with no
+ * error bit ever set, so resetting just the CMD/DAT lines is not enough. */
+static int sdc_reset_all(void)
+{
+    long t;
+    SDC_R8(0x2f) = 0x01;                 /* SW_RESET_ALL */
+    for (t = SDC_POLL; (SDC_R8(0x2f) & 0x01) && t; t--) { }
+    return t ? 0 : -1;
+}
+
+static void udelay(long n)
+{
+    volatile long i;
+    for (i = 0; i < n * 20; i++) { }
+}
+
+/* System clock gate. Set bit = clock GATED OFF (the same convention as the USB
+ * clock, which had to be ungated by CLEARING bits at this register).
+ *
+ * Hardware read: 0x80140600 -- bits 9, 10, 18, 20, 31 set, i.e. gated. The
+ * firmware carries explicit enable/disable helper pairs for three masks here
+ * (ROM 0x3fd24/0x3fd78 -> bit 0, 0x3fdbc/0x3fe38 -> bits 3+4, 0x40180/0x401dc
+ * -> bits 9+10), and bits 9+10 is the only one of those currently gated off --
+ * the leading candidate for the card interface. Bit 31 is deliberately NOT a
+ * candidate: it is very likely a global/PLL bit and clearing it blind could
+ * take the whole part down, including the display we are reporting on. Every
+ * candidate below only ever CLEARS a set bit, i.e. turns a clock ON, which
+ * cannot disturb the already-working display. */
+#define CLK_GATE (*(volatile uint32_t *)0x80000300u)
+#define NGATE 4
+static const uint32_t GATE_CAND[NGATE] = {
+    0x00000600u,   /* bits 9+10  -- firmware-managed pair, best candidate */
+    0x00040000u,   /* bit 18 */
+    0x00100000u,   /* bit 20 */
+    0x00140600u,   /* all of the above together */
+};
+
 /* Turn the SD clock back on.
  *
  * MEASURED on hardware: after the AP loader has finished reading the AP off the
@@ -592,10 +630,12 @@ int pyapp_main(void)
     int rstrc = 0;             /* did the CMD/DAT line reset complete? */
     int rc0 = 0, rc1 = 0, rc2 = 0;   /* per-command return codes */
     uint32_t st2 = 0;          /* STAT after the read attempts */
-    int ok, i;
+    int ok, i, gi;
+    uint32_t clk_orig, gate = 0;
     char *p;
 
     STATUS_WORD = 0x00000001u;
+    clk_orig = CLK_GATE;
     osd_init();
     osd_text(0, "CT952 CARD DUMP AP");
 
@@ -620,21 +660,32 @@ int pyapp_main(void)
     stage("PREPARE");
     sdc_prepare();
 
-    /* The loader leaves the SD clock off (see sdc_clock_on): without this every
-     * command below times out, which is exactly what "FAIL STEP 0" was. */
-    stage("SD CLOCK ON");
-    clkrc = sdc_clock_on(0x40);          /* base/128: safe for re-identification */
+    /* Hunt the card-interface clock gate.
+     *
+     * Hardware said: after the first command STAT bit 0 (CMD_INHIBIT_CMD) is
+     * stuck at 1 and INT_STAT never gains either CMD_COMPLETE or any error bit,
+     * even though the error-status enables are on (S34=01FF01FF). A command
+     * that is neither answered nor timed out means nothing is being clocked
+     * onto the bus at all -- CLK_CTRL says the SD clock is enabled, so the
+     * missing clock is upstream, at the system gate.
+     *
+     * Rather than cost a hardware round-trip per guess, try each candidate here
+     * and probe it with a real CMD0: bring the controller fully up on that gate
+     * setting and see whether the command completes. First one that completes
+     * wins, and the winning mask is reported on screen. */
+    for (gi = 0; gi < NGATE; gi++) {
+        CLK_GATE = clk_orig & ~GATE_CAND[gi];      /* only ever ungates */
+        stage("GATE PROBE");
+        sdc_reset_all();
+        SDC_R8(0x28) = 0x00;         /* HOST_CTRL: 1-bit, normal speed to identify */
+        SDC_PW_CTRL = 0x0F;          /* BUS_VOL_33V | BUS_PW_ON */
+        sdc_prepare();
+        if (sdc_clock_on(0x40) < 0) continue;
+        udelay(2000);                /* card power/clock ramp before the first command */
+        if (sdc_cmd(0, 0, F_RESP_LEN_0, 0, 0) == 0) { gate = GATE_CAND[gi]; break; }
+    }
+    if (!gate) CLK_GATE = clk_orig;  /* nothing worked: leave the gate as we found it */
 
-    /* With the clock restored, clear out any half-finished transaction the
-     * loader left in the CMD/DAT sequencers. Symptom of skipping this: commands
-     * neither complete nor error -- INT_STAT simply never gains CMD_COMPLETE. */
-    stage("LINE RESET");
-    rstrc = sdc_reset_lines();
-    sdc_prepare();                       /* the reset clears the enables too */
-
-    /* Try the card in the state the firmware left it before re-identifying it.
-     * Record each return code separately: "it failed" is not enough to tell a
-     * refused command from a completed-but-wrong one. */
     stage("READ SEC0");
     rc0 = sdc_read_block(0, g_sector);
     ok = (rc0 == 0 && g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
@@ -648,7 +699,7 @@ int pyapp_main(void)
             ok = (rc2 == 0 && g_sector[0x1fe] == 0x55 && g_sector[0x1ff] == 0xAA);
         }
     }
-    st2 = SDC_STAT;                      /* controller state AFTER the attempts */
+    st2 = SDC_STAT;
     stage("PARSE FAT");
 
     /* Capture what sector 0 actually looks like -- enough to tell a dead DMA
@@ -691,7 +742,7 @@ int pyapp_main(void)
     *p++ = ',';            p = ln_hex(p, (uint32_t)(rc1 & 0xF), 1);
     *p++ = ',';            p = ln_hex(p, (uint32_t)(rc2 & 0xF), 1);
     p = ln_str(p, " ST2="); p = ln_hex(p, st2, 8);
-    p = ln_str(p, " SIG="); p = ln_hex(p, sig, 4);
+    p = ln_str(p, " GATE="); p = ln_hex(p, gate, 8);
     osd_text(6, g_line);
 
     cache_flush();

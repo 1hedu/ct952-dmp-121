@@ -8177,3 +8177,59 @@ silicon. Two other real-silicon-only issues were fixed alongside (see 10.56 comm
 buffers must be 512-aligned (the BLK_SIZE DMA-boundary field defaults to 4 KB and a straddling
 transfer stalls mid-flight), and polled drivers must set Interrupt Status Enable (0x34) or the
 status bits they poll are never permitted to latch.
+
+### 10.58 ★ On-screen register dump, and the card interface has no clock (CMD_INHIBIT stuck)
+
+The OSD turned out to be the reliable way off this board: with the SD write failing, the whole
+24-register dump was rendered to the panel instead (4 cells of `LLL=XXXXXXXX` per row, 6 rows
+plus a status row, inside the MEASURED-safe 56-row window -- 72 rows shears the last line, seen
+on hardware). Photographed off the frame:
+
+```
+T1C=00000003 IMP=00000000 M1E=00000000 M1P=00000000
+M2E=00000000 M2P=00000000 CLK=80140600 CFG=006001BB
+CCH=FF07000F OPO=004E0066 OSZ=10380268 LB1=00300010
+UPS=00000000 UOT=00000000 UMD=00000000 FFC=0E6FACDA
+FCP=000122FF S24=000F0001 S28=060F0000 S2C=40070E00
+S30=01000000 S34=01FF01FF S40=01E022A2 SFC=00001000
+SD FAIL S=0000 RC=F,F,0 ST2=000F0001
+```
+
+**What this pins down.**
+- `S2C=40070E00` -> CLK_CTRL = 0x4007: divider 0x40, INCLK_ENABLE|INCLK_STABLE|SDCLK_ENABLE all
+  set, and byte 0x2f = 0 so the line reset self-cleared. The SD clock enable *took*.
+- `S28=060F0000` -> HOST_CTRL 0x06 (4-bit, high speed), PW_CTRL 0x0F (BUS_PW_ON, 3.3 V). Bus
+  power is on; that write stuck.
+- `S34=01FF01FF` -> only the low 9 bits of each half are writable, but that includes
+  CMD_COMPLETE and CMD_TIMEOUT, so status latching is correctly enabled.
+- `FFC=0E6FACDA` -> FCR_FUNC_CTRL: LITTLE_ENDIAN (bit 23) = 0, confirming the register reads
+  above are correctly ordered; SW_CDWP_ENABLE = 0 (real card-detect pins, not overridden).
+- **`S24=000F0001` is the finding.** Pre-flight STAT read `0x000F0000` -- CMD_INHIBIT_CMD CLEAR.
+  After the first command it is `0x000F0001`, i.e. **stuck busy**, and `S30=01000000` shows
+  neither CMD_COMPLETE nor the error summary despite timeouts being enabled.
+
+A command that is neither answered nor timed out is not a protocol failure -- nothing is being
+clocked onto the bus at all. Since CLK_CTRL is enabled, the missing clock is upstream of the
+controller, at the system gate.
+
+**The gate.** `CLK=0x80140600` (0x80000300) has bits 9, 10, 18, 20, 31 set, and on this SoC a
+SET bit means the clock is GATED OFF -- the same convention as the USB clock, which had to be
+ungated by CLEARING bits here. The firmware carries three explicit enable/disable helper pairs
+for this register:
+
+| ROM enable (clear) | ROM disable (set) | mask |
+|---|---|---|
+| 0x3fd24 | 0x3fd78 | bit 0 |
+| 0x3fdbc | 0x3fe38 | bits 3+4 |
+| **0x40180** | **0x401dc** | **bits 9+10** |
+
+Bits 9+10 is the only firmware-managed pair currently gated off, making it the leading candidate
+for the card interface. Rather than spend a hardware round-trip per guess, `carddump.c` now hunts
+it: for each candidate mask it ungates, does SW_RESET_ALL, sets 1-bit/normal-speed HOST_CTRL,
+bus power, status enables and the clock, waits out the power ramp, then probes with a real CMD0 --
+the first mask whose CMD0 completes wins and is reported as `GATE=`. Candidates only ever CLEAR a
+set bit (turn a clock ON), so none can disturb the working display; bit 31 is excluded as a
+likely global/PLL bit.
+
+Also fixed here: CMD_INHIBIT stuck needs SW_RESET_ALL, not just the CMD/DAT line reset (10.57's
+line reset self-cleared yet left the inhibit set).
